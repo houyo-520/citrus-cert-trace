@@ -170,15 +170,26 @@ FISCO_ENABLE_CHAIN=true
 
 ## 十、生产部署
 
-```bash
-# 后端
-gunicorn config.wsgi:application -b 0.0.0.0:8000 -w 4
+> **本系统已实际上线**：http://<your-server-ip>/
+> 架构为 nginx（前端静态 + /api 反代）→ gunicorn → Django，链与后端同机。
+> 完整部署说明见项目根目录 `系统部署说明.md`，一键部署脚本 `源代码/deploy.py`。
 
-# 前端
-npm run build   # 产物 dist/ 交给 Nginx
+```bash
+# 一键部署到云服务器（在本目录执行）
+python deploy.py all          # 或分步：upload / setup / migrate / service / nginx / start / check
 ```
 
-Nginx 配置见 `frontend/README.md`。
+手动部署方式：
 
-> ⚠️ 安全提示：`web3 RPC` 端口（8545）**不要直接暴露公网**。推荐 Django 后端与链节点同机部署，
-> 走 `127.0.0.1` 访问；若必须跨机，请加 Nginx 反代 + 鉴权 + IP 白名单。
+```bash
+# 后端
+gunicorn config.wsgi:application -b 127.0.0.1:8000 -w 3
+
+# 前端
+npm run build   # 产物 dist/ 交给 nginx
+```
+
+Nginx 配置见 `frontend/README.md` 与 `系统部署说明.md`。
+
+> ⚠️ 安全提示：生产环境请设 `DJANGO_DEBUG=false`、替换 `DJANGO_SECRET_KEY`，
+> 并把后端与链节点**同机部署**走 `127.0.0.1`，避免 web3 RPC（8545）暴露公网。
