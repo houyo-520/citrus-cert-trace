@@ -1,0 +1,48 @@
+* {
+  box-sizing: border-box;
+}
+
+html, body, #app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: "Microsoft YaHei", "PingFang SC", -apple-system, sans-serif;
+  background: #f5f7fa;
+  color: #303133;
+}
+
+.page-container {
+  padding: 16px;
+}
+
+.card-title {
+  font-size: 16px;
+  font-weight: 600;
+  margin-bottom: 12px;
+  color: #303133;
+}
+
+.text-muted {
+  color: #909399;
+  font-size: 13px;
+}
+
+.hash-text {
+  font-family: Consolas, Monaco, monospace;
+  font-size: 12px;
+  color: #606266;
+  word-break: break-all;
+}
+
+.trust-badge-ok {
+  color: #67c23a;
+  font-weight: 600;
+}
+
+.trust-badge-bad {
+  color: #f56c6c;
+  font-weight: 600;
+}

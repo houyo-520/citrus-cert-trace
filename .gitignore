@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Django
+db.sqlite3
+db.sqlite3-journal
+media/
+staticfiles/
+*.log
+
+# Node
+node_modules/
+dist/
+.DS_Store
+npm-debug.log*
+yarn-error.log*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 联盟链敏感信息（私钥、账户、部署产物）—— 绝不提交
+.env
+.env.local
+.fisco_account.json
+.fisco_contract.json
+
+# 数据库
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.db
+
+# 缓存与构建产物
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+cache/
+.cache/
+
+# 前端
+.vite/
+*.local
+
+# 系统文件
+Thumbs.db
+Desktop.ini
+*.lnk
+
+# 临时脚本（个人调试用，不入库）
+_*.py
+_srv.py
