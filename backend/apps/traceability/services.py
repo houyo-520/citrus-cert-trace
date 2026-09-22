@@ -163,6 +163,51 @@ def anchor_revoke(cert: Certificate, reason: str = "") -> EvidenceRecord:
                         cert.cert_no, digest, payload, result)
 
 
+def build_inspection_payload(record) -> str:
+    """
+    构造监督检查记录的规范化原文。
+
+    参与哈希的字段选择原则：只放**结论性、不可抵赖**的事实
+    （检查结果、评分、罚款、法律依据、整改期限），
+    不放「整改说明」这类后续会补充的描述性文字 —— 否则整改一填写哈希就变，
+    存证就失去了「固化当时判定」的意义。
+    """
+    return "|".join([
+        str(record.id),
+        record.certificate.cert_no if record.certificate_id else "",
+        record.get_check_type_display(),
+        record.get_check_result_display(),
+        _fmt(record.check_score),
+        record.inspector_name or "",
+        _fmt(record.check_time),
+        _fmt(record.rectify_deadline),
+        _fmt(record.penalty_amount),
+        (record.legal_basis or "").strip(),
+    ])
+
+
+def anchor_inspection(record) -> EvidenceRecord:
+    """
+    监督检查结论存证上链。
+
+    ★ 这是本系统「监管 + 可信存证」的结合点：
+    检查结论一旦上链，事后任何一方都无法单方面否认「当时判了不合格」。
+    对监管方是履职留痕，对被检方是程序正义保障。
+    """
+    payload = build_inspection_payload(record)
+    digest = sha256_hex(payload)
+    result = _anchor(digest, payload, EvidenceRecord.BizType.INSPECTION,
+                     record.id, record.certificate.cert_no or f"INS-{record.id}")
+    record.record_hash = digest
+    record.is_anchored = True
+    record.anchored_at = datetime.now()
+    record.save(update_fields=["record_hash", "is_anchored", "anchored_at",
+                               "updated_at"])
+    return _save_record(EvidenceRecord.BizType.INSPECTION, record.id,
+                        record.certificate.cert_no or f"INS-{record.id}",
+                        digest, payload, result)
+
+
 def verify_certificate(cert: Certificate, check_chain: bool = False) -> dict:
     """
     验真：重算当前合格证哈希，与存证记录中的摘要比对；可选做链上二次核验。

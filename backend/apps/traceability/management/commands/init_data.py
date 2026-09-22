@@ -3,17 +3,20 @@
 - 创建四类角色账号（含第二个种植主体账号，用于演示数据隔离）
 - 创建生产主体、批次、检测报告、合格证（自动存证）
 - 创建产销供需信息 + 产销意向单
+- 创建监管现场监督检查记录（执法闭环）
 - 产生操作日志（审计演示）
+
+幂等：已有业务数据时不删库，只做增量补全（_top_up）。
 """
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from django.contrib.auth import get_user_model
 from django.core.management.base import BaseCommand
 
-from apps.traceability import services
-from apps.traceability.models import (Certificate, MatchIntent, OperationLog,
-                                      Producer, ProductBatch, SupplyDemand,
-                                      TestReport)
+from apps.traceability import certno, services
+from apps.traceability.models import (Certificate, InspectionRecord, MatchIntent,
+                                      OperationLog, Producer, ProductBatch,
+                                      SupplyDemand, TestReport)
 
 User = get_user_model()
 
@@ -24,6 +27,12 @@ USERS = [
     ("producer2", "admin123", "producer", "种植主体", "甜蜜蜜家庭农场"),
     ("buyer", "admin123", "buyer", "收购商", "鲜果汇供应链"),
 ]
+
+# 行政区划代码（编号前 6 位）
+REGION_CODES = {
+    "橙心柑橘种植合作社": "511402",   # 四川省眉山市东坡区
+    "甜蜜蜜家庭农场": "511424",       # 四川省眉山市丹棱县
+}
 
 
 class Command(BaseCommand):
@@ -43,7 +52,7 @@ class Command(BaseCommand):
 
     def _top_up(self):
         """
-        幂等补全：让已有数据库也能演示「角色隔离 / 审计日志 / 产销匹配」。
+        幂等补全：让已有数据库也能演示「角色隔离 / 审计日志 / 产销匹配 / 监管检查」。
 
         老数据的问题是两个主体都挂在同一个 producer 账号下，
         角色隔离演示不出效果 —— 这里把第二个主体划给 producer2。
@@ -52,6 +61,9 @@ class Command(BaseCommand):
         producer2_user = User.objects.filter(username="producer2").first()
         regulator_user = User.objects.filter(username="regulator").first()
         buyer_user = User.objects.filter(username="buyer").first()
+
+        # 0) 补行政区划代码（编号规则需要）
+        self._top_up_region_code()
 
         # 1) 第二个主体改挂 producer2，使数据隔离可演示
         p2 = Producer.objects.filter(name="甜蜜蜜家庭农场").first()
@@ -93,7 +105,11 @@ class Command(BaseCommand):
                     message="希望长期合作，可先小批量试单")
                 self.stdout.write(f"  已补充产销意向单（匹配度 {score}）")
 
-        # 4) 补操作日志（若没有）
+        # 4) 补监管现场检查记录（若没有）
+        if not InspectionRecord.objects.exists():
+            self._create_inspections(regulator_user)
+
+        # 5) 补操作日志（若没有）
         if not OperationLog.objects.exists():
             rows = []
             for c in Certificate.objects.all()[:2]:
@@ -111,6 +127,122 @@ class Command(BaseCommand):
             if rows:
                 OperationLog.objects.bulk_create(rows)
                 self.stdout.write(f"  已补充 {len(rows)} 条操作日志")
+
+    def _top_up_region_code(self):
+        """给老主体补行政区划代码；给老合格证补 19 位编号（CERT-xxx 旧格式）。"""
+        for p in Producer.objects.all():
+            if p.region_code:
+                continue
+            code = REGION_CODES.get(p.name, "")
+            if not code and p.region:
+                # 从 region 文本里没有标准码，统一兜底
+                code = "000000"
+            if code:
+                p.region_code = code
+                p.save(update_fields=["region_code", "updated_at"])
+                self.stdout.write(f"  已补主体区域码 {p.name} -> {code}")
+
+        # 老合格证编号（CERT-2026-1001）不符合 19 位规则：
+        # 保留编号不动（已上链，改了哈希会失效），仅补签发日期，
+        # 保证 certno.parse_cert_no 能优雅返回 valid=False 而不报错。
+        for c in Certificate.objects.filter(status=Certificate.Status.ISSUED):
+            if certno.is_valid_cert_no(c.cert_no):
+                continue
+            if not c.issue_date:
+                c.issue_date = c.created_at.date() if c.created_at else date.today()
+                c.save(update_fields=["issue_date", "updated_at"])
+        legacy = Certificate.objects.exclude(
+            status=Certificate.Status.ISSUED).count()
+        if legacy:
+            self.stdout.write(f"  历史合格证 {legacy} 张处于非签发状态（保留原编号）")
+
+    def _create_inspections(self, regulator_user):
+        """
+        创建监督检查演示数据。
+
+        三条记录覆盖三种典型情形：
+          ① 合格 —— 闭环完成，无整改
+          ② 不合格 + 已整改 —— 复查通过，合格证恢复
+          ③ 不合格 + 逾期未整改 —— 合格证被暂停，超期告警
+        这是「执法闭环」的完整演示。
+        """
+        certs = list(Certificate.objects.filter(
+            status__in=[Certificate.Status.ISSUED,
+                        Certificate.Status.SUSPENDED]).order_by("id"))
+        if not certs:
+            return
+        c1 = certs[0]
+        c2 = certs[1] if len(certs) > 1 else certs[0]
+
+        # ① 日常检查合格
+        r1 = InspectionRecord.objects.create(
+            certificate=c1, inspector=regulator_user, inspector_name="赵国强",
+            inspector_no="ZJ5114020012", department="眉山市东坡区农业农村局执法大队",
+            check_time=datetime.now() - timedelta(days=6),
+            check_location="东坡区万亩柑橘产业园冷库",
+            check_type=InspectionRecord.CheckType.ROUTINE,
+            check_result=InspectionRecord.CheckResult.QUALIFIED,
+            check_score=96,
+            problem_description="未发现质量问题，生产记录完整，承诺达标合格证使用规范。",
+            rectify_status=InspectionRecord.RectifyStatus.NOT_REQUIRED,
+            follow_up_person="赵国强",
+        )
+        services.anchor_inspection(r1)
+
+        # ② 专项检查不合格 -> 已整改闭环
+        r2 = InspectionRecord.objects.create(
+            certificate=c2, inspector=regulator_user, inspector_name="孙丽娟",
+            inspector_no="ZJ5114240008", department="眉山市丹棱县农业农村局执法大队",
+            check_time=datetime.now() - timedelta(days=12),
+            check_location="丹棱县不知火柑橘基地分选车间",
+            check_type=InspectionRecord.CheckType.SPECIAL,
+            check_result=InspectionRecord.CheckResult.UNQUALIFIED,
+            check_score=68,
+            problem_description="分选车间未按规定记录农药使用间隔期，农事档案缺 2 个批次记录；"
+                                "包装区与成品区未有效隔离。",
+            rectify_requirement="1. 7 日内补全农事记录台账；2. 完成包装区物理隔离改造；"
+                                "3. 提交整改报告并接受复查。",
+            rectify_deadline=date.today() - timedelta(days=5),
+            rectify_status=InspectionRecord.RectifyStatus.DONE,
+            rectify_time=datetime.now() - timedelta(days=6),
+            rectify_note="已完成农事台账补录，包装区加装隔离挡板并通过现场复查。",
+            follow_up_person="孙丽娟",
+            penalty_amount=2000,
+            penalty_reason="未按规定建立农产品生产记录",
+            legal_basis="《农产品质量安全法》第六十五条",
+        )
+        services.anchor_inspection(r2)
+
+        # ③ 投诉核查不合格 -> 逾期未整改（合格证被暂停）
+        r3 = InspectionRecord.objects.create(
+            certificate=c2, inspector=regulator_user, inspector_name="孙丽娟",
+            inspector_no="ZJ5114240008", department="眉山市丹棱县农业农村局执法大队",
+            check_time=datetime.now() - timedelta(days=20),
+            check_location="丹棱县不知火柑橘基地",
+            check_type=InspectionRecord.CheckType.COMPLAINT,
+            check_result=InspectionRecord.CheckResult.UNQUALIFIED,
+            check_score=55,
+            problem_description="接到消费者投诉后核查，发现 1 个批次未按规定开具承诺达标合格证"
+                                "即对外销售，且未建立销售台账。",
+            rectify_requirement="立即停止该批次销售，10 日内建立销售台账并补充开具合格证。",
+            rectify_deadline=date.today() - timedelta(days=3),
+            rectify_status=InspectionRecord.RectifyStatus.OVERDUE,
+            follow_up_person="孙丽娟",
+            penalty_amount=5000,
+            penalty_reason="未按规定开具承诺达标合格证",
+            legal_basis="《农产品质量安全承诺达标合格证管理办法》第二十一条",
+        )
+        services.anchor_inspection(r3)
+
+        # 逾期检查 -> 关联合格证置为「暂停使用」
+        if r3.certificate.status != Certificate.Status.REVOKED:
+            r3.certificate.status = Certificate.Status.SUSPENDED
+            r3.certificate.suspend_reason = (
+                f"监督检查不合格且逾期未整改（检查#{r3.id}）")
+            r3.certificate.save(update_fields=["status", "suspend_reason", "updated_at"])
+
+        self.stdout.write("  已补充监督检查记录 3 条（合格1 / 已整改1 / 逾期1，"
+                          "并联动暂停 1 张合格证）")
 
     def _create_users(self):
         for username, password, role, _, org in USERS:
@@ -135,12 +267,14 @@ class Command(BaseCommand):
         p1 = Producer.objects.create(
             name="橙心柑橘种植合作社", credit_code="91510100MA6XXXXX1A",
             contact="王建国", phone="13800001111", region="四川省眉山市东坡区",
+            region_code="511402",
             address="东坡区万亩柑橘产业园", audit_status=Producer.AuditStatus.APPROVED,
             owner=producer_user,
         )
         p2 = Producer.objects.create(
             name="甜蜜蜜家庭农场", credit_code="91510100MA6XXXXX2B",
             contact="李秀兰", phone="13800002222", region="四川省眉山市丹棱县",
+            region_code="511424",
             address="丹棱县不知火柑橘基地", audit_status=Producer.AuditStatus.PENDING,
             owner=producer2_user,
         )
@@ -185,23 +319,36 @@ class Command(BaseCommand):
         services.anchor_report(r1)
         services.anchor_report(r2)
 
-        # 合格证（自动存证）
-        c1 = Certificate.objects.create(
-            cert_no="CERT-2026-1001", batch=b1, report=r1,
+        # 合格证（★ 编号按 19 位规则自动分配 + 自动存证）
+        # 注意：先建对象（不落库）-> 填业务字段 -> save_with_cert_no 取号落库
+        c1 = Certificate(
+            batch=b1, report=r1,
             producer_name=p1.name, product_name="柑橘", quantity_kg=5000,
             issue_date=date.today() - timedelta(days=2),
             valid_until=date.today() + timedelta(days=28),
             status=Certificate.Status.ISSUED, issuer=regulator_user,
         )
+        certno.save_with_cert_no(c1, p1)
         services.anchor_certificate(c1)
-        c2 = Certificate.objects.create(
-            cert_no="CERT-2026-1002", batch=b2, report=r2,
+
+        c2 = Certificate(
+            batch=b2, report=r2,
             producer_name=p1.name, product_name="柑橘", quantity_kg=8000,
             issue_date=date.today() - timedelta(days=1),
             valid_until=date.today() + timedelta(days=29),
             status=Certificate.Status.ISSUED, issuer=regulator_user,
         )
+        certno.save_with_cert_no(c2, p1)
         services.anchor_certificate(c2)
+
+        self.stdout.write(f"  合格证编号（19位规则）：{c1.cert_no} / {c2.cert_no}")
+
+        # ★ 一张草稿合格证：演示「草稿不占号 -> 提交 -> 签发分配编号」的流程
+        Certificate.objects.create(
+            batch=b3, producer_name=p2.name, product_name="柑橘", quantity_kg=3000,
+            status=Certificate.Status.DRAFT, issuer=regulator_user,
+            remark="待补充检测报告后提交审核（演示编号分配流程）",
+        )
 
         # 产销供需（差异化亮点）
         sd1 = SupplyDemand.objects.create(
@@ -242,16 +389,19 @@ class Command(BaseCommand):
             score_detail=r["detail"], message="希望长期合作，可先小批量试单",
         )
 
+        # ★ 监管现场监督检查（执法闭环演示）
+        self._create_inspections(regulator_user)
+
         # ★ 操作日志（审计演示：把初始化动作也留痕）
         OperationLog.objects.bulk_create([
             OperationLog(operator=regulator_user, operator_name="regulator",
                          operator_role="regulator", action="issue",
-                         target_type="合格证", target_no="CERT-2026-1001",
-                         detail="签发合格证 CERT-2026-1001", ip="127.0.0.1"),
+                         target_type="合格证", target_no=c1.cert_no,
+                         detail=f"签发合格证 {c1.cert_no}", ip="127.0.0.1"),
             OperationLog(operator=regulator_user, operator_name="regulator",
                          operator_role="regulator", action="issue",
-                         target_type="合格证", target_no="CERT-2026-1002",
-                         detail="签发合格证 CERT-2026-1002", ip="127.0.0.1"),
+                         target_type="合格证", target_no=c2.cert_no,
+                         detail=f"签发合格证 {c2.cert_no}", ip="127.0.0.1"),
             OperationLog(operator=producer_user, operator_name="producer",
                          operator_role="producer", action="anchor",
                          target_type="生产批次", target_no="BATCH-2026-1001",
@@ -261,4 +411,5 @@ class Command(BaseCommand):
                          target_type="产销意向单", target_no="供应春见耙耙柑8000kg（附合格证）",
                          detail=f"发起对接意向（匹配度 {r['score']}）", ip="127.0.0.1"),
         ])
-        self.stdout.write("  创建生产主体2个、批次3个、报告2份、合格证2张、供需4条、意向1条、日志4条")
+        self.stdout.write("  创建生产主体2个、批次3个、报告2份、合格证2张+1草稿、"
+                          "供需4条、意向1条、检查3条、日志4条")

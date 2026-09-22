@@ -71,7 +71,7 @@
       <el-descriptions :column="2" border class="result-desc">
         <el-descriptions-item label="合格证编号">{{ result.cert_no }}</el-descriptions-item>
         <el-descriptions-item label="证书状态">
-          <el-tag :type="result.status === 'issued' ? 'success' : 'info'" size="small">
+          <el-tag :type="statusTagType(result.status)" size="small">
             {{ result.status_display }}
           </el-tag>
         </el-descriptions-item>
@@ -91,6 +91,67 @@
         <el-descriptions-item label="签发日期">{{ result.issue_date }}</el-descriptions-item>
         <el-descriptions-item label="有效期至">{{ result.valid_until }}</el-descriptions-item>
       </el-descriptions>
+
+      <!-- 编号构成：让消费者看懂 19 位编号的含义 -->
+      <div v-if="result.cert_no_parsed && result.cert_no_parsed.valid" class="no-parse">
+        <div class="no-parse-title">编号构成（19 位：区域码 + 日期 + 流水）</div>
+        <div class="segments">
+          <div class="seg">
+            <div class="seg-val">{{ result.cert_no_parsed.region_code }}</div>
+            <div class="seg-lbl">行政区划码</div>
+          </div>
+          <div class="seg">
+            <div class="seg-val">{{ result.cert_no_parsed.date }}</div>
+            <div class="seg-lbl">签发日期</div>
+          </div>
+          <div class="seg">
+            <div class="seg-val">{{ result.cert_no_parsed.seq }}</div>
+            <div class="seg-lbl">当日流水号</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ★ 监督检查公示：扫码即可看到这张证是否被查出过问题 -->
+      <div v-if="result.inspection_count > 0" class="insp-panel">
+        <div class="insp-title">
+          <el-icon><Stamp /></el-icon> 监督检查公示
+          <el-tag size="small" type="info" effect="plain">
+            共 {{ result.inspection_count }} 次
+          </el-tag>
+        </div>
+        <el-descriptions v-if="result.inspection" :column="2" border>
+          <el-descriptions-item label="检查结论">
+            <el-tag size="small"
+                    :type="result.inspection.check_result === '不合格' ? 'danger' : 'success'">
+              {{ result.inspection.check_result }}
+            </el-tag>
+          </el-descriptions-item>
+          <el-descriptions-item label="检查类型">
+            {{ result.inspection.check_type }}
+          </el-descriptions-item>
+          <el-descriptions-item label="检查时间">{{ result.inspection.check_time }}</el-descriptions-item>
+          <el-descriptions-item label="检查评分">{{ result.inspection.check_score }}</el-descriptions-item>
+          <el-descriptions-item label="检查部门" :span="2">
+            {{ result.inspection.department || '—' }}
+          </el-descriptions-item>
+          <el-descriptions-item label="发现问题" :span="2">
+            {{ result.inspection.problem || '—' }}
+          </el-descriptions-item>
+          <el-descriptions-item label="整改状态" :span="2">
+            {{ result.inspection.rectify_status }}
+          </el-descriptions-item>
+        </el-descriptions>
+        <p class="insp-note">
+          检查结论已上链存证（摘要 {{ (result.inspection.record_hash || '').slice(0, 24) }}…），
+          事后任何一方均无法单方面否认当时的判定。
+        </p>
+      </div>
+
+      <el-alert v-if="result.status === 'suspended'" type="error" :closable="false"
+                show-icon class="suspend-alert">
+        <template #title>该合格证已被暂停使用</template>
+        <div class="result-msg">{{ result.suspend_reason || '监督检查不合格，暂缓流通' }}</div>
+      </el-alert>
 
       <div class="chain-panel">
         <div class="chain-title">
@@ -143,6 +204,11 @@ const result = ref(null)
 const loading = ref(false)
 const searched = ref(false)
 const samples = ['CERT-2026-1001', 'CERT-2026-1002']
+
+const statusTagType = (s) => ({
+  issued: 'success', draft: 'info', pending: 'warning',
+  suspended: 'danger', revoked: 'danger'
+}[s] || 'info')
 
 const doVerify = async () => {
   if (!certNo.value.trim()) {
@@ -248,5 +314,53 @@ if (certNo.value) doVerify()
   line-height: 1.7;
   margin: 12px 0 0;
 }
+.no-parse {
+  background: #fff;
+  border: 1px solid #e4e7ed;
+  border-radius: 8px;
+  padding: 14px 16px;
+  margin-bottom: 16px;
+}
+.no-parse-title { font-size: 13px; font-weight: 600; margin-bottom: 10px; }
+.segments { display: flex; gap: 10px; flex-wrap: wrap; }
+.seg {
+  border: 1px solid #dcdfe6;
+  border-radius: 6px;
+  padding: 8px 16px;
+  text-align: center;
+  min-width: 110px;
+  flex: 1;
+}
+.seg-val {
+  font-family: Consolas, Monaco, monospace;
+  font-size: 16px;
+  font-weight: 700;
+  color: #0f5c3f;
+}
+.seg-lbl { font-size: 11px; color: #909399; margin-top: 4px; }
+.insp-panel {
+  background: #fff;
+  border: 1px solid #e4e7ed;
+  border-left: 3px solid #e6a23c;
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+.insp-title {
+  font-size: 15px;
+  font-weight: 600;
+  margin-bottom: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #b88230;
+}
+.insp-note {
+  font-size: 12px;
+  color: #909399;
+  line-height: 1.7;
+  margin: 12px 0 0;
+}
+.suspend-alert { margin-bottom: 16px; }
 .verify-footer { text-align: center; margin-top: 30px; }
 </style>

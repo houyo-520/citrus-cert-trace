@@ -32,6 +32,10 @@ class Producer(BaseModel):
     phone = models.CharField("联系电话", max_length=20)
     address = models.CharField("产地地址", max_length=200, blank=True, default="")
     region = models.CharField("所属区域", max_length=100, blank=True, default="")
+    # 行政区划代码（6 位，如 510106 = 四川省成都市金牛区）
+    # 用于合格证编号的前 6 位：区域码 + 日期 + 流水
+    region_code = models.CharField("行政区划代码", max_length=6, blank=True, default="",
+                                   help_text="6 位数字，如 510106；留空则编号区域码为 000000")
     audit_status = models.CharField("审核状态", max_length=20,
                                     choices=AuditStatus.choices,
                                     default=AuditStatus.PENDING)
@@ -117,12 +121,25 @@ class TestReport(BaseModel):
 # 4. 合格证（核心！含可信存证哈希）
 # ---------------------------------------------------------------
 class Certificate(BaseModel):
+    """
+    合格证。
+
+    编号分配策略（★防占号）：
+      编号 = 区域码(6) + 日期(8) + 流水(5)，共 19 位，对标农业农村部实际格式。
+      草稿/待审核阶段 cert_no 为空，**只有正式签发时才分配编号**。
+      否则大量草稿会吃掉流水号，导致正式号码跳跃、废号无法回收。
+    """
+
     class Status(models.TextChoices):
-        PENDING = "pending", "待审核"
-        ISSUED = "issued", "已签发"
+        DRAFT = "draft", "草稿"            # 已建档，未提交，尚未占号
+        PENDING = "pending", "待审核"       # 已提交，等待监管签发
+        ISSUED = "issued", "已签发"         # 已分配编号 + 已存证上链
+        SUSPENDED = "suspended", "暂停使用"  # 监督检查不合格，暂停对外流通
         REVOKED = "revoked", "已作废"
 
-    cert_no = models.CharField("合格证编号", max_length=40, unique=True)
+    cert_no = models.CharField("合格证编号", max_length=40, unique=True,
+                               null=True, blank=True,
+                               help_text="19 位：区域码6+日期8+流水5；草稿阶段为空，签发时自动分配")
     batch = models.ForeignKey(ProductBatch, on_delete=models.CASCADE,
                               verbose_name="生产批次", related_name="certificates")
     report = models.ForeignKey(TestReport, on_delete=models.SET_NULL, null=True, blank=True,
@@ -134,12 +151,17 @@ class Certificate(BaseModel):
     issue_date = models.DateField("签发日期", null=True, blank=True)
     valid_until = models.DateField("有效期至", null=True, blank=True)
     status = models.CharField("状态", max_length=20, choices=Status.choices,
-                              default=Status.PENDING)
+                              default=Status.DRAFT)
 
     # ---- 可信存证核心字段 ----
     cert_hash = models.CharField("合格证哈希(SHA-256)", max_length=64, blank=True, default="")
     is_anchored = models.BooleanField("是否已存证", default=False)
     anchored_at = models.DateTimeField("存证时间", null=True, blank=True)
+
+    # ---- 监督检查联动 ----
+    # 现场检查判定不合格时置为「暂停使用」，与签发状态区分开：
+    # 暂停不是作废（证还在，只是暂缓流通），复查合格后可恢复。
+    suspend_reason = models.CharField("暂停原因", max_length=255, blank=True, default="")
 
     issuer = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
                                null=True, blank=True, verbose_name="签发人",
@@ -153,7 +175,12 @@ class Certificate(BaseModel):
         ordering = ["-id"]
 
     def __str__(self):
-        return self.cert_no
+        return self.cert_no or f"草稿#{self.pk}"
+
+    @property
+    def is_active(self) -> bool:
+        """是否为「当前有效、可流通」的合格证。"""
+        return self.status == self.Status.ISSUED
 
 
 # ---------------------------------------------------------------
@@ -165,6 +192,7 @@ class EvidenceRecord(BaseModel):
         REPORT = "report", "检测报告"
         CERTIFICATE = "certificate", "合格证"
         REVOKE = "revoke", "作废记录"
+        INSPECTION = "inspection", "监督检查"
 
     biz_type = models.CharField("业务类型", max_length=20, choices=BizType.choices)
     biz_id = models.IntegerField("业务ID")
@@ -294,7 +322,138 @@ class MatchIntent(BaseModel):
 
 
 # ---------------------------------------------------------------
-# 9. 操作审计日志（谁 / 何时 / 对哪条数据 / 做了什么）
+# 9. 监管现场监督检查记录（执法闭环）
+# ---------------------------------------------------------------
+class InspectionRecord(BaseModel):
+    """
+    监管现场监督检查记录。
+
+    为什么需要这张表：
+      本系统原有的「检测报告」是**第三方检测机构**出具的技术报告；
+      而《农产品质量安全承诺达标合格证管理办法》中，农业农村部门的
+      **现场监督检查**是另一条独立主线，也是「监管人员」角色的核心业务。
+      没有它，regulator 只能审核主体、签发合格证，业务单薄。
+
+    执法闭环（★这是本表的设计重点）：
+      检查 -> 评分 + 问题描述
+           -> 整改要求 + 整改期限
+           -> 整改状态：待整改 -> 整改中 -> 已整改 / 逾期
+           -> 复查负责人 + 现场照片
+           -> 罚款金额 + 罚款理由 + 法律依据
+      检查结论为「不合格」时，自动把关联合格证置为「暂停使用」——
+      让监督检查与可信存证链路串起来。
+    """
+
+    class CheckType(models.TextChoices):
+        ROUTINE = "routine", "日常检查"
+        SPECIAL = "special", "专项检查"
+        COMPLAINT = "complaint", "投诉核查"
+        SAMPLING = "sampling", "监督抽样"
+
+    class CheckResult(models.TextChoices):
+        QUALIFIED = "qualified", "合格"
+        UNQUALIFIED = "unqualified", "不合格"
+        RECHECK = "recheck", "待复检"
+
+    class RectifyStatus(models.TextChoices):
+        NOT_REQUIRED = "not_required", "无需整改"
+        PENDING = "pending", "待整改"
+        ONGOING = "ongoing", "整改中"
+        DONE = "done", "已整改"
+        OVERDUE = "overdue", "已逾期"
+        RECHECK_FAILED = "recheck_failed", "复查仍不合格"
+
+    # ---- 关联对象 ----
+    certificate = models.ForeignKey(Certificate, on_delete=models.CASCADE,
+                                    verbose_name="受检合格证", related_name="inspections")
+    # ---- 执行人 ----
+    inspector = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+                                  null=True, blank=True, verbose_name="检查人",
+                                  related_name="inspections")
+    inspector_name = models.CharField("检查人姓名", max_length=50, blank=True, default="")
+    inspector_no = models.CharField("执法证号/工号", max_length=50, blank=True, default="")
+    department = models.CharField("检查部门", max_length=100, blank=True, default="")
+    check_time = models.DateTimeField("检查时间", null=True, blank=True)
+    check_location = models.CharField("检查地点", max_length=200, blank=True, default="")
+    # ---- 检查内容 ----
+    check_type = models.CharField("检查类型", max_length=20, choices=CheckType.choices,
+                                  default=CheckType.ROUTINE)
+    check_result = models.CharField("检查结果", max_length=20,
+                                    choices=CheckResult.choices,
+                                    default=CheckResult.RECHECK)
+    check_score = models.DecimalField("检查评分", max_digits=5, decimal_places=2,
+                                      default=0,
+                                      help_text="百分制评分")
+    problem_description = models.TextField("发现问题", blank=True, default="")
+    # ---- 整改闭环 ----
+    rectify_requirement = models.TextField("整改要求", blank=True, default="")
+    rectify_deadline = models.DateField("整改期限", null=True, blank=True)
+    rectify_status = models.CharField("整改状态", max_length=20,
+                                      choices=RectifyStatus.choices,
+                                      default=RectifyStatus.NOT_REQUIRED)
+    rectify_time = models.DateTimeField("整改完成时间", null=True, blank=True)
+    rectify_note = models.TextField("整改说明", blank=True, default="")
+    follow_up_person = models.CharField("复查负责人", max_length=50, blank=True, default="")
+    # ---- 处罚 ----
+    penalty_amount = models.DecimalField("罚款金额(元)", max_digits=12, decimal_places=2,
+                                         default=0)
+    penalty_reason = models.CharField("处罚事由", max_length=255, blank=True, default="")
+    legal_basis = models.CharField("法律依据", max_length=255, blank=True, default="")
+    # ---- 证据材料（存文件路径，逗号分隔）----
+    attachments = models.TextField("现场证据材料", blank=True, default="",
+                                   help_text="多个文件路径用英文逗号分隔")
+    # ---- 结论存证 ----
+    # 检查结论上链后，事后任何一方都无法否认「当时判了不合格」：
+    # 对监管方是履职留痕，对被检方是程序正义保障。
+    record_hash = models.CharField("检查结论哈希(SHA-256)", max_length=64,
+                                   blank=True, default="")
+    is_anchored = models.BooleanField("是否已存证", default=False)
+    anchored_at = models.DateTimeField("存证时间", null=True, blank=True)
+    remark = models.CharField("备注", max_length=255, blank=True, default="")
+
+    class Meta:
+        db_table = "biz_inspection_record"
+        verbose_name = "监督检查记录"
+        verbose_name_plural = "监督检查记录"
+        ordering = ["-id"]
+        indexes = [
+            models.Index(fields=["check_result"]),
+            models.Index(fields=["rectify_status"]),
+            models.Index(fields=["certificate"]),
+        ]
+
+    def __str__(self):
+        return f"检查#{self.id}({self.get_check_result_display()})"
+
+    @property
+    def is_overdue(self) -> bool:
+        """是否已逾期：有期限、未整改完、且当前日期已超过期限。"""
+        from datetime import date as _date
+        if not self.rectify_deadline:
+            return False
+        if self.rectify_status in (self.RectifyStatus.DONE,
+                                   self.RectifyStatus.NOT_REQUIRED,
+                                   self.RectifyStatus.RECHECK_FAILED):
+            return False
+        return _date.today() > self.rectify_deadline
+
+    def refresh_overdue(self, save: bool = True) -> bool:
+        """
+        刷新逾期状态（幂等）。
+
+        逾期是「随时间自然发生」的状态，不可能靠人工点击维护，
+        因此在列表查询/详情查看时按当前日期动态判定并落库。
+        """
+        if self.is_overdue and self.rectify_status != self.RectifyStatus.OVERDUE:
+            self.rectify_status = self.RectifyStatus.OVERDUE
+            if save:
+                self.save(update_fields=["rectify_status", "updated_at"])
+            return True
+        return False
+
+
+# ---------------------------------------------------------------
+# 10. 操作审计日志（谁 / 何时 / 对哪条数据 / 做了什么）
 # ---------------------------------------------------------------
 class OperationLog(BaseModel):
     """
@@ -316,6 +475,8 @@ class OperationLog(BaseModel):
         ANCHOR = "anchor", "存证"
         VERIFY = "verify", "验真"
         MATCH = "match", "产销对接"
+        INSPECT = "inspect", "监督检查"
+        RECTIFY = "rectify", "整改复查"
 
     operator = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
                                  null=True, blank=True, verbose_name="操作人",

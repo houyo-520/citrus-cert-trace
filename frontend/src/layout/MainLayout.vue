@@ -81,6 +81,7 @@ const ALL_MENUS = [
   { path: '/batch', label: '生产批次', icon: 'Box', roles: [] },
   { path: '/report', label: '检测报告', icon: 'Document', roles: [] },
   { path: '/certificate', label: '合格证管理', icon: 'Postcard', roles: [] },
+  { path: '/inspection', label: '监督检查', icon: 'Stamp', roles: [] },
   { path: '/evidence', label: '存证与核验', icon: 'Lock', roles: [] },
   { path: '/supply', label: '产销对接', icon: 'ShoppingCart', roles: [] },
   { path: '/intent', label: '产销意向单', icon: 'Connection', roles: [] },

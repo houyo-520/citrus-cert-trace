@@ -37,6 +37,43 @@
     </el-card>
 
     <el-card shadow="never">
+      <template #header>
+        <div class="head">
+          <span>合格证编号规则</span>
+          <el-tag type="success" size="small">
+            {{ certNoRule.length }} 位 = 区域码 + 日期 + 流水
+          </el-tag>
+        </div>
+      </template>
+      <div class="rule-box">
+        <div class="rule-example mono">{{ certNoRule.example }}</div>
+        <div class="segments">
+          <div v-for="s in certNoRule.segments" :key="s.name" class="seg">
+            <div class="seg-val mono">{{ s.example }}</div>
+            <div class="seg-lbl">{{ s.name }}（{{ s.length }} 位）</div>
+            <div class="seg-desc">{{ s.desc }}</div>
+          </div>
+        </div>
+        <el-alert type="info" :closable="false" show-icon class="mt">
+          <template #title>{{ certNoRule.note }}</template>
+        </el-alert>
+      </div>
+
+      <div class="flow-title">合格证状态流转</div>
+      <div class="flow">
+        <template v-for="(s, i) in statusFlow" :key="s.key">
+          <div class="flow-node" :class="'flow-' + s.key">
+            <div class="flow-name">{{ s.label }}</div>
+            <div class="flow-desc">{{ s.desc }}</div>
+          </div>
+          <el-icon v-if="i < statusFlow.length - 1" class="flow-arrow">
+            <Right />
+          </el-icon>
+        </template>
+      </div>
+    </el-card>
+
+    <el-card shadow="never">
       <template #header><span>当前登录身份</span></template>
       <el-descriptions :column="3" border size="small">
         <el-descriptions-item label="账号">{{ userStore.username }}</el-descriptions-item>
@@ -59,6 +96,16 @@
         <el-descriptions-item label="合格证作废">
           <el-tag size="small" :type="userStore.perms.can_revoke ? 'success' : 'info'">
             {{ userStore.perms.can_revoke ? '可操作' : '无权限' }}
+          </el-tag>
+        </el-descriptions-item>
+        <el-descriptions-item label="监督检查录入">
+          <el-tag size="small" :type="userStore.perms.can_inspect ? 'success' : 'info'">
+            {{ userStore.perms.can_inspect ? '可操作' : '无权限' }}
+          </el-tag>
+        </el-descriptions-item>
+        <el-descriptions-item label="整改复查">
+          <el-tag size="small" :type="userStore.perms.can_rectify ? 'success' : 'info'">
+            {{ userStore.perms.can_rectify ? '可操作' : '无权限' }}
           </el-tag>
         </el-descriptions-item>
         <el-descriptions-item label="生产数据写入">
@@ -91,6 +138,8 @@ const loading = ref(false)
 const resourceMatrix = ref([])
 const actionMatrix = ref([])
 const roles = ref([])
+const certNoRule = ref({ length: 19, segments: [], example: '', note: '' })
+const statusFlow = ref([])
 
 const load = async () => {
   loading.value = true
@@ -100,6 +149,8 @@ const load = async () => {
     resourceMatrix.value = d.resource_matrix
     actionMatrix.value = d.action_matrix
     roles.value = d.roles
+    if (d.cert_no_rule) certNoRule.value = d.cert_no_rule
+    if (d.cert_status_flow) statusFlow.value = d.cert_status_flow
   } finally {
     loading.value = false
   }
@@ -117,4 +168,50 @@ onMounted(load)
   font-weight: 600;
 }
 .txt-hl { color: #409EFF; font-weight: 600; }
+.mono { font-family: Consolas, Monaco, monospace; }
+.rule-box { padding: 4px 0; }
+.rule-example {
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: 3px;
+  color: #409eff;
+  text-align: center;
+  margin-bottom: 16px;
+}
+.segments {
+  display: flex;
+  justify-content: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.seg {
+  border: 1px solid #dcdfe6;
+  border-radius: 6px;
+  padding: 10px 18px;
+  text-align: center;
+  min-width: 130px;
+}
+.seg-val { font-size: 18px; font-weight: 700; color: #303133; }
+.seg-lbl { font-size: 12px; color: #606266; margin-top: 4px; }
+.seg-desc { font-size: 11px; color: #909399; margin-top: 4px; }
+.flow-title { font-weight: 600; margin: 22px 0 12px; font-size: 14px; }
+.flow { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.flow-node {
+  border: 1px solid #dcdfe6;
+  border-radius: 6px;
+  padding: 8px 12px;
+  min-width: 120px;
+  flex: 1;
+  background: #fafafa;
+}
+.flow-name { font-size: 13px; font-weight: 600; }
+.flow-desc { font-size: 11px; color: #909399; margin-top: 4px; line-height: 1.4; }
+.flow-draft { border-left: 3px solid #909399; }
+.flow-pending { border-left: 3px solid #e6a23c; }
+.flow-issued { border-left: 3px solid #67c23a; }
+.flow-suspended { border-left: 3px solid #f56c6c; }
+.flow-revoked { border-left: 3px solid #303133; }
+.flow-arrow { color: #c0c4cc; flex: 0 0 auto; }
+.mt { margin-top: 16px; }
 </style>
+

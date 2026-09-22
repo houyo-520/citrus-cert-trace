@@ -1,13 +1,15 @@
 from django.contrib import admin
 from .models import (Producer, ProductBatch, TestReport, Certificate,
-                     EvidenceRecord, PublicQueryRecord, SupplyDemand)
+                     EvidenceRecord, PublicQueryRecord, SupplyDemand,
+                     InspectionRecord, MatchIntent, OperationLog)
 
 
 @admin.register(Producer)
 class ProducerAdmin(admin.ModelAdmin):
-    list_display = ("id", "name", "contact", "phone", "region", "audit_status")
+    list_display = ("id", "name", "contact", "phone", "region", "region_code",
+                    "audit_status")
     list_filter = ("audit_status", "region")
-    search_fields = ("name", "contact", "phone")
+    search_fields = ("name", "contact", "phone", "region_code")
 
 
 @admin.register(ProductBatch)
@@ -29,6 +31,31 @@ class CertificateAdmin(admin.ModelAdmin):
                     "is_anchored", "cert_hash")
     list_filter = ("status", "is_anchored")
     search_fields = ("cert_no", "producer_name")
+
+
+@admin.register(InspectionRecord)
+class InspectionRecordAdmin(admin.ModelAdmin):
+    list_display = ("id", "certificate", "check_type", "check_result",
+                    "check_score", "rectify_status", "rectify_deadline",
+                    "penalty_amount", "is_anchored")
+    list_filter = ("check_type", "check_result", "rectify_status", "is_anchored")
+    search_fields = ("certificate__cert_no", "inspector_name", "check_location")
+
+
+@admin.register(MatchIntent)
+class MatchIntentAdmin(admin.ModelAdmin):
+    list_display = ("id", "supply", "initiator", "quantity_kg", "price",
+                    "match_score", "status")
+    list_filter = ("status",)
+    search_fields = ("supply__title",)
+
+
+@admin.register(OperationLog)
+class OperationLogAdmin(admin.ModelAdmin):
+    list_display = ("id", "operator_name", "operator_role", "action",
+                    "target_type", "target_no", "ip", "created_at")
+    list_filter = ("action", "operator_role")
+    search_fields = ("operator_name", "target_no", "detail")
 
 
 @admin.register(EvidenceRecord)

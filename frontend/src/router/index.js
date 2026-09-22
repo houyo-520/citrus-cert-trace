@@ -50,6 +50,12 @@ const routes = [
         meta: { title: '合格证管理' }
       },
       {
+        path: 'inspection',
+        name: 'Inspection',
+        component: () => import('@/views/Inspection.vue'),
+        meta: { title: '监督检查' }
+      },
+      {
         path: 'evidence',
         name: 'Evidence',
         component: () => import('@/views/Evidence.vue'),

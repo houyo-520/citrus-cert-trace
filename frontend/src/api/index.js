@@ -27,10 +27,31 @@ export const deleteReport = (id) => request.delete(`/report/${id}/`)
 // ---- 合格证 ----
 export const listCertificate = (params) => request.get('/certificate/', { params })
 export const createCertificate = (data) => request.post('/certificate/', data)
+export const updateCertificate = (id, data) => request.put(`/certificate/${id}/`, data)
 export const issueCertificate = (id) => request.post(`/certificate/${id}/issue/`)
+export const submitCertificate = (id) => request.post(`/certificate/${id}/submit/`)
+export const rejectCertificate = (id, reason) =>
+  request.post(`/certificate/${id}/reject/`, { reason })
 export const revokeCertificate = (id, reason) =>
   request.post(`/certificate/${id}/revoke/`, { reason })
 export const deleteCertificate = (id) => request.delete(`/certificate/${id}/`)
+// ★ 预看下一个可用编号（不占用）：让监管直观看到 19 位编号规则
+export const peekCertNo = (producerId) =>
+  request.get('/certificate/peek-cert-no/', { params: { producer: producerId } })
+// ★ 某张合格证的监督检查汇总
+export const certInspectionSummary = (id) =>
+  request.get(`/certificate/${id}/inspection-summary/`)
+
+// ---- 监督检查（监管执法闭环）----
+export const listInspection = (params) => request.get('/inspection/', { params })
+export const createInspection = (data) => request.post('/inspection/', data)
+export const updateInspection = (id, data) => request.put(`/inspection/${id}/`, data)
+export const deleteInspection = (id) => request.delete(`/inspection/${id}/`)
+// ★ 整改复查：提交整改说明 + 复查结论
+export const rectifyInspection = (id, data) =>
+  request.post(`/inspection/${id}/rectify/`, data)
+// ★ 检查结论重新存证
+export const anchorInspection = (id) => request.post(`/inspection/${id}/anchor/`)
 
 // ---- 存证 ----
 export const listEvidence = (params) => request.get('/evidence/', { params })

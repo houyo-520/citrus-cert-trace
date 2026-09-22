@@ -2,58 +2,86 @@
   <el-card shadow="never">
     <div class="toolbar">
       <el-button type="primary" @click="load">刷新</el-button>
-      <!-- 签发合格证仅监管/管理员可见（后端同样拦截，前端隐藏只是体验优化） -->
       <el-button v-if="userStore.perms.can_issue" type="success" @click="openDialog()">
-        签发合格证
+        新建合格证
       </el-button>
       <el-tag v-else type="info" effect="plain">
         当前角色为只读，签发/作废需监管人员权限
       </el-tag>
+      <el-tag v-if="userStore.perms.can_issue" type="warning" effect="plain">
+        编号规则：区域码6 + 日期8 + 流水5 = 19 位，签发时自动分配
+      </el-tag>
     </div>
 
     <el-table :data="list" v-loading="loading" border stripe>
-      <el-table-column prop="cert_no" label="合格证编号" width="150" />
-      <el-table-column prop="producer_name" label="生产主体" min-width="160" />
-      <el-table-column prop="product_name" label="产品" width="90" />
-      <el-table-column prop="quantity_kg" label="数量(kg)" width="100" />
-      <el-table-column prop="issue_date" label="签发日期" width="120" />
-      <el-table-column label="状态" width="90">
+      <el-table-column label="合格证编号" width="190">
+        <template #default="{ row }">
+          <span v-if="row.cert_no" class="mono">{{ row.cert_no }}</span>
+          <el-tag v-else size="small" type="info">未分配（{{ row.status_display }}）</el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column prop="producer_name_display" label="生产主体" min-width="150"
+                       show-overflow-tooltip />
+      <el-table-column prop="product_name" label="产品" width="80" />
+      <el-table-column prop="quantity_kg" label="数量(kg)" width="95" />
+      <el-table-column prop="issue_date" label="签发日期" width="110" />
+      <el-table-column label="状态" width="95">
         <template #default="{ row }">
           <el-tag :type="certStatusType(row.status)" size="small">
             {{ row.status_display }}
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="存证" width="90">
+      <el-table-column label="监督检查" width="110">
+        <template #default="{ row }">
+          <el-tag v-if="row.latest_inspection_result" size="small"
+                  :type="row.latest_inspection_result === '不合格' ? 'danger' : 'success'">
+            {{ row.latest_inspection_result }}
+          </el-tag>
+          <span v-else class="text-muted">未检查</span>
+        </template>
+      </el-table-column>
+      <el-table-column label="存证" width="85">
         <template #default="{ row }">
           <el-tag :type="row.is_anchored ? 'success' : 'info'" size="small">
             {{ row.is_anchored ? '已存证' : '未存证' }}
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="哈希" width="140">
+      <el-table-column label="哈希" width="130">
         <template #default="{ row }">
-          <span class="hash-text">{{ (row.cert_hash || '').slice(0, 16) }}...</span>
+          <span class="mono hash-text">{{ (row.cert_hash || '').slice(0, 16) }}...</span>
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="230" fixed="right">
+      <el-table-column label="操作" width="270" fixed="right">
         <template #default="{ row }">
-          <el-button link type="primary" @click="showQrcode(row)">二维码</el-button>
-          <el-button link type="success" v-if="userStore.perms.can_issue && row.status !== 'issued'"
-                     @click="issue(row)">签发</el-button>
-          <el-button link type="warning" v-if="userStore.perms.can_revoke && row.status !== 'revoked'"
-                     @click="revoke(row)">作废</el-button>
+          <el-button link type="primary" @click="showDetail(row)">详情</el-button>
+          <el-button v-if="row.cert_no" link type="primary" @click="showQrcode(row)">
+            二维码
+          </el-button>
+          <el-button v-if="userStore.perms.can_submit_cert && row.status === 'draft'"
+                     link type="warning" @click="submit(row)">提交</el-button>
+          <el-button v-if="userStore.perms.can_issue && row.status !== 'issued'"
+                     link type="success" @click="issue(row)">签发</el-button>
+          <el-button v-if="userStore.perms.can_issue && row.status === 'pending'"
+                     link type="info" @click="reject(row)">驳回</el-button>
+          <el-button v-if="userStore.perms.can_revoke && row.status !== 'revoked'"
+                     link type="warning" @click="revoke(row)">作废</el-button>
           <el-button link type="danger" v-if="userStore.perms.can_issue"
                      @click="remove(row)">删除</el-button>
         </template>
       </el-table-column>
     </el-table>
 
-    <el-dialog v-model="dialogVisible" title="签发合格证" width="560px">
+    <!-- 新建合格证：建档不占号 -->
+    <el-dialog v-model="dialogVisible" title="新建合格证（建档）" width="620px">
+      <el-alert type="info" :closable="false" show-icon class="tip">
+        <template #title>
+          建档阶段<strong>不分配编号</strong>（避免草稿吃掉流水号）。
+          提交审核后由监管签发，签发时按「区域码 + 日期 + 流水」自动分配 19 位编号并上链存证。
+        </template>
+      </el-alert>
       <el-form :model="form" label-width="110px">
-        <el-form-item label="合格证编号" required>
-          <el-input v-model="form.cert_no" placeholder="如 CERT-2026-1003" />
-        </el-form-item>
         <el-form-item label="生产批次" required>
           <el-select v-model="form.batch" style="width:100%" placeholder="选择批次"
                      @change="onBatchChange">
@@ -62,7 +90,7 @@
           </el-select>
         </el-form-item>
         <el-form-item label="检测报告">
-          <el-select v-model="form.report" style="width:100%" placeholder="选择报告（可选）">
+          <el-select v-model="form.report" style="width:100%" placeholder="选择报告（提交审核前必填）">
             <el-option v-for="r in reports" :key="r.id"
                        :label="`${r.report_no} (${r.conclusion_display})`" :value="r.id" />
           </el-select>
@@ -76,30 +104,124 @@
         <el-form-item label="开具数量(kg)">
           <el-input-number v-model="form.quantity_kg" :min="0" style="width:100%" />
         </el-form-item>
-        <el-form-item label="签发日期">
-          <el-date-picker v-model="form.issue_date" type="date" value-format="YYYY-MM-DD"
-                          style="width:100%" />
-        </el-form-item>
         <el-form-item label="有效期至">
           <el-date-picker v-model="form.valid_until" type="date" value-format="YYYY-MM-DD"
                           style="width:100%" />
         </el-form-item>
+        <el-form-item label="备注">
+          <el-input v-model="form.remark" />
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
-        <el-button type="primary" @click="save">签发并存证</el-button>
+        <el-button type="primary" @click="save">建档</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 编号规则预览 -->
+    <el-dialog v-model="previewVisible" title="即将分配的编号" width="520px">
+      <div v-if="preview" class="preview-box">
+        <div class="preview-no">{{ preview.preview_cert_no || '（无可分配编号）' }}</div>
+        <div class="segments">
+          <div class="seg">
+            <div class="seg-val">{{ (preview.preview_cert_no || '').slice(0, 6) }}</div>
+            <div class="seg-lbl">区域码</div>
+          </div>
+          <div class="seg">
+            <div class="seg-val">{{ (preview.preview_cert_no || '').slice(6, 14) }}</div>
+            <div class="seg-lbl">日期</div>
+          </div>
+          <div class="seg">
+            <div class="seg-val">{{ (preview.preview_cert_no || '').slice(14) }}</div>
+            <div class="seg-lbl">流水</div>
+          </div>
+        </div>
+        <p class="text-muted">{{ preview.rule }}</p>
+        <p class="text-muted">主体：{{ preview.producer_name || '—' }}（区域码 {{ preview.region_code }}）</p>
+        <p class="text-muted">此编号仅为预览，实际分配在点击「确认签发」时发生。</p>
+      </div>
+      <template #footer>
+        <el-button @click="previewVisible = false">取消</el-button>
+        <el-button type="primary" @click="confirmIssue">确认签发</el-button>
       </template>
     </el-dialog>
 
     <el-dialog v-model="qrVisible" title="合格证追溯二维码" width="360px" align-center>
       <div class="qr-box" v-if="qrCert">
         <img :src="qrUrl" alt="二维码" class="qr-img" />
-        <p class="qr-no">{{ qrCert.cert_no }}</p>
-        <p class="text-muted">扫码进入公众验真页，可查看合格证及存证信息</p>
+        <p class="qr-no mono">{{ qrCert.cert_no }}</p>
+        <p class="text-muted">扫码进入公众验真页，可查看合格证、存证信息与监督检查公示</p>
         <el-input v-model="qrUrl" readonly size="small">
           <template #prepend>验真链接</template>
         </el-input>
       </div>
+    </el-dialog>
+
+    <!-- 详情：编号解析 + 检查汇总 -->
+    <el-dialog v-model="detailVisible" title="合格证详情" width="700px">
+      <el-descriptions :column="2" border size="small">
+        <el-descriptions-item label="合格证编号">
+          <span v-if="detail.cert_no" class="mono">{{ detail.cert_no }}</span>
+          <el-tag v-else size="small" type="info">未分配</el-tag>
+        </el-descriptions-item>
+        <el-descriptions-item label="状态">
+          <el-tag size="small" :type="certStatusType(detail.status)">
+            {{ detail.status_display }}
+          </el-tag>
+        </el-descriptions-item>
+        <el-descriptions-item label="生产主体">{{ detail.producer_name_display }}</el-descriptions-item>
+        <el-descriptions-item label="批次">{{ detail.batch_no || '—' }}</el-descriptions-item>
+        <el-descriptions-item label="检测报告">{{ detail.report_no || '—' }}</el-descriptions-item>
+        <el-descriptions-item label="开具数量">{{ detail.quantity_kg }} kg</el-descriptions-item>
+        <el-descriptions-item label="签发日期">{{ detail.issue_date || '—' }}</el-descriptions-item>
+        <el-descriptions-item label="有效期至">{{ detail.valid_until || '—' }}</el-descriptions-item>
+        <el-descriptions-item v-if="detail.suspend_reason" label="暂停原因" :span="2">
+          <span class="text-danger">{{ detail.suspend_reason }}</span>
+        </el-descriptions-item>
+      </el-descriptions>
+
+      <div v-if="detail.cert_no_parsed && detail.cert_no_parsed.valid" class="parsed">
+        <div class="parsed-title">编号构成（19 位）</div>
+        <div class="segments">
+          <div class="seg">
+            <div class="seg-val">{{ detail.cert_no_parsed.region_code }}</div>
+            <div class="seg-lbl">区域码</div>
+          </div>
+          <div class="seg">
+            <div class="seg-val">{{ detail.cert_no_parsed.date }}</div>
+            <div class="seg-lbl">签发日期</div>
+          </div>
+          <div class="seg">
+            <div class="seg-val">{{ detail.cert_no_parsed.seq }}</div>
+            <div class="seg-lbl">当日流水</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="parsed" v-if="summary">
+        <div class="parsed-title">监督检查情况</div>
+        <el-descriptions :column="3" border size="small">
+          <el-descriptions-item label="检查次数">{{ summary.total }}</el-descriptions-item>
+          <el-descriptions-item label="不合格次数">{{ summary.unqualified_count }}</el-descriptions-item>
+          <el-descriptions-item label="逾期未整改">{{ summary.overdue_count }}</el-descriptions-item>
+        </el-descriptions>
+        <el-descriptions v-if="summary.latest" :column="2" border size="small" class="mt">
+          <el-descriptions-item label="最近结论">
+            <el-tag size="small"
+                    :type="summary.latest.check_result === 'unqualified' ? 'danger' : 'success'">
+              {{ summary.latest.check_result_display }}
+            </el-tag>
+          </el-descriptions-item>
+          <el-descriptions-item label="评分">{{ summary.latest.check_score }}</el-descriptions-item>
+          <el-descriptions-item label="整改状态" :span="2">
+            {{ summary.latest.rectify_status_display }}
+          </el-descriptions-item>
+        </el-descriptions>
+      </div>
+
+      <template #footer>
+        <el-button @click="detailVisible = false">关闭</el-button>
+      </template>
     </el-dialog>
   </el-card>
 </template>
@@ -109,7 +231,8 @@ import { ref, onMounted, reactive, computed } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   listCertificate, createCertificate, issueCertificate, revokeCertificate,
-  deleteCertificate, listBatch, listReport
+  deleteCertificate, submitCertificate, rejectCertificate,
+  peekCertNo, certInspectionSummary, listBatch, listReport
 } from '@/api'
 import { useUserStore } from '@/store/user'
 
@@ -120,7 +243,13 @@ const reports = ref([])
 const loading = ref(false)
 const dialogVisible = ref(false)
 const qrVisible = ref(false)
+const previewVisible = ref(false)
+const detailVisible = ref(false)
 const qrCert = ref(null)
+const detail = ref({})
+const summary = ref(null)
+const preview = ref(null)
+const pendingIssue = ref(null)
 const form = reactive({ product_name: '柑橘', quantity_kg: 0 })
 
 const qrUrl = computed(() => {
@@ -128,7 +257,10 @@ const qrUrl = computed(() => {
   return `${window.location.origin}/#/verify/${qrCert.value.cert_no}`
 })
 
-const certStatusType = (s) => ({ pending: 'warning', issued: 'success', revoked: 'danger' }[s] || 'info')
+const certStatusType = (s) => ({
+  draft: 'info', pending: 'warning', issued: 'success',
+  suspended: 'danger', revoked: 'danger'
+}[s] || 'info')
 
 const load = async () => {
   loading.value = true
@@ -162,25 +294,57 @@ const openDialog = () => {
 }
 
 const save = async () => {
-  if (!form.cert_no || !form.batch) {
-    ElMessage.warning('请填写合格证编号并选择批次')
+  if (!form.batch) {
+    ElMessage.warning('请选择生产批次')
     return
   }
   await createCertificate(form)
-  ElMessage.success('合格证已签发并完成可信存证')
+  ElMessage.success('已建档（草稿不占号，提交审核后由监管签发分配编号）')
   dialogVisible.value = false
   load()
 }
 
+const submit = async (row) => {
+  try {
+    await submitCertificate(row.id)
+    ElMessage.success('已提交审核，等待监管签发')
+    load()
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.message || '提交失败（需先关联检测报告）')
+  }
+}
+
 const issue = async (row) => {
-  await issueCertificate(row.id)
-  ElMessage.success('签发成功并重新存证')
+  // 先预看即将分配的编号，让监管对编号规则有直观认识
+  const producerId = row.batch ? (batches.value.find((b) => b.id === row.batch) || {}).producer : null
+  try {
+    const res = await peekCertNo(producerId)
+    preview.value = res.data
+  } catch (e) {
+    preview.value = null
+  }
+  pendingIssue.value = row
+  previewVisible.value = true
+}
+
+const confirmIssue = async () => {
+  await issueCertificate(pendingIssue.value.id)
+  ElMessage.success('签发成功：编号已分配并完成可信存证')
+  previewVisible.value = false
+  load()
+}
+
+const reject = async (row) => {
+  const { value } = await ElMessageBox.prompt('请填写驳回原因', '驳回合格证申请',
+    { type: 'warning', inputPlaceholder: '如：主体名称有误 / 缺少检测报告' })
+  await rejectCertificate(row.id, value || '')
+  ElMessage.success('已驳回，退回草稿状态（未占号）')
   load()
 }
 
 const revoke = async (row) => {
   const { value } = await ElMessageBox.prompt(
-    `确认作废合格证「${row.cert_no}」？请填写作废原因（将记入审计日志与链上存证）`,
+    `确认作废合格证「${row.cert_no || '草稿#' + row.id}」？请填写作废原因（将记入审计日志与链上存证）`,
     '作废合格证',
     { type: 'warning', inputPlaceholder: '如：抽检不合格 / 信息填报有误' }
   )
@@ -190,7 +354,8 @@ const revoke = async (row) => {
 }
 
 const remove = async (row) => {
-  await ElMessageBox.confirm(`确认删除合格证「${row.cert_no}」？`, '提示', { type: 'warning' })
+  await ElMessageBox.confirm(`确认删除合格证「${row.cert_no || '草稿#' + row.id}」？`,
+    '提示', { type: 'warning' })
   await deleteCertificate(row.id)
   ElMessage.success('已删除')
   load()
@@ -201,12 +366,55 @@ const showQrcode = (row) => {
   qrVisible.value = true
 }
 
+const showDetail = async (row) => {
+  detail.value = row
+  summary.value = null
+  detailVisible.value = true
+  try {
+    const res = await certInspectionSummary(row.id)
+    summary.value = res.data
+  } catch (e) {
+    summary.value = null
+  }
+}
+
 onMounted(() => { load(); loadRefs() })
 </script>
 
 <style scoped>
-.toolbar { display: flex; gap: 10px; margin-bottom: 14px; }
+.toolbar { display: flex; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; align-items: center; }
 .qr-box { text-align: center; }
 .qr-img { width: 200px; height: 200px; }
 .qr-no { font-weight: 600; margin: 10px 0 4px; }
+.mono { font-family: Consolas, Monaco, monospace; font-size: 12px; }
+.hash-text { font-size: 12px; color: #606266; }
+.text-muted { color: #909399; font-size: 12px; }
+.text-danger { color: #f56c6c; font-weight: 600; }
+.tip { margin-bottom: 14px; }
+.preview-box { text-align: center; }
+.preview-no {
+  font-family: Consolas, Monaco, monospace;
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: 2px;
+  color: #409eff;
+  margin-bottom: 16px;
+}
+.segments {
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.seg {
+  border: 1px solid #dcdfe6;
+  border-radius: 4px;
+  padding: 8px 14px;
+  min-width: 92px;
+}
+.seg-val { font-family: Consolas, Monaco, monospace; font-size: 16px; font-weight: 600; }
+.seg-lbl { font-size: 11px; color: #909399; margin-top: 4px; }
+.parsed { margin-top: 16px; }
+.parsed-title { font-weight: 600; margin-bottom: 10px; font-size: 14px; }
+.mt { margin-top: 10px; }
 </style>

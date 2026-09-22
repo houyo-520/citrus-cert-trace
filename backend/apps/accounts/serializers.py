@@ -38,6 +38,9 @@ class UserSerializer(serializers.ModelSerializer):
             "can_audit": is_regulator,          # 主体审核
             "can_issue": is_regulator,          # 合格证签发
             "can_revoke": is_regulator,         # 合格证作废
+            "can_submit_cert": is_regulator or role == "producer",  # 提交合格证审核
+            "can_inspect": is_regulator,        # ★ 现场监督检查录入
+            "can_rectify": is_regulator,        # ★ 整改复查确认
             "can_anchor": is_regulator or role == "producer",   # 存证
             "can_write_production": is_regulator or role == "producer",  # 生产数据
             "can_publish_supply": role in ("admin", "regulator",
