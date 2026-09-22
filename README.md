@@ -52,7 +52,77 @@
 
 - 种植主体发布供应信息，收购商发布求购信息。
 - 供应信息可**关联合格证**，实现"先扫码验真，再对接下单"。
-- 平台记录对接状态，打通"产 — 证 — 销"闭环。
+- **智能匹配推荐**：可解释的多因子加权打分模型，输出 0–100 匹配度与逐因子明细。
+
+  | 因子 | 权重 | 计分规则 |
+  | --- | --- | --- |
+  | 品种匹配 | 30 | 品种一致 30；同产品不同品种 15；产品不同 0 |
+  | 数量满足度 | 25 | `min(供,需)/max(供,需) × 25`（比值而非差值，体现相对差异） |
+  | 价格契合度 | 20 | 报价差在期望价 ±15% 内满分，15%~60% 线性衰减，≥60% 得 0 |
+  | 地域邻近度 | 15 | 同地区 15；同省市前缀 8；跨区域 0 |
+  | 信用合规 | 10 | 供方主体已审核 + 关联合格证已签发（各 5 分） |
+
+- **产销意向单（MatchIntent）**：把"一次对接"建模为独立实体，记录发起人、数量、成交价、
+  匹配度评分与评分明细，状态流转 `待确认 → 已接受/已拒绝/已完成`，实现对接全程留痕。
+- 种植主体与收购商**双向均可发起**对接，符合"产销衔接"的双向撮合本质。
+
+### 4. 四角色权限差异化 ★
+
+系统区分 **系统管理员 / 监管人员 / 种植主体 / 收购商** 四类角色，权限分**接口级**与**数据级**两层：
+
+**数据级可见范围**
+
+| 资源 | 管理员 | 监管人员 | 种植主体 | 收购商 |
+| --- | --- | --- | --- | --- |
+| 生产主体 | 全部 | 全部 | 仅自己创建的 | 仅已审核通过的 |
+| 生产批次 | 全部 | 全部 | 仅自己的 | 仅已审核主体的 |
+| 检测报告 | 全部 | 全部 | 仅自己的 | 只读、仅合格 |
+| 合格证 | 全部 | 全部 | 自己的可增改 | 只读、仅已签发 |
+| 存证记录 | 全部 | 全部 | 仅自己的 | 只读、仅已签发证 |
+| 产销供需 | 全部 | 全部 | 自己的 + 全部求购 | 自己的 + 全部供应 |
+| 产销意向单 | 全部 | 全部 | 自己发起/收到的 | 自己发起/收到的 |
+| 操作日志 | 全部 | 全部 | 仅自己的 | 仅自己的 |
+
+**接口级操作授权**
+
+| 操作 | 管理员 | 监管人员 | 种植主体 | 收购商 |
+| --- | --- | --- | --- | --- |
+| 主体审核 | ✓ | ✓ | ✗ | ✗ |
+| 合格证签发 | ✓ | ✓ | ✗ | ✗ |
+| 合格证作废 | ✓ | ✓ | ✗ | ✗ |
+| 批次/报告存证 | ✓ | ✓ | ✓ | ✗ |
+| 发布供需信息 | ✓ | ✓ | ✓ | ✓ |
+| 发起对接意向 | ✓ | ✓ | ✓ | ✓ |
+
+实现方式：`permissions.py` 提供接口级 `BasePermission`（按 action 细分）与
+数据级 `RoleScopedQuerySetMixin`（统一 `get_queryset()` 过滤）。
+前端按登录返回的 `permissions` 清单控制菜单与按钮，**后端仍做兜底拦截**（防绕过）。
+`GET /api/role-matrix/` 直接返回上表，前端「权限说明」页渲染展示。
+
+### 5. 操作审计日志
+
+- 链上存证锚定**数据摘要**，审计日志锚定**操作行为**，二者互补构成完整可信链。
+- 覆盖动作：`登录 / 新增 / 修改 / 删除 / 审核 / 签发 / 作废 / 存证 / 验真 / 对接`。
+- 记录操作人、角色、IP（兼容 nginx `X-Forwarded-For`）、目标对象、执行结果与详情；
+  **登录失败同样留痕**，满足安全审计需要。
+- 日志本身按角色隔离：种植主体/收购商只能查看自己的操作记录。
+- `GET /api/log/` 支持按 `action / operator / target_type / keyword` 组合筛选。
+
+### 6. 单元测试
+
+`backend/apps/traceability/tests.py` 含 **40 个用例**，覆盖 6 个测试类：
+
+| 测试类 | 用例数 | 关注点 |
+| --- | --- | --- |
+| `HashConsistencyTest` | 5 | 哈希稳定性；**8000 与 8000.00 必须同哈希**（数值格式化回归） |
+| `TamperDetectionTest` | 5 | 双层篡改检测，含"连摘要一起改"场景 |
+| `PermissionTest` | 11 | 越权拦截 403、数据隔离、看板角色差异、角色矩阵 |
+| `AuditLogTest` | 7 | 各动作留痕、日志隔离 |
+| `MatchingTest` | 11 | 匹配算法各因子、排序、意向单、双向发起 |
+| `EndToEndFlowTest` | 1 | 录批次 → 出报告 → 签合格证 → 公众验真 |
+
+运行：`python manage.py test apps.traceability apps.accounts`
+
 
 ## 四、目录结构
 
@@ -65,11 +135,15 @@
 │   ├── apps/
 │   │   ├── accounts/              # 用户与角色（4 类角色）
 │   │   └── traceability/          # 核心业务
-│   │       ├── models.py          # 主体/批次/报告/合格证/存证/供需
+│   │       ├── models.py          # 主体/批次/报告/合格证/存证/供需/意向单/审计日志
 │   │       ├── services.py        # ★ 哈希存证与验真核心
 │   │       ├── chain.py           # ★ 联盟链客户端（web3.py）
+│   │       ├── permissions.py     # ★ 角色权限（接口级 + 数据级）
+│   │       ├── audit.py           # ★ 操作审计日志写入
+│   │       ├── matching.py        # ★ 产销智能匹配算法
 │   │       ├── serializers.py
-│   │       ├── views.py           # ViewSet + 公众验真 + 链状态 + 看板
+│   │       ├── views.py           # ViewSet + 公众验真 + 链状态 + 看板 + 角色矩阵
+│   │       ├── tests.py           # ★ 40 个单元测试
 │   │       ├── urls.py
 │   │       ├── admin.py
 │   │       └── management/commands/init_data.py  # 演示数据
@@ -79,11 +153,12 @@
 └── frontend/                      # Vue3 前端
     ├── src/
     │   ├── api/                   # Axios 接口封装
-    │   ├── layout/                # 后台布局
-    │   ├── router/                # 路由与守卫
-    │   ├── store/                 # Pinia
+    │   ├── layout/                # 后台布局（菜单按角色过滤）
+    │   ├── router/                # 路由与守卫（含角色守卫）
+    │   ├── store/                 # Pinia（含 permissions）
     │   ├── utils/request.js       # 请求拦截器（JWT）
-    │   └── views/                 # 页面（登录/验真/看板/主体/批次/报告/合格证/存证/产销）
+    │   └── views/                 # 12 页面：登录/验真/看板/主体/批次/报告/合格证/
+    │                              #   存证/产销/意向单/操作日志/权限说明
     ├── package.json
     └── vite.config.js
 ```
@@ -142,14 +217,19 @@ FISCO_ENABLE_CHAIN=true
 
 ## 七、默认账号
 
-| 账号 | 密码 | 角色 |
-| --- | --- | --- |
-| admin | admin123 | 系统管理员 |
-| regulator | admin123 | 监管人员 |
-| producer | admin123 | 种植主体 |
-| buyer | admin123 | 收购商 |
+| 账号 | 密码 | 角色 | 说明 |
+| --- | --- | --- | --- |
+| admin | admin123 | 系统管理员 | 全量可见 + 全部操作 |
+| regulator | admin123 | 监管人员 | 全量可见 + 审核/签发/作废 |
+| producer | admin123 | 种植主体 | 仅自己数据；可存证、发供需、发起对接 |
+| producer2 | admin123 | 种植主体 | 第二个主体账号，**用于演示数据隔离** |
+| buyer | admin123 | 收购商 | 仅已审核主体 + 已签发合格证；可发供需、发起对接 |
+
+> 用 producer 与 producer2 分别登录，可直观看到"各自只看到自己的主体/批次/日志"；
+> 用 buyer 登录则看到"仅已审核通过的主体 + 仅已签发的合格证"。
 
 演示合格证编号：`CERT-2026-1001`、`CERT-2026-1002`
+演示批次编号：`BATCH-2026-1002`、`BATCH-2026-2001`
 
 ## 八、核心数据主线
 
@@ -161,23 +241,63 @@ FISCO_ENABLE_CHAIN=true
                ├─ 存证记录(EvidenceRecord) ── tx_hash / block_height
                │     └─ 上链 ──> FISCO BCOS（CertificateEvidence 合约）
                └─ 产销供需(SupplyDemand) ── 关联证书，先验真再对接
+                     └─ 产销意向单(MatchIntent) ── 匹配度评分 + 状态流转
+
+旁路：操作日志(OperationLog) ── 记录所有角色的一切操作行为
 ```
 
-## 九、切换 MySQL
+## 九、接口一览
+
+> 业务路由统一为**单数**形式；除公众验真外均需 `Authorization: Bearer <JWT>`。
+
+| 方法 | 路径 | 权限 | 说明 |
+| --- | --- | --- | --- |
+| POST | `/api/auth/login/` | 公开 | 登录，返回 `access/refresh/user`（含 `permissions`） |
+| POST | `/api/auth/refresh/` | 公开 | 刷新 JWT |
+| GET | `/api/auth/profile/` | 登录 | 当前用户信息与权限清单 |
+| GET | `/api/public/verify/<cert_no>/` | **公开** | 公众扫码验真（含链上核验结果） |
+| GET | `/api/dashboard/` | 登录 | 看板统计（**口径随角色变化**） |
+| GET | `/api/role-matrix/` | 登录 | 角色-资源/操作矩阵 |
+| CRUD | `/api/producer/` | 登录（范围隔离） | 生产主体 |
+| POST | `/api/producer/<id>/audit/` | 监管 | 主体审核 |
+| CRUD | `/api/batch/` | 登录（范围隔离） | 生产批次 |
+| POST | `/api/batch/<id>/anchor/` | 监管/主体 | 批次存证上链 |
+| CRUD | `/api/report/` | 登录（范围隔离） | 检测报告 |
+| POST | `/api/report/<id>/anchor/` | 监管/主体 | 报告存证上链 |
+| CRUD | `/api/certificate/` | 登录（范围隔离） | 合格证 |
+| POST | `/api/certificate/<id>/issue/` | 监管 | 签发（算哈希 + 上链） |
+| POST | `/api/certificate/<id>/revoke/` | 监管 | 作废（生成 REVOKE 存证） |
+| GET | `/api/certificate/<id>/qrcode/` | 登录 | 生成合格证二维码 |
+| GET | `/api/evidence/` | 登录（范围隔离） | 存证记录 |
+| GET | `/api/evidence/chain-status/` | 登录 | 联盟链节点状态 |
+| POST | `/api/evidence/<id>/verify/` | 登录 | 单条存证链上核验 |
+| CRUD | `/api/supply/` | 登录（范围隔离） | 产销供需 |
+| GET | `/api/supply/<id>/recommend/` | 四角色 | ★ 智能匹配推荐（含因子明细） |
+| POST | `/api/supply/<id>/intent/` | 四角色 | ★ 发起产销意向单 |
+| POST | `/api/supply/<id>/match/` | 四角色 | 标记已对接 |
+| GET | `/api/intent/` | 登录（范围隔离） | 意向单列表 |
+| POST | `/api/intent/<id>/respond/` | 登录 | 接受/拒绝/完成意向 |
+| GET | `/api/log/` | 登录（范围隔离） | 操作审计日志（支持多条件筛选） |
+
+## 十、切换 MySQL
 
 修改 `backend/config/settings.py` 中的 `DATABASES`（注释里有 MySQL 配置示例），
 并安装 `PyMySQL`（已在 requirements.txt 中）。`config/__init__.py` 已做兼容处理。
 
-## 十、生产部署
+## 十一、生产部署
 
-> **本系统已实际上线**：http://<your-server-ip>/
+> **本系统已实际上线**：http://<your-server-ip>:8090/
 > 架构为 nginx（前端静态 + /api 反代）→ gunicorn → Django，链与后端同机。
 > 完整部署说明见项目根目录 `系统部署说明.md`，一键部署脚本 `源代码/deploy.py`。
+> （80/8080 端口因未备案被云厂商拦截层丢包，故对外使用 8090。）
 
 ```bash
 # 一键部署到云服务器（在本目录执行）
 python deploy.py all          # 或分步：upload / setup / migrate / service / nginx / start / check
 ```
+
+> ⚠️ `deploy.py upload` 的 skip 集合必须包含 `db.sqlite3` 与 `.env`，
+> 否则本地演示库会覆盖服务器生产数据。
 
 手动部署方式：
 
