@@ -1,12 +1,17 @@
 """
 一键部署：把 Django 后端 + Vue 前端 dist 部署到 <your-server-ip>
-用法:
-  python _deploy.py upload     # 上传源码与前端产物
-  python _deploy.py setup      # 服务器端安装依赖/迁移/建服务
-  python _deploy.py nginx      # 配置 nginx
-  python _deploy.py start      # 启动服务
-  python _deploy.py check      # 健康检查
-  python _deploy.py all        # 全流程
+
+用法（在本文件所在目录，即 源代码/ 下执行）：
+  python deploy.py upload     # 上传源码与前端产物
+  python deploy.py setup      # 服务器端安装依赖
+  python deploy.py migrate    # 迁移 + collectstatic + 演示数据
+  python deploy.py service    # 写 systemd 服务
+  python deploy.py nginx      # 配置 nginx
+  python deploy.py start      # 启动服务
+  python deploy.py check      # 健康检查
+  python deploy.py all        # 全流程
+
+依赖：paramiko（本机 venv: C:/Users/houyo/.workbuddy/binaries/python/envs/default）
 """
 import sys, os, posixpath, stat, json, time
 import paramiko
@@ -19,7 +24,8 @@ REMOTE_ROOT = "/home/ubuntu/citrus"
 REMOTE_BACKEND = REMOTE_ROOT + "/backend"
 REMOTE_FRONT = REMOTE_ROOT + "/frontend_dist"
 
-LOCAL = r"D:\HuaweiMoveData\Users\houyo\Desktop\毕设源\源代码"
+# 本地源码根 = 本脚本所在目录（源代码/），便于整体移动
+LOCAL = os.path.dirname(os.path.abspath(__file__))
 
 SECRET_KEY = "__SET_VIA_ENV__"
 
