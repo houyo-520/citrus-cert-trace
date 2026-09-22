@@ -119,7 +119,7 @@ FISCO_PRIVATE_KEY=__SET_VIA_ENV__
 FISCO_GAS_LIMIT=500000
 FISCO_ENABLE_CHAIN=true
 
-FRONTEND_VERIFY_BASE=http://<your-server-ip>/#/verify
+FRONTEND_VERIFY_BASE=http://<your-server-ip>:8090/#/verify
 """
     with sftp.open(REMOTE_BACKEND + "/.env", "w") as f:
         f.write(env)
@@ -194,8 +194,14 @@ def do_service(cli):
 
 # ---------------------------------------------------------------- nginx
 NGINX = """server {
+    # 端口说明（实测 2026-09）：
+    #   80 / 443 / 8080  → 未备案会被腾讯云拦截层「代答握手 + 丢包」，
+    #                       表现为 TCP 能连但永远收不到数据
+    #   8090            → 非标端口，不在拦截名单，安全组放行即可用 ★ 当前推荐
     listen 80 default_server;
     listen [::]:80 default_server;
+    listen 8080;
+    listen 8090;
     server_name <your-server-ip> _;
 
     client_max_body_size 20m;
