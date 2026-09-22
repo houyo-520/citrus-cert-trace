@@ -77,7 +77,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, onBeforeUnmount, nextTick, computed } from 'vue'
 import * as echarts from 'echarts'
 import { getDashboard } from '@/api'
 import { useUserStore } from '@/store/user'
@@ -118,8 +118,22 @@ const inspCards = computed(() => {
   ]
 })
 
+/**
+ * ★ 安全初始化图表
+ * echarts.init(null) 会抛 "Cannot read properties of null (reading 'getAttribute')"，
+ * 常见于 ① 元素在 v-if 分支里未渲染 ② 弹窗/切页后 DOM 已卸载 ③ onMounted 时布局未就绪。
+ * 这里统一做「元素存在 + 未销毁 + 已有实例则复用」三重守卫。
+ */
+const safeInit = (el) => {
+  if (!el) return null
+  const existed = echarts.getInstanceByDom(el)
+  if (existed && !existed.isDisposed()) return existed
+  return echarts.init(el)
+}
+
 const renderBar = () => {
-  const chart = echarts.init(barRef.value)
+  const chart = safeInit(barRef.value)
+  if (!chart) return
   chart.setOption({
     tooltip: { trigger: 'axis' },
     grid: { left: 50, right: 20, top: 30, bottom: 40 },
@@ -146,7 +160,8 @@ const renderBar = () => {
 }
 
 const renderPie = () => {
-  const chart = echarts.init(pieRef.value)
+  const chart = safeInit(pieRef.value)
+  if (!chart) return
   chart.setOption({
     tooltip: { trigger: 'item' },
     legend: { bottom: 0 },
@@ -169,8 +184,8 @@ const renderPie = () => {
 }
 
 const renderInsp = () => {
-  if (!inspRef.value) return
-  const chart = echarts.init(inspRef.value)
+  const chart = safeInit(inspRef.value)
+  if (!chart) return
   const s = stats.value
   chart.setOption({
     tooltip: { trigger: 'axis' },
@@ -196,18 +211,40 @@ const renderInsp = () => {
   })
 }
 
-onMounted(async () => {
-  try {
-    const res = await getDashboard()
-    stats.value = res.data.data || res.data
-  } catch (e) {}
+const renderAll = () => {
   renderBar()
   renderPie()
   renderInsp()
-  window.addEventListener('resize', () => {
-    echarts.getInstanceByDom(barRef.value)?.resize()
-    echarts.getInstanceByDom(pieRef.value)?.resize()
-    if (inspRef.value) echarts.getInstanceByDom(inspRef.value)?.resize()
+}
+
+const onResize = () => {
+  const insts = [barRef.value, pieRef.value, inspRef.value]
+    .map((el) => (el ? echarts.getInstanceByDom(el) : null))
+    .filter((c) => c && !c.isDisposed())
+  insts.forEach((c) => c.resize())
+}
+
+onMounted(async () => {
+  try {
+    const res = await getDashboard()
+    // 包装体 {code,message,data}
+    stats.value = res.data || {}
+  } catch (e) {
+    // 接口异常时仍渲染空图表，避免整页白屏
+  }
+  // 等 DOM 完成布局再初始化，规避高度为 0 / 元素未挂载
+  await nextTick()
+  renderAll()
+  window.addEventListener('resize', onResize)
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', onResize)
+  // 主动销毁实例，防止切页后残留导致下次 init 拿到已 dispose 的容器
+  ;[barRef.value, pieRef.value, inspRef.value].forEach((el) => {
+    if (!el) return
+    const c = echarts.getInstanceByDom(el)
+    if (c && !c.isDisposed()) c.dispose()
   })
 })
 </script>

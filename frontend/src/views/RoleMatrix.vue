@@ -145,10 +145,11 @@ const load = async () => {
   loading.value = true
   try {
     const res = await getRoleMatrix()
-    const d = res.data.data
-    resourceMatrix.value = d.resource_matrix
-    actionMatrix.value = d.action_matrix
-    roles.value = d.roles
+    // 包装体 {code,message,data}：拦截器返回的 res 即响应体，业务字段在 res.data
+    const d = res.data || {}
+    resourceMatrix.value = d.resource_matrix || []
+    actionMatrix.value = d.action_matrix || []
+    roles.value = d.roles || []
     if (d.cert_no_rule) certNoRule.value = d.cert_no_rule
     if (d.cert_status_flow) statusFlow.value = d.cert_status_flow
   } finally {

@@ -103,10 +103,16 @@ def do_upload(cli):
     )
     print(f"  上传 {n1} 个文件")
 
-    print("=== 2) 上传前端构建产物 ===")
+    print("=== 2) 上传前端构建产物（清洁同步）===")
+    # ★ 必须先清空再上传：
+    #   Vite 产物文件名带内容哈希，每次构建 hash 都变。若只上传不删除，
+    #   历史 chunk 会无限累积（实测累积到 63 个 JS），配合浏览器缓存的旧
+    #   index.html → 旧入口仍能引用到旧 chunk → 页面永远跑旧代码、报错照旧。
+    #   清空可保证「服务器上只有本次构建的产物」。
+    run(cli, f"rm -rf {REMOTE_FRONT}/assets {REMOTE_FRONT}/index.html", quiet=True)
     mkdirs(sftp, REMOTE_FRONT)
     n2 = put_dir(sftp, os.path.join(LOCAL, "frontend", "dist"), REMOTE_FRONT)
-    print(f"  上传 {n2} 个文件")
+    print(f"  上传 {n2} 个文件（已先清空远端旧产物）")
 
     print("=== 3) 写入服务器专用 .env ===")
     env = f"""# 生产环境配置（服务器 <your-server-ip>）
@@ -218,6 +224,14 @@ NGINX = """server {
         try_files $uri $uri/ /index.html;
     }
 
+    # ★ index.html 绝不缓存：它是 SPA 的唯一入口，引用的 chunk 名每次构建都变。
+    #   一旦被缓存，用户会长期停留在旧版本（配合残留的旧 chunk 就更难察觉）。
+    location = /index.html {
+        add_header Cache-Control "no-store, no-cache, must-revalidate";
+        add_header Pragma "no-cache";
+        expires -1;
+    }
+
     # 后端 API 反代到 Gunicorn
     location /api/ {
         proxy_pass http://127.0.0.1:8000;
@@ -242,7 +256,12 @@ NGINX = """server {
         alias /home/ubuntu/citrus/backend/media/;
     }
 
-    # 静态资源缓存
+    # 静态资源长缓存：文件名含内容哈希，内容变则文件名变，可放心 immutable
+    location ^~ /assets/ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        try_files $uri =404;
+    }
     location ~* \\.(js|css|png|jpg|jpeg|gif|ico|svg|woff2?)$ {
         expires 7d;
         add_header Cache-Control "public, immutable";

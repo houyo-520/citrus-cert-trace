@@ -133,9 +133,8 @@ const load = async () => {
     if (query.operator) params.operator = query.operator
     if (query.keyword) params.keyword = query.keyword
     const res = await listLog(params)
-    const d = res.data
-    rows.value = d.results || d
-    total.value = d.count ?? rows.value.length
+    rows.value = res.results || res.data || []
+    total.value = res.count ?? rows.value.length
   } finally {
     loading.value = false
   }

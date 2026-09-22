@@ -282,7 +282,8 @@ const openRecommend = async (item) => {
   recList.value = []
   recommendVisible.value = true
   const res = await recommendSupply(item.id, 5)
-  recList.value = res.data.data || []
+  // 包装体 {code,message,data}：data 为候选数组
+  recList.value = res.data || []
 }
 
 // ★ 打开发起意向弹窗

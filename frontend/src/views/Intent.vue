@@ -148,9 +148,8 @@ const load = async () => {
     const params = { page: page.value }
     if (query.status) params.status = query.status
     const res = await listIntent(params)
-    const d = res.data
-    rows.value = d.results || d
-    total.value = d.count ?? rows.value.length
+    rows.value = res.results || res.data || []
+    total.value = res.count ?? rows.value.length
   } finally {
     loading.value = false
   }

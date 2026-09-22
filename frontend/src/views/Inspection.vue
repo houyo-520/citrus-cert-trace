@@ -436,9 +436,8 @@ const load = async () => {
     if (query.rectify_status) params.rectify_status = query.rectify_status
     if (query.keyword) params.keyword = query.keyword
     const res = await listInspection(params)
-    const d = res.data
-    rows.value = d.results || d
-    total.value = d.count ?? rows.value.length
+    rows.value = res.results || res.data || []
+    total.value = res.count ?? rows.value.length
   } finally {
     loading.value = false
   }
