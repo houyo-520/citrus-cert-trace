@@ -30,9 +30,17 @@ def _load_dotenv(path: Path):
 
 _load_dotenv(BASE_DIR / ".env")
 
-SECRET_KEY = "django-insecure-citrus-cert-trace-2026-change-me-in-production"
-DEBUG = True
-ALLOWED_HOSTS = ["*"]
+SECRET_KEY = os.environ.get(
+    "DJANGO_SECRET_KEY",
+    "django-insecure-citrus-cert-trace-2026-change-me-in-production",
+)
+# 生产环境务必在 .env 里设 DJANGO_DEBUG=false
+DEBUG = os.environ.get("DJANGO_DEBUG", "true").lower() == "true"
+ALLOWED_HOSTS = [
+    h.strip()
+    for h in os.environ.get("DJANGO_ALLOWED_HOSTS", "*").split(",")
+    if h.strip()
+]
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -115,6 +123,7 @@ USE_I18N = True
 USE_TZ = False
 
 STATIC_URL = "static/"
+STATIC_ROOT = BASE_DIR / "staticfiles"
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
