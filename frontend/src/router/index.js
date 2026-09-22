@@ -1,4 +1,5 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
+import { ElMessage } from 'element-plus'
 
 const routes = [
   {
@@ -59,6 +60,24 @@ const routes = [
         name: 'Supply',
         component: () => import('@/views/Supply.vue'),
         meta: { title: '产销对接' }
+      },
+      {
+        path: 'intent',
+        name: 'Intent',
+        component: () => import('@/views/Intent.vue'),
+        meta: { title: '产销意向单' }
+      },
+      {
+        path: 'log',
+        name: 'OperationLog',
+        component: () => import('@/views/OperationLog.vue'),
+        meta: { title: '操作日志' }
+      },
+      {
+        path: 'roles',
+        name: 'RoleMatrix',
+        component: () => import('@/views/RoleMatrix.vue'),
+        meta: { title: '权限说明' }
       }
     ]
   }
@@ -73,12 +92,26 @@ router.beforeEach((to, from, next) => {
   document.title = (to.meta.title ? to.meta.title + ' - ' : '') + '柑橘合格证追溯系统'
   const token = localStorage.getItem('token')
   if (to.meta.public) {
-    next()
-  } else if (!token) {
-    next('/login')
-  } else {
-    next()
+    return next()
   }
+  if (!token) {
+    return next('/login')
+  }
+  // 角色级路由守卫：菜单已隐藏，这里防手输 URL 绕过
+  const need = to.meta.roles
+  if (need && need.length) {
+    let role = ''
+    try {
+      role = JSON.parse(localStorage.getItem('user') || '{}').role || ''
+    } catch (e) {
+      role = ''
+    }
+    if (!need.includes(role)) {
+      ElMessage.warning('当前角色无权访问该页面')
+      return next('/dashboard')
+    }
+  }
+  next()
 })
 
 export default router

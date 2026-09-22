@@ -4,7 +4,12 @@
       <el-input v-model="keyword" placeholder="搜索主体名称/联系人" style="width:240px"
                 clearable @keyup.enter="load" />
       <el-button type="primary" @click="load">查询</el-button>
-      <el-button type="success" @click="openDialog()">新增主体</el-button>
+      <!-- 新增主体：种植主体可录入自己的主体信息；收购商只读 -->
+      <el-button v-if="userStore.perms.can_write_production" type="success"
+                 @click="openDialog()">新增主体</el-button>
+      <el-tag v-if="!userStore.perms.can_view_all" type="info" effect="plain">
+        {{ userStore.isBuyer ? '仅显示已审核通过的主体' : '仅显示我的主体数据' }}
+      </el-tag>
     </div>
 
     <el-table :data="list" v-loading="loading" border stripe>
@@ -22,12 +27,15 @@
       </el-table-column>
       <el-table-column label="操作" width="220" fixed="right">
         <template #default="{ row }">
-          <el-button link type="primary" @click="openDialog(row)">编辑</el-button>
-          <el-button link type="success" v-if="row.audit_status !== 'approved'"
-                     @click="audit(row, 'approved')">通过</el-button>
-          <el-button link type="warning" v-if="row.audit_status !== 'rejected'"
-                     @click="audit(row, 'rejected')">驳回</el-button>
-          <el-button link type="danger" @click="remove(row)">删除</el-button>
+          <el-button v-if="userStore.perms.can_write_production" link type="primary"
+                     @click="openDialog(row)">编辑</el-button>
+          <!-- 审核按钮仅监管/管理员可见（后端同步拦截，防绕过） -->
+          <el-button v-if="userStore.perms.can_audit && row.audit_status !== 'approved'"
+                     link type="success" @click="audit(row, 'approved')">通过</el-button>
+          <el-button v-if="userStore.perms.can_audit && row.audit_status !== 'rejected'"
+                     link type="warning" @click="audit(row, 'rejected')">驳回</el-button>
+          <el-button v-if="userStore.perms.can_write_production" link type="danger"
+                     @click="remove(row)">删除</el-button>
         </template>
       </el-table-column>
     </el-table>
@@ -75,6 +83,9 @@
 import { ref, onMounted, reactive } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { listProducer, createProducer, updateProducer, deleteProducer, auditProducer } from '@/api'
+import { useUserStore } from '@/store/user'
+
+const userStore = useUserStore()
 
 const list = ref([])
 const total = ref(0)

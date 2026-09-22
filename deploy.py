@@ -91,11 +91,15 @@ def do_upload(cli):
     mkdirs(sftp, REMOTE_BACKEND)
 
     print("=== 1) 上传后端源码 ===")
+    # ★ 关键：必须排除 db.sqlite3 与 .env
+    #   - db.sqlite3 覆盖服务器会直接毁掉生产数据
+    #   - .env 由本脚本在服务器端单独生成（含生产密钥）
     n1 = put_dir(
         sftp,
         os.path.join(LOCAL, "backend"),
         REMOTE_BACKEND,
-        skip={"__pycache__", ".venv", "venv", "staticfiles", ".git"},
+        skip={"__pycache__", ".venv", "venv", "staticfiles", ".git",
+              "db.sqlite3", ".env", "media"},
     )
     print(f"  上传 {n1} 个文件")
 

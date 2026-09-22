@@ -2,7 +2,14 @@
   <el-card shadow="never">
     <div class="toolbar">
       <el-button type="primary" @click="load">刷新</el-button>
-      <el-button type="success" @click="openDialog()">新增检测报告</el-button>
+      <el-button v-if="userStore.perms.can_write_production" type="success"
+                 @click="openDialog()">新增检测报告</el-button>
+      <el-tag v-if="userStore.isBuyer" type="info" effect="plain">
+        仅显示合格结论的报告
+      </el-tag>
+      <el-tag v-else-if="userStore.isProducer" type="info" effect="plain">
+        仅显示我的报告数据
+      </el-tag>
     </div>
 
     <el-table :data="list" v-loading="loading" border stripe>
@@ -25,7 +32,8 @@
       </el-table-column>
       <el-table-column label="操作" width="90" fixed="right">
         <template #default="{ row }">
-          <el-button link type="danger" @click="remove(row)">删除</el-button>
+          <el-button v-if="userStore.perms.can_write_production" link type="danger"
+                     @click="remove(row)">删除</el-button>
         </template>
       </el-table-column>
     </el-table>
@@ -73,6 +81,9 @@
 import { ref, onMounted, reactive } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { listReport, createReport, deleteReport, listBatch } from '@/api'
+import { useUserStore } from '@/store/user'
+
+const userStore = useUserStore()
 
 const list = ref([])
 const batches = ref([])

@@ -12,26 +12,10 @@
         text-color="#c0c4cc"
         active-text-color="#ffd04b"
       >
-        <el-menu-item index="/dashboard">
-          <el-icon><DataLine /></el-icon><span>数据看板</span>
-        </el-menu-item>
-        <el-menu-item index="/producer">
-          <el-icon><OfficeBuilding /></el-icon><span>生产主体</span>
-        </el-menu-item>
-        <el-menu-item index="/batch">
-          <el-icon><Box /></el-icon><span>生产批次</span>
-        </el-menu-item>
-        <el-menu-item index="/report">
-          <el-icon><Document /></el-icon><span>检测报告</span>
-        </el-menu-item>
-        <el-menu-item index="/certificate">
-          <el-icon><Postcard /></el-icon><span>合格证管理</span>
-        </el-menu-item>
-        <el-menu-item index="/evidence">
-          <el-icon><Lock /></el-icon><span>存证与核验</span>
-        </el-menu-item>
-        <el-menu-item index="/supply">
-          <el-icon><ShoppingCart /></el-icon><span>产销对接</span>
+        <!-- 菜单按角色渲染：menus 已按当前角色过滤 -->
+        <el-menu-item v-for="m in menus" :key="m.path" :index="m.path">
+          <el-icon><component :is="m.icon" /></el-icon>
+          <span>{{ m.label }}</span>
         </el-menu-item>
       </el-menu>
     </el-aside>
@@ -41,6 +25,7 @@
         <div class="header-title">{{ route.meta.title }}</div>
         <div class="header-right">
           <el-tag type="success" effect="plain" size="small">可信存证已启用</el-tag>
+          <el-tag type="warning" effect="plain" size="small">{{ scopeLabel }}</el-tag>
           <el-dropdown @command="onCommand">
             <span class="user-info">
               <el-icon><User /></el-icon>
@@ -49,7 +34,8 @@
             </span>
             <template #dropdown>
               <el-dropdown-menu>
-                <el-dropdown-item command="logout">退出登录</el-dropdown-item>
+                <el-dropdown-item command="roles">查看权限说明</el-dropdown-item>
+                <el-dropdown-item command="logout" divided>退出登录</el-dropdown-item>
               </el-dropdown-menu>
             </template>
           </el-dropdown>
@@ -81,8 +67,38 @@ const roleMap = {
   buyer: '收购商'
 }
 const roleLabel = computed(() => roleMap[userStore.role] || userStore.role)
+const scopeLabel = computed(() => {
+  if (userStore.isRegulator) return '全量数据可见'
+  if (userStore.isProducer) return '仅我的数据'
+  if (userStore.isBuyer) return '仅可交易数据'
+  return ''
+})
+
+// 全部菜单定义，roles 为空表示所有角色可见
+const ALL_MENUS = [
+  { path: '/dashboard', label: '数据看板', icon: 'DataLine', roles: [] },
+  { path: '/producer', label: '生产主体', icon: 'OfficeBuilding', roles: [] },
+  { path: '/batch', label: '生产批次', icon: 'Box', roles: [] },
+  { path: '/report', label: '检测报告', icon: 'Document', roles: [] },
+  { path: '/certificate', label: '合格证管理', icon: 'Postcard', roles: [] },
+  { path: '/evidence', label: '存证与核验', icon: 'Lock', roles: [] },
+  { path: '/supply', label: '产销对接', icon: 'ShoppingCart', roles: [] },
+  { path: '/intent', label: '产销意向单', icon: 'Connection', roles: [] },
+  { path: '/log', label: '操作日志', icon: 'Tickets', roles: [] },
+  { path: '/roles', label: '权限说明', icon: 'Key', roles: [] }
+]
+
+// ★ 按角色过滤菜单 —— 角色差异化的直观体现
+const menus = computed(() => {
+  const role = userStore.role
+  return ALL_MENUS.filter((m) => !m.roles.length || m.roles.includes(role))
+})
 
 const onCommand = async (cmd) => {
+  if (cmd === 'roles') {
+    router.push('/roles')
+    return
+  }
   if (cmd === 'logout') {
     await ElMessageBox.confirm('确认退出登录？', '提示', { type: 'warning' })
     userStore.logout()
@@ -118,7 +134,7 @@ const onCommand = async (cmd) => {
   height: 60px;
 }
 .header-title { font-size: 16px; font-weight: 600; }
-.header-right { display: flex; align-items: center; gap: 16px; }
+.header-right { display: flex; align-items: center; gap: 12px; }
 .user-info {
   display: flex;
   align-items: center;

@@ -144,6 +144,25 @@ def anchor_report(report) -> EvidenceRecord:
                         report.report_no, digest, payload, result)
 
 
+def anchor_revoke(cert: Certificate, reason: str = "") -> EvidenceRecord:
+    """
+    合格证作废存证。
+
+    作废必须留痕 —— 否则「已作废的证」与「从未存在过的证」在链上无法区分。
+    存证原文 = cert_no + 作废标记 + 原因 + 时间，单独一条 REVOKE 类型记录。
+    注意：biz_id 用负数偏移，避免与 CERTIFICATE 类型的同 id 记录冲突。
+    """
+    from datetime import datetime as _dt
+    payload = "|".join([
+        cert.cert_no, "REVOKED", reason.strip(), _fmt(_dt.now()),
+    ])
+    digest = sha256_hex(payload)
+    result = _anchor(digest, payload, EvidenceRecord.BizType.REVOKE,
+                     cert.id, cert.cert_no)
+    return _save_record(EvidenceRecord.BizType.REVOKE, cert.id,
+                        cert.cert_no, digest, payload, result)
+
+
 def verify_certificate(cert: Certificate, check_chain: bool = False) -> dict:
     """
     验真：重算当前合格证哈希，与存证记录中的摘要比对；可选做链上二次核验。

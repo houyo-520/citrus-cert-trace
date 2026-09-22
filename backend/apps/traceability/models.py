@@ -246,3 +246,99 @@ class SupplyDemand(BaseModel):
 
     def __str__(self):
         return self.title
+
+
+# ---------------------------------------------------------------
+# 8. 产销意向单（对接过程留痕：谁对哪条供需发起了对接）
+# ---------------------------------------------------------------
+class MatchIntent(BaseModel):
+    """
+    产销对接意向单。
+
+    原实现里「对接」只是把 SupplyDemand.deal_status 改成 matched，
+    既没有留痕也无法追溯是谁发起的。这里把它建模成独立实体：
+    一次对接 = 一条意向单，供需双方、发起人、数量、成交价全部落库，
+    并可回写供需单的对接状态，形成完整链路。
+    """
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "待确认"
+        ACCEPTED = "accepted", "已接受"
+        REJECTED = "rejected", "已拒绝"
+        DONE = "done", "已完成"
+
+    supply = models.ForeignKey(SupplyDemand, on_delete=models.CASCADE,
+                               verbose_name="关联供需单", related_name="intents")
+    initiator = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+                                  null=True, blank=True, verbose_name="发起人",
+                                  related_name="match_intents")
+    quantity_kg = models.DecimalField("意向数量(kg)", max_digits=12, decimal_places=2,
+                                      default=0)
+    price = models.DecimalField("意向单价(元/kg)", max_digits=10, decimal_places=2,
+                                default=0)
+    status = models.CharField("意向状态", max_length=20, choices=Status.choices,
+                              default=Status.PENDING)
+    # 匹配度打分（0-100），由 services.score_match 计算，便于答辩展示算法
+    match_score = models.IntegerField("匹配度评分", default=0)
+    score_detail = models.CharField("评分明细", max_length=255, blank=True, default="")
+    message = models.CharField("对接留言", max_length=255, blank=True, default="")
+
+    class Meta:
+        db_table = "biz_match_intent"
+        verbose_name = "产销意向单"
+        verbose_name_plural = "产销意向单"
+        ordering = ["-id"]
+
+    def __str__(self):
+        return f"意向#{self.id} -> {self.supply_id}"
+
+
+# ---------------------------------------------------------------
+# 9. 操作审计日志（谁 / 何时 / 对哪条数据 / 做了什么）
+# ---------------------------------------------------------------
+class OperationLog(BaseModel):
+    """
+    操作审计日志。
+
+    为什么需要：本系统主题是「可信存证」，但存证记录本身也需要被审计 ——
+    谁在什么时候签发了合格证、谁把它作废了、谁触发了存证。
+    这张表与链上存证互补：链上锚定的是「数据摘要」，日志锚定的是「操作行为」。
+    """
+
+    class Action(models.TextChoices):
+        LOGIN = "login", "登录"
+        CREATE = "create", "新增"
+        UPDATE = "update", "修改"
+        DELETE = "delete", "删除"
+        AUDIT = "audit", "审核"
+        ISSUE = "issue", "签发"
+        REVOKE = "revoke", "作废"
+        ANCHOR = "anchor", "存证"
+        VERIFY = "verify", "验真"
+        MATCH = "match", "产销对接"
+
+    operator = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+                                 null=True, blank=True, verbose_name="操作人",
+                                 related_name="operation_logs")
+    operator_name = models.CharField("操作人账号", max_length=50, blank=True, default="")
+    operator_role = models.CharField("操作人角色", max_length=20, blank=True, default="")
+    action = models.CharField("操作类型", max_length=20, choices=Action.choices)
+    target_type = models.CharField("对象类型", max_length=40, blank=True, default="")
+    target_id = models.IntegerField("对象ID", null=True, blank=True)
+    target_no = models.CharField("对象编号", max_length=60, blank=True, default="")
+    detail = models.CharField("操作详情", max_length=255, blank=True, default="")
+    ip = models.CharField("来源IP", max_length=50, blank=True, default="")
+    success = models.BooleanField("是否成功", default=True)
+
+    class Meta:
+        db_table = "sys_operation_log"
+        verbose_name = "操作日志"
+        verbose_name_plural = "操作日志"
+        ordering = ["-id"]
+        indexes = [
+            models.Index(fields=["action"]),
+            models.Index(fields=["target_type", "target_id"]),
+        ]
+
+    def __str__(self):
+        return f"{self.operator_name} {self.get_action_display()} {self.target_no}"

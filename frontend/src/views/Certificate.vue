@@ -2,7 +2,13 @@
   <el-card shadow="never">
     <div class="toolbar">
       <el-button type="primary" @click="load">刷新</el-button>
-      <el-button type="success" @click="openDialog()">签发合格证</el-button>
+      <!-- 签发合格证仅监管/管理员可见（后端同样拦截，前端隐藏只是体验优化） -->
+      <el-button v-if="userStore.perms.can_issue" type="success" @click="openDialog()">
+        签发合格证
+      </el-button>
+      <el-tag v-else type="info" effect="plain">
+        当前角色为只读，签发/作废需监管人员权限
+      </el-tag>
     </div>
 
     <el-table :data="list" v-loading="loading" border stripe>
@@ -33,11 +39,12 @@
       <el-table-column label="操作" width="230" fixed="right">
         <template #default="{ row }">
           <el-button link type="primary" @click="showQrcode(row)">二维码</el-button>
-          <el-button link type="success" v-if="row.status !== 'issued'"
+          <el-button link type="success" v-if="userStore.perms.can_issue && row.status !== 'issued'"
                      @click="issue(row)">签发</el-button>
-          <el-button link type="warning" v-if="row.status !== 'revoked'"
+          <el-button link type="warning" v-if="userStore.perms.can_revoke && row.status !== 'revoked'"
                      @click="revoke(row)">作废</el-button>
-          <el-button link type="danger" @click="remove(row)">删除</el-button>
+          <el-button link type="danger" v-if="userStore.perms.can_issue"
+                     @click="remove(row)">删除</el-button>
         </template>
       </el-table-column>
     </el-table>
@@ -104,7 +111,9 @@ import {
   listCertificate, createCertificate, issueCertificate, revokeCertificate,
   deleteCertificate, listBatch, listReport
 } from '@/api'
+import { useUserStore } from '@/store/user'
 
+const userStore = useUserStore()
 const list = ref([])
 const batches = ref([])
 const reports = ref([])
@@ -170,9 +179,13 @@ const issue = async (row) => {
 }
 
 const revoke = async (row) => {
-  await ElMessageBox.confirm(`确认作废合格证「${row.cert_no}」？`, '提示', { type: 'warning' })
-  await revokeCertificate(row.id)
-  ElMessage.success('已作废')
+  const { value } = await ElMessageBox.prompt(
+    `确认作废合格证「${row.cert_no}」？请填写作废原因（将记入审计日志与链上存证）`,
+    '作废合格证',
+    { type: 'warning', inputPlaceholder: '如：抽检不合格 / 信息填报有误' }
+  )
+  await revokeCertificate(row.id, value || '')
+  ElMessage.success('已作废，作废记录已存证并留痕')
   load()
 }
 

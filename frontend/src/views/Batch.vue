@@ -2,7 +2,15 @@
   <el-card shadow="never">
     <div class="toolbar">
       <el-button type="primary" @click="load">刷新</el-button>
-      <el-button type="success" @click="openDialog()">新增批次</el-button>
+      <!-- 生产数据录入：种植主体与监管可写，收购商只读 -->
+      <el-button v-if="userStore.perms.can_write_production" type="success"
+                 @click="openDialog()">新增批次</el-button>
+      <el-tag v-if="userStore.isBuyer" type="info" effect="plain">
+        仅显示已审核通过主体的批次
+      </el-tag>
+      <el-tag v-else-if="userStore.isProducer" type="info" effect="plain">
+        仅显示我的批次数据
+      </el-tag>
     </div>
 
     <el-table :data="list" v-loading="loading" border stripe>
@@ -66,6 +74,9 @@
 import { ref, onMounted, reactive } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { listBatch, createBatch, deleteBatch, anchorBatch, listProducer } from '@/api'
+import { useUserStore } from '@/store/user'
+
+const userStore = useUserStore()
 
 const list = ref([])
 const producers = ref([])

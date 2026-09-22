@@ -28,7 +28,8 @@ export const deleteReport = (id) => request.delete(`/report/${id}/`)
 export const listCertificate = (params) => request.get('/certificate/', { params })
 export const createCertificate = (data) => request.post('/certificate/', data)
 export const issueCertificate = (id) => request.post(`/certificate/${id}/issue/`)
-export const revokeCertificate = (id) => request.post(`/certificate/${id}/revoke/`)
+export const revokeCertificate = (id, reason) =>
+  request.post(`/certificate/${id}/revoke/`, { reason })
 export const deleteCertificate = (id) => request.delete(`/certificate/${id}/`)
 
 // ---- 存证 ----
@@ -42,6 +43,23 @@ export const listSupply = (params) => request.get('/supply/', { params })
 export const createSupply = (data) => request.post('/supply/', data)
 export const deleteSupply = (id) => request.delete(`/supply/${id}/`)
 export const matchSupply = (id) => request.post(`/supply/${id}/match/`)
+// ★ 智能匹配推荐（返回按匹配度降序的候选，含各因子得分明细）
+export const recommendSupply = (id, limit = 5) =>
+  request.get(`/supply/${id}/recommend/`, { params: { limit } })
+// ★ 发起产销意向单
+export const createIntent = (id, data) => request.post(`/supply/${id}/intent/`, data)
+
+// ---- 产销意向单 ----
+export const listIntent = (params) => request.get('/intent/', { params })
+export const respondIntent = (id, status) =>
+  request.post(`/intent/${id}/respond/`, { status })
+export const deleteIntent = (id) => request.delete(`/intent/${id}/`)
+
+// ---- 操作日志 ----
+export const listLog = (params) => request.get('/log/', { params })
+
+// ---- 权限矩阵 ----
+export const getRoleMatrix = () => request.get('/role-matrix/')
 
 // ---- 公众验真（免登录） ----
 export const publicVerify = (certNo) => request.get(`/public/verify/${certNo}/`)

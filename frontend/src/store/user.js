@@ -9,7 +9,13 @@ export const useUserStore = defineStore('user', {
   getters: {
     isLogin: (state) => !!state.token,
     role: (state) => state.user?.role || '',
-    username: (state) => state.user?.username || ''
+    username: (state) => state.user?.username || '',
+    // 权限清单由后端下发（/api/auth/profile/ 的 permissions 字段）
+    perms: (state) => state.user?.permissions || {},
+    isRegulator: (state) =>
+      ['admin', 'regulator'].includes(state.user?.role || ''),
+    isProducer: (state) => (state.user?.role || '') === 'producer',
+    isBuyer: (state) => (state.user?.role || '') === 'buyer'
   },
   actions: {
     async login(form) {
@@ -20,6 +26,10 @@ export const useUserStore = defineStore('user', {
       localStorage.setItem('token', data.access)
       localStorage.setItem('user', JSON.stringify(data.user))
       return data
+    },
+    setUser(user) {
+      this.user = user
+      localStorage.setItem('user', JSON.stringify(user))
     },
     logout() {
       this.token = ''
