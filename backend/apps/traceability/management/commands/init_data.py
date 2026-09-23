@@ -109,6 +109,34 @@ class Command(BaseCommand):
         if not InspectionRecord.objects.exists():
             self._create_inspections(regulator_user)
 
+        # 4.5) ★ 补一张草稿合格证：演示「草稿不占号 → 提交送审 → 签发分配编号」全流程
+        #      没有草稿时，主体端的「提交」按钮不会出现（按钮条件是 status=draft），
+        #      答辩现场就无法演示这条主线。这里幂等补一张。
+        #      注意：提交送审要求先关联检测报告，所以给该批次也补一份报告，
+        #      否则「提交」会因缺报告而失败，流程仍演示不通。
+        if not Certificate.objects.filter(status=Certificate.Status.DRAFT).exists():
+            pb = (ProductBatch.objects.filter(producer=p2).first()
+                  or ProductBatch.objects.order_by("-id").first())
+            if pb:
+                rpt = TestReport.objects.filter(batch=pb).first()
+                if not rpt:
+                    rpt = TestReport.objects.create(
+                        report_no=f"RPT-{pb.batch_no.split('-')[-1]}-D",
+                        batch=pb, test_org="眉山市丹棱县农产品质量检测中心",
+                        test_date=date.today(), conclusion=TestReport.Conclusion.QUALIFIED,
+                        pesticide_residue="未检出（<0.01mg/kg）",
+                        heavy_metal="符合 GB 2762 标准",
+                        remark="用于演示「建档 → 提交送审 → 签发分配编号」流程",
+                    )
+                    self.stdout.write(f"  已补充检测报告 {rpt.report_no}（草稿提交前置条件）")
+                Certificate.objects.create(
+                    batch=pb, report=rpt, producer_name=pb.producer.name,
+                    product_name="柑橘", quantity_kg=3000,
+                    status=Certificate.Status.DRAFT, issuer=regulator_user,
+                    remark="待提交审核（演示编号分配流程）",
+                )
+                self.stdout.write("  已补充草稿合格证 1 张（用于演示提交送审 → 签发分配编号）")
+
         # 5) 补操作日志（若没有）
         if not OperationLog.objects.exists():
             rows = []
