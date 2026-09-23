@@ -57,9 +57,16 @@ echo "开始重写（每个提交都会检出并重新提交，需要一点时�
 echo ""
 
 git filter-branch --force --tree-filter "
-  if [ -f deploy.py ]; then
-    sed -i $(printf '%s ' "${SED_ARGS[@]}") deploy.py
-  fi
+  # ★ 覆盖所有文本文件，不只 deploy.py。
+  #   原因：早期版本的扫描器自己内嵌了凭据明文（作为检测规则），
+  #   那也是一处泄露，必须一起清掉。只改 deploy.py 会漏掉它。
+  for f in \$(git ls-files); do
+    case \"\$f\" in
+      *.py|*.js|*.mjs|*.vue|*.json|*.md|*.sh|*.txt|*.yml|*.yaml|*.env|*.example|*.conf|*.html)
+        [ -f \"\$f\" ] && sed -i $(printf '%s ' "${SED_ARGS[@]}") \"\$f\"
+        ;;
+    esac
+  done
   # 私钥文件若曾入库，一并移除
   rm -f backend/.fisco_account.json backend/.fisco_contract.json 2>/dev/null
   true
