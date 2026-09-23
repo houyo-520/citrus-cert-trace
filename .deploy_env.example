@@ -1,0 +1,29 @@
+# ============================================================
+# deploy.py 部署凭据模板
+# ============================================================
+# 用法：
+#   1. 复制本文件为 .deploy_env（该文件名已在 .gitignore 中，不会被提交）
+#        cp .deploy_env.example .deploy_env
+#   2. 填入真实的服务器密码 / Django 密钥 / 链上私钥
+#   3. 直接执行 python deploy.py check 即可，脚本会自动读取本文件
+#
+# 格式说明（两种写法都支持）：
+#   KEY=value
+#   export KEY=value
+# 环境变量优先级高于本文件 —— 需要临时换目标服务器时用 export 覆盖即可。
+#
+# ⚠️ 切勿把 .deploy_env 提交到版本库。
+# ============================================================
+
+# ---- 目标服务器 ----
+CITRUS_SSH_HOST=<your-server-ip>
+CITRUS_SSH_USER=ubuntu
+CITRUS_SSH_PASSWORD=
+
+# ---- Django 生产密钥 ----
+# 生成：python3 -c "import secrets; print(secrets.token_urlsafe(50))"
+CITRUS_SECRET_KEY=
+
+# ---- 联盟链存证账户私钥 ----
+# 该账户需有链上写入权限，泄漏后他人可冒充本系统向链上写存证
+CITRUS_CHAIN_PRIVATE_KEY=

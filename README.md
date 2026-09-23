@@ -177,7 +177,22 @@ draft 草稿 ──提交──> pending 待审核 ──签发(分配编号)─
 **公众公示**：`GET /api/public/verify/<cert_no>/` 会附带监督检查信息，
 消费者扫码即可看到「这张证是否被查出过问题、整改是否闭环」，无需登录。
 
-### 7. 操作审计日志
+### 7. 检测报告附件上传
+
+`TestReport.file` 以 `FileField` 落地，检测报告可附上第三方检测机构出具的 PDF 扫描件：
+
+- **两处上传入口**：新建报告时随表单一并提交；已有报告行内「上传」补传。
+- **后端可信边界**：序列化器校验扩展名白名单（pdf / jpg / jpeg / png）与 10 MB 上限，
+  不依赖前端限制（前端可绕过）。
+- **`file_name` 回显原始文件名**：Django 存盘会加随机后缀（`report_rBcOEvO.pdf`），
+  展示层剥离，用户看到的是自己上传的名字。
+- **附件随记录清理**：`FileField` 只存路径，删记录不会自动删磁盘文件。
+  删除报告时连带删除附件、替换附件时清理旧文件，避免长期积累孤儿文件。
+- **nginx `^~ /media/`**：附件由 nginx 直接托管。必须用 `^~` 前缀 ——
+  按扩展名的正则 location 优先级更高，会把 `.jpg` 附件交给以「前端 dist」为基准的
+  `try_files`，导致「上传成功但打不开」。
+
+### 8. 操作审计日志
 
 - 链上存证锚定**数据摘要**，审计日志锚定**操作行为**，二者互补构成完整可信链。
 - 覆盖动作：`登录 / 新增 / 修改 / 删除 / 审核 / 签发 / 作废 / 存证 / 验真 / 产销对接 / 监督检查 / 整改复查`。
@@ -186,9 +201,9 @@ draft 草稿 ──提交──> pending 待审核 ──签发(分配编号)─
 - 日志本身按角色隔离：种植主体/收购商只能查看自己的操作记录。
 - `GET /api/log/` 支持按 `action / operator / target_type / keyword` 组合筛选。
 
-### 8. 单元测试
+### 9. 单元测试
 
-`backend/apps/traceability/tests.py` 含 **71 个用例**，覆盖 8 个测试类：
+`backend/apps/traceability/tests.py` 含 **83 个用例**，覆盖 10 个测试类：
 
 | 测试类 | 用例数 | 关注点 |
 | --- | --- | --- |
@@ -200,6 +215,8 @@ draft 草稿 ──提交──> pending 待审核 ──签发(分配编号)─
 | `EndToEndFlowTest` | 1 | 建档 → 提交 → 签发（分配编号）→ 公众验真 |
 | `CertNoRuleTest` | 12 | 编号规则、区域码容错、流水递增、**防占号**、重复签发不换号 |
 | `InspectionTest` | 19 | 执法闭环、合格证暂停/恢复、逾期判定、存证原文稳定性、数据隔离 |
+| `ReportFileUploadTest` | 8 | 附件上传/替换/删除、扩展名白名单、大小上限、权限、文件清理 |
+| `InspectionBizNoTest` | 4 | 检查存证的链上编号独立性（同证多条检查互不覆盖） |
 
 运行：`python manage.py test apps.traceability apps.accounts`
 
@@ -224,10 +241,11 @@ draft 草稿 ──提交──> pending 待审核 ──签发(分配编号)─
 │   │       ├── matching.py        # ★ 产销智能匹配算法
 │   │       ├── serializers.py
 │   │       ├── views.py           # ViewSet + 公众验真 + 链状态 + 看板 + 角色矩阵
-│   │       ├── tests.py           # ★ 71 个单元测试
+│   │       ├── tests.py           # ★ 83 个单元测试
 │   │       ├── urls.py
 │   │       ├── admin.py
 │   │       └── management/commands/init_data.py  # 演示数据
+│   ├── media/                     # 上传附件（检测报告 PDF 等，不入库）
 │   ├── .env.example               # 链配置模板（复制为 .env）
 │   ├── requirements.txt
 │   └── manage.py
@@ -348,7 +366,7 @@ FISCO_ENABLE_CHAIN=true
 | POST | `/api/producer/<id>/audit/` | 监管 | 主体审核 |
 | CRUD | `/api/batch/` | 登录（范围隔离） | 生产批次 |
 | POST | `/api/batch/<id>/anchor/` | 监管/主体 | 批次存证上链 |
-| CRUD | `/api/report/` | 登录（范围隔离） | 检测报告 |
+| CRUD | `/api/report/` | 登录（范围隔离） | 检测报告（支持 `multipart` 附件上传） |
 | POST | `/api/report/<id>/anchor/` | 监管/主体 | 报告存证上链 |
 | CRUD | `/api/certificate/` | 登录（范围隔离） | 合格证（建档为草稿，不占号） |
 | GET | `/api/certificate/peek-cert-no/` | 登录 | ★ 预看下一个 19 位编号（不占用） |
