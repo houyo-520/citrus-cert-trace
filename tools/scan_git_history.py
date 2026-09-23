@@ -8,17 +8,30 @@
 
 做法：遍历全部提交，读取每个版本的 deploy.py，检查是否含已知凭据。
 """
-import re
+import os
 import subprocess
 import sys
 
-REPO = r"D:\HuaweiMoveData\Users\houyo\Desktop\毕设源\源代码"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-KNOWN = {
-    "服务器 SSH 密码": "__SET_VIA_ENV__",
-    "Django SECRET_KEY": "__SET_VIA_ENV__",
-    "链上账户私钥": "__SET_VIA_ENV__",
-}
+# ★ 与 scan_secrets.py 同理：凭据明文不写死在本文件（会被提交），
+#   从 .gitignore 排除的 .known_secrets 读取。
+SECRETS_FILE = os.path.join(REPO, ".known_secrets")
+
+
+def load_known():
+    if not os.path.isfile(SECRETS_FILE):
+        return {}
+    out = {}
+    with open(SECRETS_FILE, encoding="utf-8") as f:
+        for i, line in enumerate(f, 1):
+            s = line.strip()
+            if s and not s.startswith("#"):
+                out[f"已知凭据 #{i}"] = s
+    return out
+
+
+KNOWN = load_known()
 
 
 def git(*args, **kw):

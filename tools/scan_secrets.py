@@ -18,14 +18,29 @@ import re
 import subprocess
 import sys
 
-REPO = r"D:\HuaweiMoveData\Users\houyo\Desktop\毕设源\源代码"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# ---- 已知的凭据明文（来自历史代码，必须全部清零）----
-KNOWN = {
-    "服务器 SSH 密码": "__SET_VIA_ENV__",
-    "Django SECRET_KEY": "__SET_VIA_ENV__",
-    "链上账户私钥": "__SET_VIA_ENV__",
-}
+# ---- 已知的凭据明文 ----
+# ★ 不写死在本文件里 —— 否则扫描器自己就成了新的泄露源
+#   （它会被提交进仓库，明文跟着进去）。
+#   改从 .known_secrets 读取，该文件已被 .gitignore 排除。
+SECRETS_FILE = os.path.join(REPO, ".known_secrets")
+
+
+def load_known():
+    """从 .known_secrets 读取待检凭据。文件不存在则返回空（仅靠模式匹配）。"""
+    if not os.path.isfile(SECRETS_FILE):
+        return {}
+    out = {}
+    with open(SECRETS_FILE, encoding="utf-8") as f:
+        for i, line in enumerate(f, 1):
+            s = line.strip()
+            if s and not s.startswith("#"):
+                out[f"已知凭据 #{i}"] = s
+    return out
+
+
+KNOWN = load_known()
 
 # ---- 通用凭据模式（排除占位符/环境变量引用）----
 PATTERNS = [
@@ -40,7 +55,8 @@ PATTERNS = [
 FORBIDDEN = [
     "backend/db.sqlite3", "backend/media", "frontend/node_modules",
     "frontend/dist", "backend/staticfiles", "backend/.env",
-    ".deploy_env",
+    ".deploy_env", ".known_secrets", "backend/.fisco_account.json",
+    "backend/.fisco_contract.json",
 ]
 
 SKIP_DIRS = {"node_modules", ".git", "__pycache__", ".venv", "venv",
@@ -70,6 +86,10 @@ warns = []
 print("=" * 66)
 print("推送前敏感信息扫描")
 print("=" * 66)
+if not KNOWN:
+    print("\n⚠️  未找到 .known_secrets，仅按通用模式匹配（漏检率会升高）")
+else:
+    print(f"\n已从 .known_secrets 载入 {len(KNOWN)} 个待检凭据")
 
 # ---------- 0. 先确定「哪些文件会被推送」----------
 # ★ 这是本扫描器的核心判据：只有 git 会推送的内容才构成泄露风险。

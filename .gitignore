@@ -28,6 +28,7 @@ yarn-error.log*
 .env
 .env.local
 .deploy_env
+.known_secrets
 .fisco_account.json
 .fisco_contract.json
 
