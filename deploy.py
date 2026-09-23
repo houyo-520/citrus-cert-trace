@@ -65,6 +65,11 @@ def _load_deploy_env():
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
+            # 容忍 `export KEY=value` 这种 shell 写法 —— 直接抄 shell 命令
+            # 进来是很自然的动作，若不剥掉 `export ` 前缀，
+            # 解析出的键会变成 "export KEY"，凭据静默读不到。
+            if line.startswith("export "):
+                line = line[len("export "):].strip()
             k, v = line.split("=", 1)
             k, v = k.strip(), v.strip().strip("'\"")
             if k and k not in os.environ:
