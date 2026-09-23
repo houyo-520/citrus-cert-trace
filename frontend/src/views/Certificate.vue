@@ -146,9 +146,17 @@
       </template>
     </el-dialog>
 
-    <el-dialog v-model="qrVisible" title="合格证追溯二维码" width="360px" align-center>
+    <el-dialog v-model="qrVisible" title="合格证追溯二维码" width="380px" align-center>
       <div class="qr-box" v-if="qrCert">
-        <img :src="qrUrl" alt="二维码" class="qr-img" />
+        <div v-if="qrError" class="qr-fallback">
+          <p class="text-danger">二维码生成失败</p>
+          <p class="text-muted">
+            {{ qrError }}<br />请复制下方链接在浏览器中打开验真页
+          </p>
+        </div>
+        <img v-else-if="qrDataUrl" :src="qrDataUrl" alt="合格证追溯二维码" class="qr-img" />
+        <div v-else class="qr-placeholder">二维码生成中…</div>
+
         <p class="qr-no mono">{{ qrCert.cert_no }}</p>
         <p class="text-muted">扫码进入公众验真页，可查看合格证、存证信息与监督检查公示</p>
         <el-input v-model="qrUrl" readonly size="small">
@@ -227,8 +235,9 @@
 </template>
 
 <script setup>
-import { ref, onMounted, reactive, computed } from 'vue'
+import { ref, onMounted, reactive, computed, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import QRCode from 'qrcode'
 import {
   listCertificate, createCertificate, issueCertificate, revokeCertificate,
   deleteCertificate, submitCertificate, rejectCertificate,
@@ -256,6 +265,33 @@ const qrUrl = computed(() => {
   if (!qrCert.value) return ''
   return `${window.location.origin}/#/verify/${qrCert.value.cert_no}`
 })
+
+// 二维码由 qrcode 库在浏览器端生成 data URL。
+// 注意：绝不能把验真页 URL 直接当 <img src>，那是 HTML 页面，浏览器按图片解码必然失败。
+const qrDataUrl = ref('')
+const qrError = ref('')
+
+watch([qrVisible, qrUrl], async ([visible, url]) => {
+  if (!visible) {
+    qrDataUrl.value = ''
+    qrError.value = ''
+    return
+  }
+  if (!url) return
+  try {
+    qrDataUrl.value = await QRCode.toDataURL(url, {
+      width: 400,
+      margin: 2,
+      errorCorrectionLevel: 'M',
+      color: { dark: '#000000', light: '#FFFFFF' }
+    })
+    qrError.value = ''
+  } catch (e) {
+    qrDataUrl.value = ''
+    qrError.value = e?.message || '请复制下方链接在浏览器中打开'
+    console.error('[certificate] 二维码生成失败', e)
+  }
+}, { immediate: true })
 
 const certStatusType = (s) => ({
   draft: 'info', pending: 'warning', issued: 'success',
@@ -384,7 +420,17 @@ onMounted(() => { load(); loadRefs() })
 <style scoped>
 .toolbar { display: flex; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; align-items: center; }
 .qr-box { text-align: center; }
-.qr-img { width: 200px; height: 200px; }
+.qr-img { width: 220px; height: 220px; display: block; margin: 0 auto; }
+.qr-placeholder {
+  width: 220px; height: 220px; margin: 0 auto; border-radius: 8px;
+  border: 1px dashed #dcdfe6; color: #909399; font-size: 13px;
+  display: flex; align-items: center; justify-content: center;
+}
+.qr-fallback {
+  min-height: 120px; padding: 18px; border-radius: 8px;
+  border: 1px dashed #f56c6c; background: #fef0f0;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;
+}
 .qr-no { font-weight: 600; margin: 10px 0 4px; }
 .mono { font-family: Consolas, Monaco, monospace; font-size: 12px; }
 .hash-text { font-size: 12px; color: #606266; }
