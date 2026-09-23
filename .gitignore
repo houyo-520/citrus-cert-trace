@@ -27,6 +27,7 @@ yarn-error.log*
 # 联盟链敏感信息（私钥、账户、部署产物）—— 绝不提交
 .env
 .env.local
+.deploy_env
 .fisco_account.json
 .fisco_contract.json
 

@@ -12,13 +12,35 @@
   python deploy.py all        # 全流程
 
 依赖：paramiko（本机 venv: C:/Users/houyo/.workbuddy/binaries/python/envs/default）
+
+---------------------------------------------------------------
+★ 凭据管理（重要）
+---------------------------------------------------------------
+本脚本**不再硬编码任何密码/密钥** —— 早先版本把服务器 SSH 密码、
+Django SECRET_KEY、链上账户私钥直接写在源码里，一旦仓库公开就全泄露。
+
+现在统一从「环境变量」或「.deploy_env 文件」读取，两者取其一：
+
+  方式一：环境变量（推荐 CI / 临时部署）
+    export CITRUS_SSH_PASSWORD='...'
+    export CITRUS_SECRET_KEY='...'
+    export CITRUS_CHAIN_PRIVATE_KEY='...'
+    python deploy.py upload
+
+  方式二：.deploy_env 文件（推荐日常开发，免每次手设）
+    在 源代码/ 下建 .deploy_env，内容形如：
+      CITRUS_SSH_PASSWORD=xxx
+      CITRUS_SECRET_KEY=xxx
+      CITRUS_CHAIN_PRIVATE_KEY=xxx
+    该文件已在 .gitignore 中排除，不会被提交。
+
+凭据实际值见 毕设源/凭据清单_请勿提交.md
 """
 import sys, os, posixpath, stat, json, time
 import paramiko
 
-HOST = "<your-server-ip>"
-USER = "ubuntu"
-PWD = "__SET_VIA_ENV__"
+HOST = os.environ.get("CITRUS_SSH_HOST", "<your-server-ip>")
+USER = os.environ.get("CITRUS_SSH_USER", "ubuntu")
 
 REMOTE_ROOT = "/home/ubuntu/citrus"
 REMOTE_BACKEND = REMOTE_ROOT + "/backend"
@@ -27,13 +49,52 @@ REMOTE_FRONT = REMOTE_ROOT + "/frontend_dist"
 # 本地源码根 = 本脚本所在目录（源代码/），便于整体移动
 LOCAL = os.path.dirname(os.path.abspath(__file__))
 
-SECRET_KEY = "__SET_VIA_ENV__"
+
+def _load_deploy_env():
+    """
+    读取 源代码/.deploy_env（若存在）并注入 os.environ。
+
+    只填「尚未设置」的键 —— 已存在的环境变量优先，
+    这样临时覆盖（export CITRUS_SSH_PASSWORD=xxx）始终生效。
+    """
+    path = os.path.join(LOCAL, ".deploy_env")
+    if not os.path.isfile(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k, v = k.strip(), v.strip().strip("'\"")
+            if k and k not in os.environ:
+                os.environ[k] = v
+
+
+_load_deploy_env()
+
+
+def _need(key, hint):
+    """取必需凭据；缺失时给出明确指引而不是抛 KeyError。"""
+    val = os.environ.get(key, "").strip()
+    if not val:
+        print(f"❌ 缺少凭据 {key}")
+        print(f"   请设置环境变量，或在 源代码/.deploy_env 中写入一行：")
+        print(f"     {key}=<{hint}>")
+        print(f"   凭据实际值见 毕设源/凭据清单_请勿提交.md")
+        sys.exit(1)
+    return val
+
+
+PWD = os.environ.get("CITRUS_SSH_PASSWORD", "")
+SECRET_KEY = os.environ.get("CITRUS_SECRET_KEY", "")
 
 
 def conn():
+    pwd = _need("CITRUS_SSH_PASSWORD", "服务器 ubuntu 用户密码")
     c = paramiko.SSHClient()
     c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    c.connect(HOST, port=22, username=USER, password=PWD, timeout=25)
+    c.connect(HOST, port=22, username=USER, password=pwd, timeout=25)
     return c
 
 
@@ -115,26 +176,41 @@ def do_upload(cli):
     print(f"  上传 {n2} 个文件（已先清空远端旧产物）")
 
     print("=== 3) 写入服务器专用 .env ===")
-    env = f"""# 生产环境配置（服务器 <your-server-ip>）
+    # ★ 不覆盖已有的 .env
+    #   服务器上的 .env 是生产配置的唯一来源（含真实密钥）。
+    #   每次部署都重写它，意味着本地必须持有全部生产密钥 —— 正是我们要避免的。
+    #   改为：只在服务器上还不存在 .env 时生成一份初始模板，其余情况原样保留。
+    code, out, _ = run(cli, f"test -f {REMOTE_BACKEND}/.env && echo EXISTS || echo MISSING",
+                       quiet=True)
+    if "EXISTS" in out:
+        print("  服务器已有 .env，保留不动（避免覆盖生产密钥）")
+    else:
+        secret = os.environ.get("CITRUS_SECRET_KEY", "")
+        chain_key = os.environ.get("CITRUS_CHAIN_PRIVATE_KEY", "")
+        if not secret or not chain_key:
+            print("  ⚠️  服务器无 .env 且本地未提供密钥，跳过生成")
+            print("     需设置 CITRUS_SECRET_KEY / CITRUS_CHAIN_PRIVATE_KEY 后重跑")
+        else:
+            env = f"""# 生产环境配置（服务器 <your-server-ip>）
 DJANGO_DEBUG=false
 DJANGO_ALLOWED_HOSTS=<your-server-ip>,localhost,127.0.0.1
-DJANGO_SECRET_KEY={SECRET_KEY}
+DJANGO_SECRET_KEY={secret}
 
 # 链与 Django 同机，走回环（RPC 不暴露公网）
 FISCO_WEB3_RPC=http://127.0.0.1:8545
 FISCO_CHAIN_ID=20200
 FISCO_GROUP_ID=group0
 FISCO_CONTRACT_ADDRESS=0x9D6aAc145B199bc406Cc4AFb8cE1571ADC619820
-FISCO_PRIVATE_KEY=__SET_VIA_ENV__
+FISCO_PRIVATE_KEY={chain_key}
 FISCO_GAS_LIMIT=500000
 FISCO_ENABLE_CHAIN=true
 
 FRONTEND_VERIFY_BASE=http://<your-server-ip>:8090/#/verify
 """
-    with sftp.open(REMOTE_BACKEND + "/.env", "w") as f:
-        f.write(env)
-    sftp.chmod(REMOTE_BACKEND + "/.env", 0o600)
-    print("  已写入 .env（权限 600）")
+            with sftp.open(REMOTE_BACKEND + "/.env", "w") as f:
+                f.write(env)
+            sftp.chmod(REMOTE_BACKEND + "/.env", 0o600)
+            print("  已生成初始 .env（权限 600）")
     sftp.close()
 
 
