@@ -186,6 +186,17 @@ def build_inspection_payload(record) -> str:
     ])
 
 
+def inspection_biz_no(record) -> str:
+    """
+    监督检查的链上业务编号。
+
+    ★ 必须带检查记录自身 id —— 合约是 `records[bizType][bizNo]` 单值映射，
+    同一 bizNo 后写会覆盖先写。若直接用 cert_no，同一张合格证上的多次检查
+    只有最后一次能在链上核验，先前记录会被永久覆盖（已实测踩坑）。
+    """
+    return f"INS-{record.id}"
+
+
 def anchor_inspection(record) -> EvidenceRecord:
     """
     监督检查结论存证上链。
@@ -194,18 +205,18 @@ def anchor_inspection(record) -> EvidenceRecord:
     检查结论一旦上链，事后任何一方都无法单方面否认「当时判了不合格」。
     对监管方是履职留痕，对被检方是程序正义保障。
     """
+    biz_no = inspection_biz_no(record)
     payload = build_inspection_payload(record)
     digest = sha256_hex(payload)
     result = _anchor(digest, payload, EvidenceRecord.BizType.INSPECTION,
-                     record.id, record.certificate.cert_no or f"INS-{record.id}")
+                     record.id, biz_no)
     record.record_hash = digest
     record.is_anchored = True
     record.anchored_at = datetime.now()
     record.save(update_fields=["record_hash", "is_anchored", "anchored_at",
                                "updated_at"])
     return _save_record(EvidenceRecord.BizType.INSPECTION, record.id,
-                        record.certificate.cert_no or f"INS-{record.id}",
-                        digest, payload, result)
+                        biz_no, digest, payload, result)
 
 
 def verify_certificate(cert: Certificate, check_chain: bool = False) -> dict:

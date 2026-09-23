@@ -23,6 +23,12 @@ export const anchorBatch = (id) => request.post(`/batch/${id}/anchor/`)
 export const listReport = (params) => request.get('/report/', { params })
 export const createReport = (data) => request.post('/report/', data)
 export const deleteReport = (id) => request.delete(`/report/${id}/`)
+// 检测报告附件：必须用 multipart/form-data 提交（axios 会自动带 boundary）
+export const uploadReportFile = (id, file) => {
+  const fd = new FormData()
+  fd.append('file', file)
+  return request.patch(`/report/${id}/`, fd)
+}
 
 // ---- 合格证 ----
 export const listCertificate = (params) => request.get('/certificate/', { params })

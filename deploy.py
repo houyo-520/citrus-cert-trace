@@ -252,8 +252,17 @@ NGINX = """server {
     location /static/ {
         alias /home/ubuntu/citrus/backend/staticfiles/;
     }
-    location /media/ {
+
+    # ★ 用户上传文件（检测报告附件等）。
+    #   必须用 `^~` 而不是普通前缀 —— 否则下面那条按扩展名匹配的正则 location
+    #   优先级更高（nginx 规则：正则 > 普通前缀），会把 .jpg/.png 类附件
+    #   交给 `try_files $uri =404`，而它的基准目录是前端 dist，
+    #   找不到文件直接 404 → 「上传成功但打不开」。
+    #   `^~` 表示命中该前缀后不再尝试正则匹配，从根上消除歧义。
+    location ^~ /media/ {
         alias /home/ubuntu/citrus/backend/media/;
+        expires 1d;
+        add_header Cache-Control "public";
     }
 
     # 静态资源长缓存：文件名含内容哈希，内容变则文件名变，可放心 immutable

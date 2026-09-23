@@ -1023,3 +1023,179 @@ class InspectionTest(BaseFixture):
         self.assertIn("整改复查", actions)
         keys = [s["key"] for s in d["cert_status_flow"]]
         self.assertIn("suspended", keys)
+
+
+# ===============================================================
+# 九、检测报告附件上传
+# ===============================================================
+class ReportFileUploadTest(BaseFixture):
+    """
+    附件上传回归。
+
+    背景：`TestReport.file` 字段建了、序列化器 `fields="__all__"` 也收，
+    但前端从来没有 el-upload —— 报告附件一度是「有字段、传不了」的半成品。
+    这里锁住后端侧的可信边界（前端 el-upload 只是体验层，不该被当作校验）。
+    """
+
+    def _file(self, name="report.pdf", content=b"%PDF-1.4 test"):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        return SimpleUploadedFile(name, content, content_type="application/pdf")
+
+    def test_create_report_without_file_still_works(self):
+        """不带附件的报告创建不能被破坏（原有主流程）"""
+        c = self.login(self.producer)
+        r = c.post("/api/report/", {
+            "report_no": "R-NOFILE-001", "batch": self.batch.id,
+            "test_org": "阿克苏检测中心", "conclusion": "qualified",
+        }, format="json")
+        self.assertEqual(r.status_code, 201, r.data)
+        self.assertEqual(r.data.get("file_name") or "", "")
+        self.assertEqual(r.data.get("file_url") or "", "")
+
+    def test_upload_file_via_multipart(self):
+        """multipart 上传成功后应能取回附件地址与文件名"""
+        c = self.login(self.producer)
+        r = c.post("/api/report/", {
+            "report_no": "R-FILE-001", "batch": self.batch.id,
+            "test_org": "阿克苏检测中心", "conclusion": "qualified",
+            "file": self._file(),
+        }, format="multipart")
+        self.assertEqual(r.status_code, 201, r.data)
+        self.assertTrue(r.data["file"], "file 字段应有值")
+        self.assertTrue(r.data["file_url"].startswith("/media/reports/"),
+                        r.data["file_url"])
+        self.assertEqual(r.data["file_name"], "report.pdf")
+
+    def test_patch_upload_existing_report(self):
+        """给已有报告补传附件（页面上「上传」按钮走的路径）"""
+        c = self.login(self.producer)
+        r = c.patch(f"/api/report/{self.report.id}/",
+                    {"file": self._file("补传版本.pdf")}, format="multipart")
+        self.assertEqual(r.status_code, 200, r.data)
+        self.report.refresh_from_db()
+        self.assertTrue(self.report.file)
+        self.assertIn("file_url", r.data)
+
+    def test_reject_unsupported_extension(self):
+        """★ 后端可信边界：绕过前端直接传可执行文件必须被拒"""
+        c = self.login(self.producer)
+        r = c.patch(f"/api/report/{self.report.id}/",
+                    {"file": self._file("evil.exe", b"MZ")}, format="multipart")
+        self.assertEqual(r.status_code, 400, r.data)
+        self.report.refresh_from_db()
+        self.assertFalse(self.report.file, "校验失败不应落库")
+
+    def test_reject_oversize_file(self):
+        """超过 10 MB 的附件必须被拒"""
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        big = SimpleUploadedFile("big.pdf", b"x" * (10 * 1024 * 1024 + 1),
+                                 content_type="application/pdf")
+        c = self.login(self.producer)
+        r = c.patch(f"/api/report/{self.report.id}/", {"file": big},
+                    format="multipart")
+        self.assertEqual(r.status_code, 400, r.data)
+
+    def test_buyer_cannot_upload(self):
+        """收购商无权上传报告附件（权限不能被上传功能绕过）"""
+        c = self.login(self.buyer)
+        r = c.patch(f"/api/report/{self.report.id}/", {"file": self._file()},
+                    format="multipart")
+        self.assertIn(r.status_code, (403, 404), r.status_code)
+
+    def test_delete_report_removes_file(self):
+        """★ 删除报告必须连带删除磁盘附件
+
+        Django 的 FileField 只存路径，删实例不会自动清理文件 ——
+        不显式删除就会积累永远没人引用的孤儿文件（实测已出现）。
+        """
+        import os
+        c = self.login(self.producer)
+        c.patch(f"/api/report/{self.report.id}/",
+                {"file": self._file("待删除.pdf")}, format="multipart")
+        self.report.refresh_from_db()
+        path = self.report.file.path
+        self.assertTrue(os.path.exists(path), "上传后文件应存在")
+
+        r = c.delete(f"/api/report/{self.report.id}/")
+        self.assertIn(r.status_code, (200, 204), r.status_code)
+        self.assertFalse(os.path.exists(path), "删除报告后附件应一并删除")
+
+    def test_replace_file_removes_old_one(self):
+        """★ 替换附件时旧文件应被清理，避免每换一次多留一份孤儿"""
+        import os
+        c = self.login(self.producer)
+        c.patch(f"/api/report/{self.report.id}/",
+                {"file": self._file("旧版.pdf")}, format="multipart")
+        self.report.refresh_from_db()
+        old_path = self.report.file.path
+
+        c.patch(f"/api/report/{self.report.id}/",
+                {"file": self._file("新版.pdf")}, format="multipart")
+        self.report.refresh_from_db()
+        new_path = self.report.file.path
+
+        self.assertNotEqual(old_path, new_path, "应换成了新文件")
+        self.assertFalse(os.path.exists(old_path), "旧附件应被清理")
+        self.assertTrue(os.path.exists(new_path), "新附件应存在")
+
+
+# ===============================================================
+# 十、监督检查链上编号唯一性（防覆盖回归）
+# ===============================================================
+class InspectionBizNoTest(BaseFixture):
+    """
+    背景：合约是 `records[bizType][bizNo]` 单值映射，同一 bizNo 后写覆盖先写。
+    早期 `anchor_inspection` 用 cert_no 当链上 biz_no，导致同一张合格证上的
+    多次检查只有最后一次能在链上核验、先前记录被永久覆盖（已实测踩坑）。
+    这里锁住「同一张证的多次检查必须各自可核验」。
+    """
+
+    def test_biz_no_uses_record_own_id(self):
+        """链上业务编号必须带检查记录自身 id，不能只用 cert_no"""
+        ins = InspectionRecord.objects.create(
+            certificate=self.cert, inspector=self.regulator,
+            inspector_name="赵国强", check_type=InspectionRecord.CheckType.ROUTINE,
+            check_result=InspectionRecord.CheckResult.QUALIFIED, check_score=95)
+        biz_no = services.inspection_biz_no(ins)
+        self.assertEqual(biz_no, f"INS-{ins.id}")
+        self.assertNotEqual(biz_no, self.cert.cert_no)
+
+    def test_two_inspections_on_same_cert_get_distinct_biz_no(self):
+        """★ 核心回归：同一张证上两次检查的链上 biz_no 必须不同（否则互相覆盖）"""
+        a = InspectionRecord.objects.create(
+            certificate=self.cert, inspector=self.regulator,
+            inspector_name="赵国强", check_type=InspectionRecord.CheckType.ROUTINE,
+            check_result=InspectionRecord.CheckResult.QUALIFIED, check_score=95)
+        b = InspectionRecord.objects.create(
+            certificate=self.cert, inspector=self.regulator,
+            inspector_name="孙丽娟", check_type=InspectionRecord.CheckType.SPECIAL,
+            check_result=InspectionRecord.CheckResult.UNQUALIFIED, check_score=60)
+        self.assertNotEqual(services.inspection_biz_no(a),
+                            services.inspection_biz_no(b))
+
+    def test_anchor_writes_record_with_id_based_biz_no(self):
+        """存证落库时 biz_no 也应是 INS-<id>，保证本地与链上口径一致"""
+        ins = InspectionRecord.objects.create(
+            certificate=self.cert, inspector=self.regulator,
+            inspector_name="赵国强", check_type=InspectionRecord.CheckType.ROUTINE,
+            check_result=InspectionRecord.CheckResult.QUALIFIED, check_score=95)
+        record = services.anchor_inspection(ins)
+        self.assertEqual(record.biz_no, f"INS-{ins.id}")
+        ins.refresh_from_db()
+        self.assertTrue(ins.is_anchored)
+        self.assertEqual(len(ins.record_hash), 64)
+
+    def test_rectify_note_not_in_payload(self):
+        """★ 上链原文只含结论性事实：整改备注变化不得改变哈希
+
+        否则监管一填整改说明，哈希就变，链核验立刻失败。
+        """
+        ins = InspectionRecord.objects.create(
+            certificate=self.cert, inspector=self.regulator,
+            inspector_name="赵国强", check_type=InspectionRecord.CheckType.ROUTINE,
+            check_result=InspectionRecord.CheckResult.UNQUALIFIED, check_score=60,
+            rectify_note="")
+        before = services.build_inspection_payload(ins)
+        ins.rectify_note = "已完成整改，复检合格"
+        after = services.build_inspection_payload(ins)
+        self.assertEqual(before, after)

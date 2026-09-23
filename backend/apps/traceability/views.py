@@ -172,11 +172,36 @@ class TestReportViewSet(RoleScopedQuerySetMixin, BaseViewSet):
                             target_no=report.report_no,
                             detail=f"新增检测报告 {report.report_no} 并自动存证")
 
+    def perform_update(self, serializer):
+        """
+        更新报告（含补传/替换附件）。
+
+        ★ 替换附件时要先删旧文件 —— 否则每换一次就在磁盘上多留一份孤儿，
+        演示库跑几轮下来 media/reports/ 会全是没人引用的历史版本。
+        """
+        old_file = self.get_object().file if self.get_object().file else None
+        report = serializer.save()
+        # 附件被换掉（或清空）时清理旧文件
+        if old_file and old_file.name != (report.file.name if report.file else ""):
+            try:
+                old_file.delete(save=False)
+            except OSError:
+                pass
+
     def perform_destroy(self, instance):
         audit.log_operation(self.request, OperationLog.Action.DELETE,
                             target_type="检测报告", target_id=instance.id,
                             target_no=instance.report_no,
                             detail=f"删除检测报告 {instance.report_no}")
+        # ★ 先删附件文件再删记录。
+        #   Django 的 FileField 只负责存路径，删除模型实例**不会**自动清理磁盘文件，
+        #   不显式删除就会在 media/reports/ 里留下永远没人引用的孤儿文件（实测已积累）。
+        #   顺序不能反：删了记录就取不到 file.name 了。
+        if instance.file:
+            try:
+                instance.file.delete(save=False)
+            except OSError:
+                pass  # 文件已不存在不应阻断删除操作
         instance.delete()
 
     @action(detail=True, methods=["post"])

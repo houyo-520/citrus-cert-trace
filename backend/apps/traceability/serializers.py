@@ -7,6 +7,10 @@ from .models import (Producer, ProductBatch, TestReport, Certificate,
                      EvidenceRecord, PublicQueryRecord, SupplyDemand,
                      MatchIntent, OperationLog, InspectionRecord)
 
+# 检测报告附件允许的扩展名与大小上限（10 MB）
+REPORT_FILE_EXTS = {".pdf", ".jpg", ".jpeg", ".png", ".doc", ".docx"}
+REPORT_FILE_MAX_MB = 10
+
 
 class ProducerSerializer(serializers.ModelSerializer):
     audit_status_display = serializers.CharField(source="get_audit_status_display",
@@ -31,10 +35,63 @@ class TestReportSerializer(serializers.ModelSerializer):
     batch_no = serializers.CharField(source="batch.batch_no", read_only=True)
     conclusion_display = serializers.CharField(source="get_conclusion_display",
                                                read_only=True)
+    # 附件的可点击地址（file 字段本身返回的是 /media/reports/xxx 相对路径，
+    # 前端拼上 API 源即可下载；这里额外给一个带文件名的展示字段）
+    file_name = serializers.SerializerMethodField()
+    file_url = serializers.SerializerMethodField()
 
     class Meta:
         model = TestReport
         fields = "__all__"
+
+    def get_file_name(self, obj):
+        """
+        附件原始文件名（无附件返回空串）。
+
+        ★ 不能用 obj.file.name —— Django 的存储层会为同名文件自动加随机后缀
+        （上传 report.pdf 实际落盘为 report_rBcOEvO.pdf），直接回显磁盘名
+        会让用户看到一串乱码后缀，误以为文件被改过。这里剥掉存储层加的后缀。
+        """
+        if not obj.file:
+            return ""
+        import os
+        import re
+        name = obj.file.name.rsplit("/", 1)[-1]
+        stem, ext = os.path.splitext(name)
+        # 只剥 storage 生成的 `_7位随机串` 尾巴，不碰用户名字里本就有的下划线
+        stem = re.sub(r"_[A-Za-z0-9]{7}$", "", stem)
+        return f"{stem}{ext}"
+
+    def get_file_url(self, obj):
+        """附件访问地址（无附件返回空串）。"""
+        if not obj.file:
+            return ""
+        try:
+            return obj.file.url
+        except ValueError:
+            return ""
+
+    def validate_file(self, value):
+        """
+        附件校验：限制类型与大小。
+
+        前端 el-upload 已做一层（体验层），后端这层才是可信边界 ——
+        绕过前端直接 POST 也必须被拦住。
+        """
+        if value is None:
+            return value
+        import os
+        ext = os.path.splitext(value.name)[1].lower()
+        if ext not in REPORT_FILE_EXTS:
+            raise serializers.ValidationError(
+                f"仅支持 {'/'.join(sorted(e.lstrip('.') for e in REPORT_FILE_EXTS))} "
+                f"格式，当前为 {ext or '未知类型'}")
+        limit = REPORT_FILE_MAX_MB * 1024 * 1024
+        if value.size > limit:
+            raise serializers.ValidationError(
+                f"附件不得超过 {REPORT_FILE_MAX_MB} MB，当前 "
+                f"{value.size / 1024 / 1024:.1f} MB")
+        return value
 
 
 class CertificateSerializer(serializers.ModelSerializer):
