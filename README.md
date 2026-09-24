@@ -1,12 +1,15 @@
 # 基于 Django 的柑橘合格证追溯系统设计与实现
 
-> 前后端分离架构 · 区块链可信存证 · 二维码追溯 · 产销衔接
+> 前后端分离架构 · 区块链可信存证 · 二维码追溯 · 追溯链时间轴 · 站内消息 · 报告 OCR · 产销衔接
 
 ## 一、项目简介
 
 本系统面向柑橘等特色农产品的质量安全监管场景，围绕 **"生产主体备案 → 生产批次建档 → 检测报告 → 承诺达标合格证签发 → 哈希上链存证 → 二维码扫码验真 → 产销供需对接"** 形成完整业务闭环。
 
 选题依据：农业农村部 2025 年第 4 号令《农产品质量安全承诺达标合格证管理办法》，2026 年 2 月起全面启用"身份证"式农产品合格证。
+
+> **已上线**：http://<your-server-ip>:8090/ （链与后端同机，免备案端口）
+> 公众验真页支持扫码后在手机上直接查看**追溯链时间轴**。
 
 ## 二、技术栈
 
@@ -18,7 +21,8 @@
 | 可信存证 | Python hashlib（SHA-256）+ **FISCO BCOS 3.17.1 联盟链** |
 | 链上交互 | web3.py（web3 RPC / HTTP，免证书） |
 | 智能合约 | Solidity 0.8.26 · `CertificateEvidence.sol` |
-| 追溯 | 合格证二维码 → 公众验真页 |
+| 报告识别 | pymupdf（PDF 文本层）+ tesseract-ocr（扫描件降级 OCR） |
+| 追溯 | 合格证二维码 → 公众验真页（追溯链时间轴） |
 | 部署 | Nginx（前端静态 + /api 反代）+ Gunicorn |
 
 ## 三、核心亮点
@@ -201,9 +205,84 @@ draft 草稿 ──提交──> pending 待审核 ──签发(分配编号)─
 - 日志本身按角色隔离：种植主体/收购商只能查看自己的操作记录。
 - `GET /api/log/` 支持按 `action / operator / target_type / keyword` 组合筛选。
 
-### 9. 单元测试
+### 9. 追溯链时间轴（公众验真页）★
 
-`backend/apps/traceability/tests.py` 含 **83 个用例**，覆盖 10 个测试类：
+公众扫码验真页由「表格」升级为**时间轴**，把散落在 7 张表里的事实串成一条可读链路：
+
+```
+生产主体备案 → 批次建档·采收 → 农事管理 → 第三方检测
+     → 合格证签发·可信存证 → 进入流通 → 监督检查
+```
+
+- **节点按事实动态生成**：没有检测报告就不出现「检测」节点，不做固定 5 步占位。
+  公众验真页的可信度建立在"显示的都是真的"之上，凭空占位会让人以为检测过了。
+- 顶部**大色块验真结论**（绿=可信 / 红=异常），一眼可辨。
+- 每个节点展示**链上锚点**（区块高度 + 交易哈希），可信存证看得见。
+- 不合格检查节点标 `danger` 级（前端标红），一眼看出哪一环出问题。
+- 接口：公开 `GET /api/public/verify/<cert_no>/`（含 `timeline`）、
+  登录 `GET /api/certificate/<id>/timeline/`。
+
+### 10. 站内消息通知
+
+解决原系统「**单向哑流程**」问题 —— 送审后监管签发与否、检查判定不合格、
+意向单发起后对方是否回应，全靠人主动刷新页面去发现。
+
+- 覆盖 9 个业务节点：送审 / 签发 / 驳回 / 作废 / 暂停 / 监督检查 / 整改复查 /
+  产销对接 / 主体审核。
+- **收件人显式建模**（`recipient` 外键），不按角色广播 ——
+  同一角色可能有多个用户（producer 与 producer2 是两个不同主体），
+  广播会把「别人家的事」也推给用户。
+- **通知失败绝不影响业务**：全部 `try/except` 吞异常记日志，
+  消息表故障不会导致签发回滚。
+- **不给自己发消息**：操作人自己知道刚做了什么。
+- **消息硬隔离**：`NotificationViewSet` 无条件锁死 `recipient=当前用户`，
+  不存在"监管看全量"的例外（消息天生私有）。
+- `read_at` 用时间戳而非布尔，既判未读也保留"何时读的"审计信息。
+- 前端：消息中心页 + 顶栏铃铛角标（30 秒节流，未读数全局单例避免不一致）。
+
+### 11. 检测报告 OCR 识别 ★
+
+上传检测报告 PDF → 自动提取报告编号、结论、日期、检测机构，减少手工录入。
+
+**分层识别**（两类报告识别成本差异巨大）：
+
+| 报告形态 | 识别路径 | 特点 |
+| --- | --- | --- |
+| 电子版 PDF（带文本层） | 直接读文本层 | 准确率近 100%、零 OCR 依赖、毫秒级 |
+| 扫描件 / 照片 | 降级 tesseract OCR | 秒级，受拍摄质量影响 |
+
+- ★ **只识别、不落库**：识别是概率性的，检测结论（合格/不合格）一旦认错会
+  直接影响农产品能否流通，必须由人眼确认后另行保存。
+- ★ **「不合格」优先于「合格」匹配**：中文里「不合格」含「合格」子串，
+  若先匹配「合格」会把不合格报告判成合格 → 放行不合格农产品。
+- **置信度按「关键字段命中数」**而非引擎自评分：业务真正关心的是
+  "能不能省下手敲报告编号和结论"，引擎高分但编号没认出来对用户无价值。
+- **只回填当前为空的字段**：用户已手填内容优先级高于机器识别。
+- **识别来源落库**（`ocr_method` / `ocr_confidence` / `ocr_text`）：
+  出问题必须能回答"这条数据是机器认的还是人敲的"。
+- 依赖：`pymupdf` / `pdfminer.six` / `pytesseract`（pip）
+  ＋ `tesseract-ocr` / `tesseract-ocr-chi-sim`（系统包，`deploy.py setup` 会幂等安装）。
+
+### 12. 移动端 H5 适配 ★
+
+扫码后手机上体验更好 —— 采用**布局范式级改造**而非皮肤微调：
+
+- 桌面侧边栏 → 移动端**抽屉菜单**（`matchMedia` 断点触发，非 resize 监听，
+  避免拖动窗口时高频重渲染整页）。
+- **全局收口三类小屏高频问题**（不做逐页写响应式，那样必漏）：
+  1. 表格横向溢出 → 溢出限制在**表格内部可横滑**，页面整体不再横滚。
+     ★ 不隐藏列：后台表格列都有业务含义，隐藏会让用户以为数据丢了。
+  2. 弹窗写死 `width="560px"` → 统一 94% 宽 + 内部滚动。
+  3. 表单 `label-width` 固定 110px → 小屏收窄。
+- **触摸优化**：`min-height` 撑开按钮
+  （★ Element Plus 给 `.el-button--small` 写死 `height:24px`，
+  只加 `padding` 无效，必须用 `min-height` 覆盖）；
+  输入框统一 16px 防 iOS Safari 聚焦自动放大。
+- 实测：iPhone 390×844 下全部页面横向溢出 0px，可点元素高度全部达标。
+
+### 13. 单元测试
+
+`backend/apps/traceability/tests.py` 含 **149 个用例**，覆盖 14 个测试类：
 
 | 测试类 | 用例数 | 关注点 |
 | --- | --- | --- |
@@ -217,8 +296,27 @@ draft 草稿 ──提交──> pending 待审核 ──签发(分配编号)─
 | `InspectionTest` | 19 | 执法闭环、合格证暂停/恢复、逾期判定、存证原文稳定性、数据隔离 |
 | `ReportFileUploadTest` | 8 | 附件上传/替换/删除、扩展名白名单、大小上限、权限、文件清理 |
 | `InspectionBizNoTest` | 4 | 检查存证的链上编号独立性（同证多条检查互不覆盖） |
+| `TimelineTest` | 9 | 节点顺序、缺报告不产生节点、锚点挂载、**节点 key 唯一性** |
+| `NotificationTest` | 15 | 各触发点收件人正确、不给自己发、**硬隔离**、已读流转、失败不破业务 |
+| `OcrTest` | 18 | **不合格优先级**、编号/日期/机构解析、真 PDF 端到端、只识别不落库 |
+| `MobileAdaptationTest` | 4 | 验真接口自包含、**扫码免登录**、列表分页、扫码留痕 |
 
 运行：`python manage.py test apps.traceability apps.accounts`
+
+**浏览器端验收**（本机 Edge，脚本在 `frontend/`）：
+
+| 脚本 | 断言数 | 覆盖 |
+| --- | --- | --- |
+| `verify_tier1.mjs` | — | 第一梯队：证面打印 / 看板增强 / 风险预警 / 批量签发 |
+| `verify_tier2.mjs` | 46 | 第二梯队：时间轴 / 消息 / OCR / 移动端（含 viewport 断言） |
+| `verify_mobile_geom.mjs` | 17 | 移动端**几何核查**：节点尺寸、横向溢出、触摸命中面积、字号 |
+
+**线上闭环验收**（打已部署服务，非破坏性，跑完自动清理）：
+
+| 脚本 | 断言数 | 覆盖 |
+| --- | --- | --- |
+| `tools/_live_ocr_check.py` | 16 | 线上 OCR 引擎自检、真 PDF 端到端、不合格红线、不落库 |
+| `tools/_live_notify_check.py` | 16 | 线上送审→监管收信闭环、硬隔离、已读流转、演示数据核对 |
 
 
 ## 四、目录结构
@@ -232,16 +330,19 @@ draft 草稿 ──提交──> pending 待审核 ──签发(分配编号)─
 │   ├── apps/
 │   │   ├── accounts/              # 用户与角色（4 类角色）
 │   │   └── traceability/          # 核心业务
-│   │       ├── models.py          # 主体/批次/报告/合格证/存证/供需/意向单/监督检查/审计日志
+│   │       ├── models.py          # 主体/批次/报告/合格证/存证/供需/意向单/监督检查/审计日志/站内消息
 │   │       ├── services.py        # ★ 哈希存证与验真核心
 │   │       ├── chain.py           # ★ 联盟链客户端（web3.py）
 │   │       ├── certno.py          # ★ 合格证编号生成器（19 位，防占号 + 并发安全）
 │   │       ├── permissions.py     # ★ 角色权限（接口级 + 数据级）
 │   │       ├── audit.py           # ★ 操作审计日志写入
 │   │       ├── matching.py        # ★ 产销智能匹配算法
+│   │       ├── timeline.py        # ★ 追溯链时间轴聚合（节点按事实动态生成）
+│   │       ├── notify.py          # ★ 站内消息服务（失败不影响业务）
+│   │       ├── ocr.py             # ★ 检测报告 OCR（分层：文本层优先，扫描件降级）
 │   │       ├── serializers.py
-│   │       ├── views.py           # ViewSet + 公众验真 + 链状态 + 看板 + 角色矩阵
-│   │       ├── tests.py           # ★ 83 个单元测试
+│   │       ├── views.py           # ViewSet + 公众验真 + 链状态 + 看板 + 角色矩阵 + 消息
+│   │       ├── tests.py           # ★ 149 个单元测试
 │   │       ├── urls.py
 │   │       ├── admin.py
 │   │       └── management/commands/init_data.py  # 演示数据
@@ -252,12 +353,16 @@ draft 草稿 ──提交──> pending 待审核 ──签发(分配编号)─
 └── frontend/                      # Vue3 前端
     ├── src/
     │   ├── api/                   # Axios 接口封装
-    │   ├── layout/                # 后台布局（菜单按角色过滤）
+    │   ├── layout/                # 后台布局（菜单按角色过滤 + 移动端抽屉 + 消息铃铛）
     │   ├── router/                # 路由与守卫（含角色守卫）
-    │   ├── store/                 # Pinia（含 permissions）
-    │   ├── utils/request.js       # 请求拦截器（JWT）
-    │   └── views/                 # 13 页面：登录/验真/看板/主体/批次/报告/合格证/
-    │                              #   监督检查/存证/产销/意向单/操作日志/权限说明
+    │   ├── store/                 # Pinia（含 permissions / notice）
+    │   ├── styles/main.css        # 全局样式 + ★ 移动端适配收口
+    │   ├── utils/request.js       # 请求拦截器（JWT + 响应体形状归一化）
+    │   └── views/                 # 14 页面：登录/验真(时间轴)/看板/主体/批次/报告(OCR)/
+    │                              #   合格证/监督检查/存证/产销/意向单/操作日志/权限说明/消息中心
+    ├── verify_tier1.mjs           # 浏览器验收（第一梯队）
+    ├── verify_tier2.mjs           # 浏览器验收（第二梯队 + 移动端 viewport）
+    ├── verify_mobile_geom.mjs     # 移动端布局几何核查
     ├── package.json
     └── vite.config.js
 ```
@@ -274,6 +379,11 @@ python manage.py migrate
 python manage.py init_data    # 初始化演示数据
 python manage.py runserver 0.0.0.0:8000
 ```
+
+> **OCR 依赖**：电子版 PDF 走文本层，只需 `pymupdf`（已含在 requirements.txt）。
+> 若还要识别**扫描件/照片**，需另装系统包（pip 装不了）：
+> `sudo apt-get install -y tesseract-ocr tesseract-ocr-chi-sim`
+> 缺 chi-sim 语言包时中文扫描件识别不出来。可用 `GET /api/report/ocr-status/` 自检。
 
 ### 前端
 
@@ -338,7 +448,8 @@ FISCO_ENABLE_CHAIN=true
 ```
 生产主体(Producer) ── 含 region_code（编号前 6 位行政区划码）
    └─ 生产批次(ProductBatch)
-         ├─ 检测报告(TestReport)
+         ├─ 检测报告(TestReport) ── 可上传附件（PDF/图片）
+         │     └─ ★ OCR 识别（只回填表单草稿，需人工确认才落库）
          └─ 合格证(Certificate) ── 含 cert_hash（SHA-256）
                ├─ 存证记录(EvidenceRecord) ── tx_hash / block_height
                │     └─ 上链 ──> FISCO BCOS（CertificateEvidence 合约）
@@ -347,7 +458,11 @@ FISCO_ENABLE_CHAIN=true
                └─ 产销供需(SupplyDemand) ── 关联证书，先验真再对接
                      └─ 产销意向单(MatchIntent) ── 匹配度评分 + 状态流转
 
+★ 追溯链时间轴：把上述 主体/批次/农事/检测/签发/流通/检查 事实串成一条
+   面向公众的链路（节点按事实存在与否动态生成，不做固定占位）
+
 旁路：操作日志(OperationLog) ── 记录所有角色的一切操作行为
+     站内消息(Notification) ── 把业务动作翻译成「给谁的提醒」（recipient 显式建模）
 ```
 
 ## 九、接口一览
@@ -359,7 +474,7 @@ FISCO_ENABLE_CHAIN=true
 | POST | `/api/auth/login/` | 公开 | 登录，返回 `access/refresh/user`（含 `permissions`） |
 | POST | `/api/auth/refresh/` | 公开 | 刷新 JWT |
 | GET | `/api/auth/profile/` | 登录 | 当前用户信息与权限清单 |
-| GET | `/api/public/verify/<cert_no>/` | **公开** | 公众扫码验真（含链上核验 + 监督检查公示） |
+| GET | `/api/public/verify/<cert_no>/` | **公开** | 公众扫码验真（含链上核验 + 监督检查公示 + **追溯链时间轴**） |
 | GET | `/api/dashboard/` | 登录 | 看板统计（**口径随角色变化**，含检查执法指标） |
 | GET | `/api/role-matrix/` | 登录 | 角色-资源/操作矩阵 + 编号规则 + 状态流转 |
 | CRUD | `/api/producer/` | 登录（范围隔离） | 生产主体 |
@@ -367,6 +482,8 @@ FISCO_ENABLE_CHAIN=true
 | CRUD | `/api/batch/` | 登录（范围隔离） | 生产批次 |
 | POST | `/api/batch/<id>/anchor/` | 监管/主体 | 批次存证上链 |
 | CRUD | `/api/report/` | 登录（范围隔离） | 检测报告（支持 `multipart` 附件上传） |
+| POST | `/api/report/ocr/` | 登录（范围隔离） | ★ **OCR 识别报告**（只识别不落库，返回字段草稿 + 置信度） |
+| GET | `/api/report/ocr-status/` | 登录 | ★ OCR 引擎自检（部署排查用） |
 | POST | `/api/report/<id>/anchor/` | 监管/主体 | 报告存证上链 |
 | CRUD | `/api/certificate/` | 登录（范围隔离） | 合格证（建档为草稿，不占号） |
 | GET | `/api/certificate/peek-cert-no/` | 登录 | ★ 预看下一个 19 位编号（不占用） |
@@ -376,6 +493,7 @@ FISCO_ENABLE_CHAIN=true
 | POST | `/api/certificate/<id>/revoke/` | 监管 | 作废（生成 REVOKE 存证） |
 | GET | `/api/certificate/<id>/qrcode/` | 登录 | 生成合格证二维码 |
 | GET | `/api/certificate/<id>/inspection-summary/` | 登录 | ★ 该证的监督检查汇总 |
+| GET | `/api/certificate/<id>/timeline/` | 登录 | ★ **追溯链时间轴明细**（公开接口只暴露脱敏后的验真数据） |
 | CRUD | `/api/inspection/` | 登录（范围隔离） | ★ 监督检查记录（写操作仅监管） |
 | POST | `/api/inspection/<id>/rectify/` | 监管 | ★ 整改复查（联动合格证恢复/维持暂停） |
 | POST | `/api/inspection/<id>/anchor/` | 监管 | ★ 检查结论重新存证 |
@@ -389,6 +507,12 @@ FISCO_ENABLE_CHAIN=true
 | GET | `/api/intent/` | 登录（范围隔离） | 意向单列表 |
 | POST | `/api/intent/<id>/respond/` | 登录 | 接受/拒绝/完成意向 |
 | GET | `/api/log/` | 登录（范围隔离） | 操作审计日志（支持多条件筛选） |
+| GET | `/api/notification/` | 登录 | ★ 站内消息列表（**硬隔离：只能看自己的**） |
+| GET | `/api/notification/unread/` | 登录 | ★ 未读汇总（按类型分组 + danger 计数） |
+| GET | `/api/notification/categories/` | 登录 | ★ 消息类型与级别字典 |
+| POST | `/api/notification/<id>/read/` | 登录 | 标记单条已读 |
+| POST | `/api/notification/read-all/` | 登录 | 全部标记已读 |
+| POST | `/api/notification/clear-read/` | 登录 | 清理已读消息 |
 
 ## 十、切换 MySQL
 
