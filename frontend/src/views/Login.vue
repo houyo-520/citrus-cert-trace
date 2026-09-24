@@ -2,16 +2,19 @@
   <div class="login-page">
     <div class="login-box">
       <div class="login-left">
-        <div class="brand">
-          <el-icon :size="40"><Orange /></el-icon>
-          <h1>柑橘合格证追溯系统</h1>
-          <p>基于可信存证与二维码追溯的农产品合格证管理平台</p>
+        <div class="login-left-mask"></div>
+        <div class="login-left-content">
+          <div class="brand">
+            <el-icon :size="40"><Orange /></el-icon>
+            <h1>柑橘合格证追溯系统</h1>
+            <p>基于可信存证与二维码追溯的农产品合格证管理平台</p>
+          </div>
+          <ul class="feature-list">
+            <li>SHA-256 哈希存证，防篡改可验真</li>
+            <li>合格证二维码追溯，扫码即查</li>
+            <li>产销供需对接，打通产证销闭环</li>
+          </ul>
         </div>
-        <ul class="feature-list">
-          <li>SHA-256 哈希存证，防篡改可验真</li>
-          <li>合格证二维码追溯，扫码即查</li>
-          <li>产销供需对接，打通产证销闭环</li>
-        </ul>
       </div>
 
       <div class="login-right">
@@ -32,11 +35,6 @@
                      style="width:100%" @click="onSubmit">登 录</el-button>
         </el-form>
 
-        <el-divider>演示账号（密码均为 admin123）</el-divider>
-        <div class="demo-accounts">
-          <el-tag v-for="a in accounts" :key="a.u" class="demo-tag"
-                  @click="fill(a.u)">{{ a.label }}：{{ a.u }}</el-tag>
-        </div>
         <div class="verify-entry">
           <el-button link type="primary" @click="$router.push('/verify')">
             公众验真入口（免登录）→
@@ -57,21 +55,10 @@ const router = useRouter()
 const userStore = useUserStore()
 const formRef = ref()
 const loading = ref(false)
-const form = reactive({ username: 'admin', password: 'admin123' })
+const form = reactive({ username: '', password: '' })
 const rules = {
   username: [{ required: true, message: '请输入用户名', trigger: 'blur' }],
   password: [{ required: true, message: '请输入密码', trigger: 'blur' }]
-}
-const accounts = [
-  { u: 'admin', label: '管理员' },
-  { u: 'regulator', label: '监管' },
-  { u: 'producer', label: '种植主体' },
-  { u: 'buyer', label: '收购商' }
-]
-
-const fill = (u) => {
-  form.username = u
-  form.password = 'admin123'
 }
 
 const onSubmit = async () => {
@@ -91,36 +78,54 @@ const onSubmit = async () => {
 
 <style scoped>
 .login-page {
+  position: relative;
   height: 100%;
   display: flex;
   align-items: center;
   justify-content: center;
-  background: linear-gradient(135deg, #0f5c3f 0%, #1a9c6b 100%);
+  background: #0f5c3f url('@/assets/login-citrus.png') center / cover no-repeat;
+}
+.login-page::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, rgba(8, 40, 28, 0.78) 0%, rgba(10, 55, 40, 0.55) 50%, rgba(8, 40, 28, 0.82) 100%);
 }
 .login-box {
+  position: relative;
+  z-index: 1;
   display: flex;
   width: 860px;
   min-height: 460px;
   background: #fff;
   border-radius: 12px;
   overflow: hidden;
-  box-shadow: 0 12px 40px rgba(0,0,0,0.18);
+  box-shadow: 0 12px 40px rgba(0,0,0,0.28);
 }
 .login-left {
   flex: 1;
-  background: #0f5c3f;
+  position: relative;
+  background: #0f5c3f url('@/assets/login-citrus.png') center / cover no-repeat;
   color: #fff;
   padding: 44px 36px;
   display: flex;
   flex-direction: column;
   justify-content: center;
+  overflow: hidden;
+}
+.login-left-mask {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, rgba(10, 60, 40, 0.72) 0%, rgba(10, 60, 40, 0.45) 45%, rgba(10, 60, 40, 0.82) 100%);
+}
+.login-left-content {
+  position: relative;
+  z-index: 1;
 }
 .brand h1 { font-size: 22px; margin: 14px 0 8px; }
 .brand p { font-size: 13px; color: #b7e4cf; line-height: 1.7; }
 .feature-list { margin-top: 26px; padding-left: 18px; line-height: 2.1; font-size: 13px; color: #d4f0e3; }
-.login-right { flex: 1; padding: 44px 40px; }
-.login-right h2 { font-size: 18px; margin: 0 0 22px; }
-.demo-accounts { display: flex; flex-wrap: wrap; gap: 8px; }
-.demo-tag { cursor: pointer; }
+.login-right { flex: 1; padding: 44px 40px; display: flex; flex-direction: column; justify-content: center; }
+.login-right h2 { font-size: 18px; margin: 0 0 22px; text-align: center; }
 .verify-entry { margin-top: 16px; text-align: center; }
 </style>
