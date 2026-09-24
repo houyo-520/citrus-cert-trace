@@ -7,3 +7,14 @@ pillow>=10.0
 PyMySQL>=1.1
 # FISCO BCOS 联盟链接入（存证上链）
 web3>=6.15
+# 检测报告 OCR 识别（#23）
+#   pymupdf  ：读电子版 PDF 的文本层（首选路径，准且快，零 OCR 依赖）
+#              同时负责把扫描件渲染成图片再交给 OCR
+#   pdfminer.six：文本层读取的兜底实现（pymupdf 不可用时）
+#   pytesseract：调用 tesseract 二进制的 Python 封装（扫描件才用到）
+#   ⚠️ tesseract 本体是系统包，pip 装不了：
+#      Ubuntu: apt-get install -y tesseract-ocr tesseract-ocr-chi-sim
+#      （缺 chi-sim 语言包时中文扫描件识别不出来）
+pymupdf>=1.24
+pdfminer.six>=20231228
+pytesseract>=0.3.10

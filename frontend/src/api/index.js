@@ -56,6 +56,28 @@ export const batchIssueCertificate = (ids) =>
 // ★ 风险预警汇总（首页红点 + 预警清单）
 export const getAlerts = () => request.get('/alerts/')
 
+// ★ 追溯链时间轴（公众验真页 / 合格证详情）
+export const certTimeline = (id) => request.get(`/certificate/${id}/timeline/`)
+
+// ★ 检测报告 OCR 识别（只识别不落库，返回结果供人工确认）
+export const ocrReport = (file) => {
+  const fd = new FormData()
+  fd.append('file', file)
+  return request.post('/report/ocr/', fd)
+}
+// OCR 引擎可用性自检
+export const ocrStatus = () => request.get('/report/ocr-status/')
+
+// ---- 站内消息 ----
+export const listNotification = (params) => request.get('/notification/', { params })
+// 未读汇总（顶栏铃铛，轻量接口）
+export const notificationUnread = () => request.get('/notification/unread/')
+export const readNotification = (id) => request.post(`/notification/${id}/read/`)
+export const readAllNotification = () => request.post('/notification/read-all/')
+export const clearReadNotification = () => request.post('/notification/clear-read/')
+export const deleteNotification = (id) => request.delete(`/notification/${id}/`)
+export const notificationCategories = () => request.get('/notification/categories/')
+
 // ---- 监督检查（监管执法闭环）----
 export const listInspection = (params) => request.get('/inspection/', { params })
 export const createInspection = (data) => request.post('/inspection/', data)

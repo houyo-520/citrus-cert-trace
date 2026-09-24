@@ -6,9 +6,9 @@ from rest_framework.routers import DefaultRouter
 
 from .views import (AlertView, CertificateViewSet, DashboardView,
                     EvidenceViewSet, InspectionRecordViewSet,
-                    MatchIntentViewSet, OperationLogViewSet, ProducerViewSet,
-                    ProductBatchViewSet, PublicVerifyView, RoleMatrixView,
-                    SupplyDemandViewSet, TestReportViewSet)
+                    MatchIntentViewSet, NotificationViewSet, OperationLogViewSet,
+                    ProducerViewSet, ProductBatchViewSet, PublicVerifyView,
+                    RoleMatrixView, SupplyDemandViewSet, TestReportViewSet)
 
 router = DefaultRouter()
 router.register(r"producer", ProducerViewSet, basename="producer")
@@ -20,6 +20,8 @@ router.register(r"evidence", EvidenceViewSet, basename="evidence")
 router.register(r"supply", SupplyDemandViewSet, basename="supply")
 router.register(r"intent", MatchIntentViewSet, basename="intent")
 router.register(r"log", OperationLogViewSet, basename="log")
+# ★ 站内消息（流程闭环）
+router.register(r"notification", NotificationViewSet, basename="notification")
 
 urlpatterns = [
     path("", include(router.urls)),

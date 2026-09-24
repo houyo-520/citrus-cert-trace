@@ -16,24 +16,25 @@ from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.accounts.models import Role
 
-from . import audit, certno, chain, matching, services
+from . import audit, certno, chain, matching, notify, ocr, services, timeline
 from .models import (Certificate, EvidenceRecord, InspectionRecord,
-                     MatchIntent, OperationLog, Producer, ProductBatch,
-                     PublicQueryRecord, SupplyDemand, TestReport)
+                     MatchIntent, Notification, OperationLog, Producer,
+                     ProductBatch, PublicQueryRecord, SupplyDemand, TestReport)
 from .permissions import (CanTrade, IsRegulator,
                           ReadOnlyOrProducerOrRegulator, ReadOnlyOrRegulator,
                           RoleScopedQuerySetMixin)
 from .serializers import (CertificateSerializer, EvidenceRecordSerializer,
                           InspectionRecordSerializer, MatchIntentSerializer,
-                          OperationLogSerializer, ProducerSerializer,
-                          ProductBatchSerializer, SupplyDemandSerializer,
-                          TestReportSerializer)
+                          NotificationSerializer, OperationLogSerializer,
+                          ProducerSerializer, ProductBatchSerializer,
+                          SupplyDemandSerializer, TestReportSerializer)
 
 
 class BaseViewSet(viewsets.ModelViewSet):
@@ -112,6 +113,8 @@ class ProducerViewSet(RoleScopedQuerySetMixin, BaseViewSet):
                             target_type="生产主体", target_id=obj.id,
                             target_no=obj.name,
                             detail=f"{obj.name} 审核 {old} -> {obj.get_audit_status_display()}")
+        # ★ 站内消息：把审核结果推给主体 owner（解决"审核完没人知道"）
+        notify.producer_audited(obj, request.user, new_status)
         return Response({"code": 200, "message": "审核完成",
                          "data": ProducerSerializer(obj).data})
 
@@ -181,7 +184,22 @@ class TestReportViewSet(RoleScopedQuerySetMixin, BaseViewSet):
         return [IsAuthenticated()]
 
     def perform_create(self, serializer):
-        report = serializer.save()
+        """
+        新增检测报告并自动存证。
+
+        ★ OCR 溯源字段要显式接收。
+          序列化器把 ocr_method/ocr_confidence/ocr_text 设为 read_only，是因为
+          它们**只能由识别流程产生、不该由前端随意声明**；但「不该随便写」不等于
+          「永远不写」—— 前端确认识别结果后保存时会把来源带上来，这里显式取出。
+          若不做这一步，字段在库里恒为空，「这条数据是机器认的还是人敲的」就永远
+          答不出来，溯源字段等于白加（实测该 bug 静默存在：不报错、字段就是空）。
+        """
+        extra = {}
+        for k in ("ocr_method", "ocr_confidence", "ocr_text"):
+            v = self.request.data.get(k)
+            if v:
+                extra[k] = str(v)[:2000 if k == "ocr_text" else 20]
+        report = serializer.save(**extra)
         services.anchor_report(report)
         audit.log_operation(self.request, OperationLog.Action.CREATE,
                             target_type="检测报告", target_id=report.id,
@@ -229,6 +247,65 @@ class TestReportViewSet(RoleScopedQuerySetMixin, BaseViewSet):
                             target_no=obj.report_no, detail=f"报告存证 {obj.report_no}")
         return Response({"code": 200, "message": "报告存证成功",
                          "data": EvidenceRecordSerializer(record).data})
+
+    @action(detail=False, methods=["post"], url_path="ocr",
+            parser_classes=[MultiPartParser, FormParser])
+    def ocr_extract(self, request):
+        """
+        ★ 检测报告 OCR 识别：上传 PDF/图片 → 自动提取关键字段。
+
+        ★ 重要：本接口**只识别、不落库**。
+          识别是概率性的，检测结论（合格/不合格）一旦认错会直接影响
+          农产品能否流通，必须由人眼确认后另行保存。
+          因此这里返回识别结果与置信度，前端回填表单，用户确认后走正常 create。
+
+        分层识别（见 ocr.py）：
+          电子版 PDF → 直接读文本层（准、快、零 OCR 依赖）
+          扫描件/图片 → 降级到 tesseract OCR
+        """
+        f = request.FILES.get("file")
+        if f is None:
+            return Response({"code": 400, "message": "请选择要识别的检测报告文件"},
+                            status=status.HTTP_400_BAD_REQUEST)
+        # 复用序列化器里的类型/大小校验规则，保持前后端一致
+        from .serializers import REPORT_FILE_EXTS, REPORT_FILE_MAX_MB
+        import os as _os
+        ext = _os.path.splitext(f.name)[1].lower()
+        if ext not in REPORT_FILE_EXTS:
+            return Response(
+                {"code": 400,
+                 "message": f"仅支持 {'/'.join(sorted(e.lstrip('.') for e in REPORT_FILE_EXTS))} "
+                            f"格式，当前为 {ext or '未知类型'}"},
+                status=status.HTTP_400_BAD_REQUEST)
+        if f.size > REPORT_FILE_MAX_MB * 1024 * 1024:
+            return Response({"code": 400,
+                             "message": f"文件不得超过 {REPORT_FILE_MAX_MB} MB，"
+                                        f"当前 {f.size / 1024 / 1024:.1f} MB"},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            data = f.read()
+        except Exception as exc:  # noqa: BLE001
+            return Response({"code": 500, "message": f"读取文件失败：{exc}"},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        result = ocr.extract_from_file(f.name, data)
+        audit.log_operation(request, OperationLog.Action.VERIFY,
+                            target_type="检测报告", target_id=None,
+                            target_no=f.name[:60],
+                            detail=f"OCR 识别报告（{result['method']}，"
+                                   f"置信度 {result['confidence']}，"
+                                   f"识别出 {len(result['filled'])} 个字段）")
+        return Response({
+            "code": 200,
+            "message": "识别完成" if result["ok"] else "未能识别，请手工录入",
+            "data": result,
+        })
+
+    @action(detail=False, methods=["get"], url_path="ocr-status")
+    def ocr_status(self, request):
+        """OCR 引擎可用性自检（部署排查用）。"""
+        return Response({"code": 200, "message": "ok", "data": ocr.engine_status()})
 
 
 # ===============================================================
@@ -389,6 +466,8 @@ class CertificateViewSet(RoleScopedQuerySetMixin, BaseViewSet):
                                     target_type="合格证", target_id=obj.id,
                                     target_no=obj.cert_no,
                                     detail=f"批量签发合格证 {obj.cert_no}")
+                # ★ 站内消息：批量签发时逐张通知（各主体只会收到自己那几张）
+                notify.cert_issued(obj, request.user)
                 results.append({"id": obj.id, "label": label, "ok": True,
                                 "cert_no": obj.cert_no, "message": "签发并存证成功"})
                 ok_count += 1
@@ -426,6 +505,8 @@ class CertificateViewSet(RoleScopedQuerySetMixin, BaseViewSet):
                             target_type="合格证", target_id=obj.id,
                             target_no=obj.cert_no or f"草稿#{obj.id}",
                             detail="提交合格证审核（待监管签发）")
+        # ★ 站内消息：提醒监管「有人送审了，来签发」
+        notify.cert_submitted(obj, request.user)
         return Response({"code": 200, "message": "已提交审核",
                          "data": CertificateSerializer(obj).data})
 
@@ -444,6 +525,8 @@ class CertificateViewSet(RoleScopedQuerySetMixin, BaseViewSet):
                             target_type="合格证", target_id=obj.id,
                             target_no=obj.cert_no or f"草稿#{obj.id}",
                             detail="驳回合格证申请" + (f"：{reason}" if reason else ""))
+        # ★ 站内消息：驳回意见必须让申请人看到，否则他不知道该改什么
+        notify.cert_rejected(obj, request.user, reason)
         return Response({"code": 200, "message": "已驳回",
                          "data": CertificateSerializer(obj).data})
 
@@ -504,6 +587,8 @@ class CertificateViewSet(RoleScopedQuerySetMixin, BaseViewSet):
                             target_no=obj.cert_no,
                             detail=f"签发合格证 {obj.cert_no}"
                                    + ("（沿用原编号）" if already else "（新分配编号）"))
+        # ★ 站内消息：签发结果推给主体
+        notify.cert_issued(obj, request.user)
         return Response({"code": 200, "message": "签发成功并完成可信存证",
                          "data": CertificateSerializer(obj).data})
 
@@ -520,6 +605,8 @@ class CertificateViewSet(RoleScopedQuerySetMixin, BaseViewSet):
                             target_no=obj.cert_no or f"草稿#{obj.id}",
                             detail=f"作废合格证 {obj.cert_no or '草稿'}"
                                    + (f"，原因：{reason}" if reason else ""))
+        # ★ 站内消息：作废是重大变更，必须主动通知持证人
+        notify.cert_revoked(obj, request.user, reason)
         return Response({"code": 200, "message": "已作废",
                          "data": CertificateSerializer(obj).data,
                          "evidence": EvidenceRecordSerializer(record).data})
@@ -620,6 +707,20 @@ class CertificateViewSet(RoleScopedQuerySetMixin, BaseViewSet):
         audit.log_operation(request, OperationLog.Action.VERIFY,
                             target_type="合格证", target_id=obj.id,
                             target_no=obj.cert_no, detail="导出/打印合格证证面")
+        return Response({"code": 200, "message": "ok", "data": data})
+
+    @action(detail=True, methods=["get"], url_path="timeline")
+    def timeline_view(self, request, pk=None):
+        """
+        ★ 追溯链时间轴：把散落在 5 张表里的时间点串成「一件柑橘的旅程」。
+
+        与 certificate-data 的分工：
+          certificate-data 是给「打印」用的静态证面字段；
+          timeline 是给「展示」用的过程叙事，节点按事实动态生成、带状态色与锚点。
+        """
+        obj = self.get_object()
+        data = timeline.build_timeline(obj)
+        data["cert_no"] = obj.cert_no
         return Response({"code": 200, "message": "ok", "data": data})
 
     @action(detail=True, methods=["get"], url_path="inspection-summary")
@@ -736,6 +837,15 @@ class InspectionRecordViewSet(RoleScopedQuerySetMixin, BaseViewSet):
                                    f"，评分 {record.check_score}"
                                    + (f"，罚款 {record.penalty_amount} 元"
                                       if record.penalty_amount else ""))
+        # ★ 站内消息：检查结论必须让被检主体知道（尤其不合格时要限期整改）
+        notify.inspection_created(record, user)
+        # 若因此暂停了合格证，额外发一条「证被暂停」的提醒 —— 两件事对主体
+        # 是不同后果（要整改 vs 货不能卖了），合并成一条会弱化后者
+        if record.check_result == InspectionRecord.CheckResult.UNQUALIFIED:
+            cert = record.certificate
+            cert.refresh_from_db(fields=["status", "suspend_reason"])
+            if cert.status == Certificate.Status.SUSPENDED:
+                notify.cert_suspended(cert, user, cert.suspend_reason)
 
     def perform_update(self, serializer):
         record = serializer.save()
@@ -801,6 +911,8 @@ class InspectionRecordViewSet(RoleScopedQuerySetMixin, BaseViewSet):
                             target_type="监督检查", target_id=obj.id,
                             target_no=obj.certificate.cert_no or f"INS-{obj.id}",
                             detail=f"整改复查：{obj.get_rectify_status_display()}")
+        # ★ 站内消息：整改提交后提醒监管来复核闭环
+        notify.rectify_done(obj, request.user)
         return Response({"code": 200, "message": "整改复查已记录",
                          "data": InspectionRecordSerializer(obj).data})
 
@@ -1031,6 +1143,8 @@ class SupplyDemandViewSet(RoleScopedQuerySetMixin, BaseViewSet):
                             target_type="产销意向单", target_id=intent.id,
                             target_no=obj.title,
                             detail=f"发起对接意向（匹配度 {score}）：{obj.title}")
+        # ★ 站内消息：提醒供需单发布方「有人找你对接」
+        notify.intent_created(intent, request.user)
         return Response({"code": 200, "message": "意向已提交",
                          "data": MatchIntentSerializer(intent).data})
 
@@ -1079,6 +1193,8 @@ class MatchIntentViewSet(RoleScopedQuerySetMixin, viewsets.ModelViewSet):
                             target_type="产销意向单", target_id=obj.id,
                             target_no=obj.supply.title,
                             detail=f"意向回应：{obj.get_status_display()}")
+        # ★ 站内消息：回应结果推给意向发起人
+        notify.intent_responded(obj, request.user)
         return Response({"code": 200, "message": "已回应",
                          "data": MatchIntentSerializer(obj).data})
 
@@ -1107,6 +1223,84 @@ class OperationLogViewSet(RoleScopedQuerySetMixin, viewsets.ReadOnlyModelViewSet
         if p.get("keyword"):
             qs = qs.filter(detail__icontains=p["keyword"])
         return qs
+
+
+# ===============================================================
+# ★ 站内消息（流程闭环的最后一环）
+# ===============================================================
+class NotificationViewSet(viewsets.ModelViewSet):
+    """
+    站内消息。
+
+    ★ 数据级隔离在这里是**硬隔离**：查询集永远锁死在 recipient=当前用户。
+      消息天生是「私有的」，不像合格证那样存在「监管能看全量」的例外，
+      所以不走 RoleScopedQuerySetMixin，直接无条件过滤，避免任何角色
+      通过改 URL 里的 id 读到别人的消息。
+    """
+    permission_classes = [IsAuthenticated]
+    serializer_class = NotificationSerializer
+
+    def get_queryset(self):
+        qs = (Notification.objects
+              .filter(recipient=self.request.user)
+              .select_related("actor"))
+        p = self.request.query_params
+        if p.get("category"):
+            qs = qs.filter(category=p["category"])
+        if p.get("unread") in ("1", "true", "yes"):
+            qs = qs.filter(read_at__isnull=True)
+        if p.get("level"):
+            qs = qs.filter(level=p["level"])
+        if p.get("keyword"):
+            kw = p["keyword"]
+            qs = qs.filter(Q(title__icontains=kw) | Q(content__icontains=kw))
+        return qs
+
+    @action(detail=False, methods=["get"])
+    def unread(self, request):
+        """未读汇总（顶栏铃铛用，轻量接口，前端轮询打这个）。"""
+        return Response({"code": 200, "message": "ok",
+                         "data": notify.unread_summary(request.user)})
+
+    @action(detail=True, methods=["post"])
+    def read(self, request, pk=None):
+        """标记单条已读。"""
+        obj = self.get_object()
+        if obj.read_at is None:
+            obj.read_at = timezone.now()
+            obj.save(update_fields=["read_at", "updated_at"])
+        return Response({"code": 200, "message": "已读",
+                         "data": NotificationSerializer(obj).data})
+
+    @action(detail=False, methods=["post"], url_path="read-all")
+    def read_all(self, request):
+        """一键全部已读（只影响自己的消息）。"""
+        n = (Notification.objects
+             .filter(recipient=request.user, read_at__isnull=True)
+             .update(read_at=timezone.now()))
+        return Response({"code": 200, "message": f"已将 {n} 条消息标记为已读",
+                         "data": {"updated": n}})
+
+    @action(detail=False, methods=["post"], url_path="clear-read")
+    def clear_read(self, request):
+        """清理已读消息（保持收件箱干净）。"""
+        n, _ = (Notification.objects
+                .filter(recipient=request.user, read_at__isnull=False).delete())
+        return Response({"code": 200, "message": f"已清理 {n} 条已读消息",
+                         "data": {"deleted": n}})
+
+    @action(detail=False, methods=["get"], url_path="categories")
+    def categories(self, request):
+        """消息类型字典（前端筛选下拉用）。"""
+        return Response({
+            "code": 200, "message": "ok",
+            "data": {
+                "categories": [{"key": k, "label": v}
+                               for k, v in Notification.Category.choices],
+                "levels": [{"key": k, "label": v}
+                           for k, v in Notification.Level.choices],
+            },
+        })
 
 
 # ===============================================================
@@ -1176,6 +1370,11 @@ class PublicVerifyView(APIView):
             "inspection_count": inspections.count(),
             "inspection": inspection_data,
         }
+        # ★ 追溯链时间轴：把「育苗→采收→检测→签发→流通」串成一条可看的时间线。
+        #   公众验真页从「表格」升级为「时间轴」的核心数据源。
+        tl = timeline.build_timeline(cert)
+        data["timeline"] = tl["nodes"]
+        data["timeline_summary"] = tl["summary"]
         # 附带存证记录
         record = EvidenceRecord.objects.filter(
             biz_type=EvidenceRecord.BizType.CERTIFICATE, biz_id=cert.id).first()

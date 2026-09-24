@@ -105,6 +105,14 @@ class TestReport(BaseModel):
                                    blank=True, default="符合标准")
     file = models.FileField("报告附件", upload_to="reports/", null=True, blank=True)
     report_hash = models.CharField("报告哈希", max_length=64, blank=True, default="")
+    # ---- OCR 识别溯源 ----
+    # 记录「这条数据是机器认出来的还是人敲的」。检测结论这类字段直接决定
+    # 农产品能否流通，出问题时必须能回答「当时是谁/什么填的」。
+    ocr_method = models.CharField("识别方式", max_length=20, blank=True, default="",
+                                  help_text="pdf-text / ocr-pdf / ocr-image / manual")
+    ocr_confidence = models.CharField("识别置信度", max_length=10, blank=True, default="")
+    ocr_text = models.TextField("识别原文", blank=True, default="",
+                                help_text="OCR/文本层原文片段，便于事后核对")
     remark = models.CharField("备注", max_length=255, blank=True, default="")
 
     class Meta:
@@ -453,7 +461,89 @@ class InspectionRecord(BaseModel):
 
 
 # ---------------------------------------------------------------
-# 10. 操作审计日志（谁 / 何时 / 对哪条数据 / 做了什么）
+# 10. 站内消息通知（解决"审核完没人知道"）
+# ---------------------------------------------------------------
+class Notification(BaseModel):
+    """
+    站内消息。
+
+    为什么需要这张表：
+      系统原来的流程是**单向哑流程** —— 种植主体提交合格证送审后，
+      监管签发或不签发，种植主体不会收到任何反馈；监管检查判定不合格，
+      被检方也不知道；产销意向单发起后对方不回来看就永远不知道。
+      所有"需要别人知道"的节点都靠人主动刷新页面去发现。
+
+      消息表把「业务动作」翻译成「给谁的提醒」，是流程闭环的最后一环。
+
+    设计要点：
+      - **收件人显式建模**（recipient 外键），不靠角色广播：
+        同一个角色可能有多个用户（producer / producer2），
+        广播会导致「别人家的事也推给我」。
+      - **category 分类**：前端可按类型筛选、给不同图标与颜色。
+      - **link_route + link_id**：点消息直接跳到对应业务对象，
+        而不是只告诉用户"有事发生了"却不告诉他去哪儿看。
+      - **read_at 用时间戳而非布尔**：既能判断未读，也保留了「何时读的」这一审计信息。
+    """
+
+    class Category(models.TextChoices):
+        CERT_SUBMIT = "cert_submit", "合格证送审"
+        CERT_ISSUE = "cert_issue", "合格证签发"
+        CERT_REJECT = "cert_reject", "合格证驳回"
+        CERT_REVOKE = "cert_revoke", "合格证作废"
+        CERT_SUSPEND = "cert_suspend", "合格证暂停"
+        INSPECTION = "inspection", "监督检查"
+        RECTIFY = "rectify", "整改复查"
+        MATCH = "match", "产销对接"
+        AUDIT = "audit", "主体审核"
+        SYSTEM = "system", "系统通知"
+
+    class Level(models.TextChoices):
+        INFO = "info", "提示"
+        SUCCESS = "success", "成功"
+        WARNING = "warning", "提醒"
+        DANGER = "danger", "重要"
+
+    recipient = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+                                  verbose_name="收件人", related_name="notifications")
+    category = models.CharField("消息类型", max_length=20,
+                                choices=Category.choices, default=Category.SYSTEM)
+    level = models.CharField("重要级别", max_length=20,
+                             choices=Level.choices, default=Level.INFO)
+    title = models.CharField("标题", max_length=120)
+    content = models.TextField("正文", blank=True, default="")
+    # 点击跳转：link_route 是前端路由名（如 certificate），link_id 是对象 id
+    link_route = models.CharField("跳转路由", max_length=40, blank=True, default="")
+    link_id = models.IntegerField("跳转对象ID", null=True, blank=True)
+    link_label = models.CharField("跳转按钮文案", max_length=40, blank=True, default="")
+    # 业务来源（便于追溯这条消息是哪次操作产生的）
+    biz_type = models.CharField("关联业务类型", max_length=40, blank=True, default="")
+    biz_no = models.CharField("关联业务编号", max_length=60, blank=True, default="")
+    read_at = models.DateTimeField("读取时间", null=True, blank=True)
+    # 发起动作的人（展示「谁触发了这条消息」）
+    actor = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+                              null=True, blank=True, verbose_name="触发人",
+                              related_name="sent_notifications")
+
+    class Meta:
+        db_table = "sys_notification"
+        verbose_name = "站内消息"
+        verbose_name_plural = "站内消息"
+        ordering = ["-id"]
+        indexes = [
+            models.Index(fields=["recipient", "read_at"]),
+            models.Index(fields=["category"]),
+        ]
+
+    def __str__(self):
+        return f"→{self.recipient_id}: {self.title}"
+
+    @property
+    def is_read(self) -> bool:
+        return self.read_at is not None
+
+
+# ---------------------------------------------------------------
+# 11. 操作审计日志（谁 / 何时 / 对哪条数据 / 做了什么）
 # ---------------------------------------------------------------
 class OperationLog(BaseModel):
     """

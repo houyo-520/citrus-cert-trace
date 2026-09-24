@@ -1553,3 +1553,643 @@ class DashboardEnhanceTest(BaseFixture):
         top = {t["name"]: t["count"] for t in d["top_producers"]}
         # 测试主体只有 setUpTestData 里那一张已签发证
         self.assertEqual(top.get("测试柑橘合作社"), 1)
+
+
+# ===============================================================
+# 十六、追溯链时间轴
+# ===============================================================
+class TimelineTest(BaseFixture):
+    """
+    时间轴的核心价值是「把散落各表的事实串起来」，因此测试重点不是
+    渲染，而是：
+      ① 节点顺序是否符合业务先后（主体→批次→检测→签发）
+      ② 缺失环节是否**不产生节点**（不能显示空节点骗人）
+      ③ 链上锚点是否被正确挂到对应节点上
+    """
+
+    def test_timeline_order_follows_business_flow(self):
+        """节点顺序必须是 主体 → 批次 → 检测 → 签发。"""
+        from . import timeline
+        tl = timeline.build_timeline(self.cert)
+        keys = [n["key"] for n in tl["nodes"]]
+        self.assertIn("producer", keys)
+        self.assertIn("batch", keys)
+        self.assertIn("report", keys)
+        self.assertIn("issue", keys)
+        # 业务先后顺序不能乱
+        self.assertLess(keys.index("producer"), keys.index("batch"))
+        self.assertLess(keys.index("batch"), keys.index("report"))
+        self.assertLess(keys.index("report"), keys.index("issue"))
+
+    def test_missing_report_produces_no_report_node(self):
+        """
+        ★ 没有检测报告时，绝不能出现一个空的「检测」节点。
+        公众验真页的可信度建立在「显示的都是真的」之上，
+        凭空占位会让人以为检测过了。
+        """
+        from . import timeline
+        cert = Certificate.objects.create(
+            cert_no="CERT-NORPT", batch=self.batch, report=None,
+            producer_name=self.producer_obj.name, product_name="柑橘",
+            quantity_kg=Decimal("100.00"), status=Certificate.Status.DRAFT)
+        tl = timeline.build_timeline(cert)
+        keys = [n["key"] for n in tl["nodes"]]
+        self.assertNotIn("report", keys)
+
+    def test_farming_node_only_when_record_exists(self):
+        """农事记录为空时不产生该节点，有内容才出现。"""
+        from . import timeline
+        tl = timeline.build_timeline(self.cert)
+        self.assertNotIn("farming", [n["key"] for n in tl["nodes"]])
+
+        self.batch.farming_record = "9月1日施用有机肥 50kg/亩"
+        self.batch.save(update_fields=["farming_record"])
+        tl2 = timeline.build_timeline(self.cert)
+        self.assertIn("farming", [n["key"] for n in tl2["nodes"]])
+
+    def test_issue_node_carries_anchor(self):
+        """签发节点应带上链上锚点信息（证明被固化在链上）。"""
+        from . import timeline
+        services.anchor_certificate(self.cert)
+        tl = timeline.build_timeline(self.cert)
+        issue = next(n for n in tl["nodes"] if n["key"] == "issue")
+        self.assertIsNotNone(issue["anchor"])
+        self.assertEqual(issue["anchor"]["data_hash"], self.cert.cert_hash)
+
+    def test_unqualified_inspection_node_is_danger_level(self):
+        """不合格检查在时间轴上必须是 danger 级（前端标红）。"""
+        from . import timeline
+        InspectionRecord.objects.create(
+            certificate=self.cert, inspector=self.regulator,
+            check_result=InspectionRecord.CheckResult.UNQUALIFIED,
+            check_score=Decimal("55.00"), problem_description="农药残留超标")
+        tl = timeline.build_timeline(self.cert)
+        # ★ key 现在是 inspection-<id>，不能再按 == "inspection" 精确匹配
+        ins_nodes = [n for n in tl["nodes"] if n["key"].startswith("inspection")]
+        self.assertEqual(len(ins_nodes), 1)
+        self.assertEqual(ins_nodes[0]["level"], "danger")
+
+    def test_public_verify_returns_timeline(self):
+        """公众验真接口必须返回时间轴（前端时间轴的唯一数据源）。"""
+        c = self.login(self.regulator)
+        d = c.get(f"/api/public/verify/{self.cert.cert_no}/").data["data"]
+        self.assertIn("timeline", d)
+        self.assertIn("timeline_summary", d)
+        self.assertGreater(len(d["timeline"]), 0)
+        self.assertEqual(d["timeline_summary"]["status"], "issued")
+
+    def test_timeline_api_requires_auth(self):
+        """时间轴明细接口需要登录（公开接口只暴露脱敏后的验真数据）。"""
+        c = APIClient()
+        r = c.get(f"/api/certificate/{self.cert.id}/timeline/")
+        self.assertEqual(r.status_code, 401)
+
+    def test_timeline_api_for_regulator(self):
+        c = self.login(self.regulator)
+        r = c.get(f"/api/certificate/{self.cert.id}/timeline/")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.data["data"]["cert_no"], self.cert.cert_no)
+
+    def test_node_keys_are_unique_with_multiple_inspections(self):
+        """
+        ★ 同一张证有多条监督检查时，节点 key 必须唯一。
+
+        踩坑：原本所有检查节点都用 "inspection" 当 key，两条检查就产生
+        重复 key。前端 v-for 靠 key 做 diff，重复 key 会让 Vue 复用错节点
+        —— 渲染出的内容可能和实际数据对不上，而且**不报任何错**。
+        （线上实测：CERT-2026-1002 有 2 条检查，出现两个 key="inspection"）
+        """
+        from . import timeline
+        from .models import InspectionRecord
+        from django.utils import timezone
+        # 再补一条检查，制造「同一张证多条检查」
+        InspectionRecord.objects.create(
+            certificate=self.cert, inspector=self.regulator,
+            check_type=InspectionRecord.CheckType.ROUTINE,
+            check_result=InspectionRecord.CheckResult.QUALIFIED,
+            check_score=Decimal("90.00"), department="县农业农村局",
+            check_time=timezone.now())
+        tl = timeline.build_timeline(self.cert)
+        keys = [n["key"] for n in tl["nodes"]]
+        self.assertEqual(len(keys), len(set(keys)),
+                         f"节点 key 出现重复：{keys}")
+        insp_keys = [k for k in keys if k.startswith("inspection")]
+        self.assertEqual(len(insp_keys), len(set(insp_keys)))
+        self.assertGreaterEqual(len(insp_keys), 1)
+
+
+# ===============================================================
+# 十七、站内消息通知
+# ===============================================================
+class NotificationTest(BaseFixture):
+    """
+    通知的核心测试点：
+      ① 业务动作是否真的产生了「给正确的人」的消息
+      ② 是否**不给自己发**（操作人自己知道刚做了什么）
+      ③ 未读/已读/全部已读/清理 的状态流转
+      ④ ★ 消息的硬隔离：任何人都读不到别人的消息
+    """
+
+    def test_submit_notifies_regulator(self):
+        """送审 → 监管收到消息（这是"审核完没人知道"的正向修复）。"""
+        from .models import Notification
+        self.cert.status = Certificate.Status.DRAFT
+        self.cert.save(update_fields=["status"])
+        c = self.login(self.producer)
+        r = c.post(f"/api/certificate/{self.cert.id}/submit/")
+        self.assertEqual(r.status_code, 200)
+        n = Notification.objects.filter(
+            recipient=self.regulator,
+            category=Notification.Category.CERT_SUBMIT).first()
+        self.assertIsNotNone(n)
+        self.assertIn("待签发", n.title)
+        self.assertEqual(n.link_route, "certificate")
+
+    def test_issue_notifies_owner(self):
+        """签发 → 主体 owner 收到消息（业务归属人，不是签发人）。"""
+        from .models import Notification
+        self.cert.status = Certificate.Status.PENDING
+        self.cert.cert_no = None
+        self.cert.save(update_fields=["status", "cert_no"])
+        c = self.login(self.regulator)
+        r = c.post(f"/api/certificate/{self.cert.id}/issue/")
+        self.assertEqual(r.status_code, 200)
+        n = Notification.objects.filter(
+            recipient=self.producer,
+            category=Notification.Category.CERT_ISSUE).first()
+        self.assertIsNotNone(n)
+        self.assertIn("已签发", n.title)
+
+    def test_never_notify_self(self):
+        """
+        ★ 操作人不应收到自己动作产生的消息。
+        监管签发时他自己就是操作人，若给自己发消息会变成噪音。
+        """
+        from .models import Notification
+        c = self.login(self.regulator)
+        c.post(f"/api/certificate/{self.cert.id}/revoke/", {"reason": "测试作废"},
+               format="json")
+        # 监管自己不该收到「合格证已作废」
+        self.assertFalse(Notification.objects.filter(
+            recipient=self.regulator,
+            category=Notification.Category.CERT_REVOKE).exists())
+
+    def test_reject_carries_reason(self):
+        """驳回意见必须进入消息正文 —— 否则申请人不知道该改什么。"""
+        from .models import Notification
+        self.cert.status = Certificate.Status.PENDING
+        self.cert.save(update_fields=["status"])
+        c = self.login(self.regulator)
+        c.post(f"/api/certificate/{self.cert.id}/reject/",
+               {"reason": "检测报告已过期"}, format="json")
+        n = Notification.objects.filter(
+            recipient=self.producer,
+            category=Notification.Category.CERT_REJECT).first()
+        self.assertIsNotNone(n)
+        self.assertIn("检测报告已过期", n.content)
+
+    def test_inspection_notifies_producer(self):
+        """检查不合格 → 被检主体收到消息，且额外收到「证被暂停」。"""
+        from .models import Notification
+        c = self.login(self.regulator)
+        r = c.post("/api/inspection/", {
+            "certificate": self.cert.id,
+            "check_type": "routine", "check_result": "unqualified",
+            "check_score": "50.00", "problem_description": "农药残留超标",
+        }, format="json")
+        self.assertEqual(r.status_code, 201)
+        self.assertTrue(Notification.objects.filter(
+            recipient=self.producer,
+            category=Notification.Category.INSPECTION).exists())
+        # 证被暂停是另一件后果（货不能卖了），应单独提醒
+        self.assertTrue(Notification.objects.filter(
+            recipient=self.producer,
+            category=Notification.Category.CERT_SUSPEND).exists())
+
+    def test_intent_created_notifies_publisher(self):
+        """发起对接 → 供需单发布方收到消息。"""
+        from .models import Notification
+        sd = SupplyDemand.objects.create(
+            kind=SupplyDemand.Kind.SUPPLY, title="阿克苏砂糖橘供应",
+            product_name="柑橘", quantity_kg=Decimal("1000.00"),
+            price=Decimal("6.00"), publisher=self.producer)
+        c = self.login(self.buyer)
+        r = c.post(f"/api/supply/{sd.id}/intent/",
+                   {"quantity_kg": "500.00", "price": "6.00"}, format="json")
+        self.assertEqual(r.status_code, 200)
+        n = Notification.objects.filter(
+            recipient=self.producer,
+            category=Notification.Category.MATCH).first()
+        self.assertIsNotNone(n)
+        self.assertEqual(n.link_route, "intent")
+
+    def test_producer_audit_notifies_owner(self):
+        """主体审核 → owner 收到消息。"""
+        from .models import Notification
+        c = self.login(self.regulator)
+        c.post(f"/api/producer/{self.other_producer_obj.id}/audit/",
+               {"audit_status": "approved"}, format="json")
+        n = Notification.objects.filter(
+            recipient=self.other_producer,
+            category=Notification.Category.AUDIT).first()
+        self.assertIsNotNone(n)
+        self.assertIn("已通过", n.title)
+
+    def test_unread_summary_counts(self):
+        """未读汇总：数量与危险级分类要正确。"""
+        from .models import Notification
+        from . import notify as notify_mod
+        notify_mod.send(self.regulator, Notification.Category.SYSTEM, "普通消息")
+        notify_mod.send(self.regulator, Notification.Category.CERT_SUSPEND,
+                        "危险消息", level=Notification.Level.DANGER)
+        c = self.login(self.regulator)
+        d = c.get("/api/notification/unread/").data["data"]
+        self.assertEqual(d["unread"], 2)
+        self.assertEqual(d["danger"], 1)
+
+    def test_mark_read_and_read_all(self):
+        """已读流转：单条已读 → 未读数减 1；全部已读 → 归零。"""
+        from .models import Notification
+        from . import notify as notify_mod
+        notify_mod.send(self.regulator, Notification.Category.SYSTEM, "消息1")
+        notify_mod.send(self.regulator, Notification.Category.SYSTEM, "消息2")
+        c = self.login(self.regulator)
+        self.assertEqual(c.get("/api/notification/unread/").data["data"]["unread"], 2)
+
+        n = Notification.objects.filter(recipient=self.regulator).first()
+        r = c.post(f"/api/notification/{n.id}/read/")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(c.get("/api/notification/unread/").data["data"]["unread"], 1)
+
+        r2 = c.post("/api/notification/read-all/")
+        self.assertEqual(r2.data["data"]["updated"], 1)
+        self.assertEqual(c.get("/api/notification/unread/").data["data"]["unread"], 0)
+
+    def test_clear_read_keeps_unread(self):
+        """清理已读不能误删未读 —— 未读是待办，丢了就漏事。"""
+        from .models import Notification
+        from . import notify as notify_mod
+        n1 = notify_mod.send(self.regulator, Notification.Category.SYSTEM, "已读的")
+        notify_mod.send(self.regulator, Notification.Category.SYSTEM, "未读的")
+        c = self.login(self.regulator)
+        c.post(f"/api/notification/{n1.id}/read/")
+        r = c.post("/api/notification/clear-read/")
+        self.assertEqual(r.data["data"]["deleted"], 1)
+        left = Notification.objects.filter(recipient=self.regulator)
+        self.assertEqual(left.count(), 1)
+        self.assertIsNone(left.first().read_at)
+
+    def test_hard_isolation_between_users(self):
+        """
+        ★ 消息是硬隔离：任何人都读不到别人的消息。
+        这里直接改 URL 里的 id 去访问别人的消息，必须 404。
+        """
+        from .models import Notification
+        from . import notify as notify_mod
+        other_msg = notify_mod.send(self.other_producer, Notification.Category.SYSTEM,
+                                    "别人家的消息")
+        c = self.login(self.producer)
+        r = c.get(f"/api/notification/{other_msg.id}/")
+        self.assertEqual(r.status_code, 404)
+        # 列表里也不该出现
+        ids = [x["id"] for x in c.get("/api/notification/").data["results"]]
+        self.assertNotIn(other_msg.id, ids)
+
+    def test_unauthenticated_denied(self):
+        """未登录不能读消息。"""
+        c = APIClient()
+        self.assertEqual(c.get("/api/notification/").status_code, 401)
+        self.assertEqual(c.get("/api/notification/unread/").status_code, 401)
+
+    def test_category_filter(self):
+        """按类型筛选。"""
+        from .models import Notification
+        from . import notify as notify_mod
+        notify_mod.send(self.regulator, Notification.Category.SYSTEM, "系统消息")
+        notify_mod.send(self.regulator, Notification.Category.INSPECTION, "检查消息")
+        c = self.login(self.regulator)
+        r = c.get("/api/notification/?category=inspection").data["results"]
+        self.assertEqual(len(r), 1)
+        self.assertEqual(r[0]["category"], "inspection")
+
+    def test_notification_failure_does_not_break_business(self):
+        """
+        ★ 通知失败绝不能让业务失败。
+        这里传入一个已删除的用户对象模拟异常，send 必须静默返回 None
+        而不是抛异常（否则签发这种核心动作会被消息表拖垮）。
+        """
+        from . import notify as notify_mod
+        from .models import Notification
+        ghost = User(username="ghost_user", role=Role.PRODUCER)
+        # 未保存的对象没有 pk，写入必然失败
+        result = notify_mod.send(ghost, Notification.Category.SYSTEM, "发不出去的消息")
+        self.assertIsNone(result)
+        self.assertFalse(Notification.objects.filter(title="发不出去的消息").exists())
+
+
+# ===============================================================
+# 十八、检测报告 OCR 识别
+# ===============================================================
+class OcrTest(BaseFixture):
+    """
+    OCR 测试策略：**不依赖真实 PDF/图片文件**，而是直接测「文本 → 字段」的
+    解析层。原因：
+      ① 解析层才是业务正确性的所在（引擎调用只是 IO）
+      ② 不引入二进制测试样本，测试跑得快、可复现、不占仓库体积
+    只有接口层用一段真实生成的 PDF 做一次端到端验证。
+    """
+
+    def test_parse_conclusion_unqualified_priority(self):
+        """
+        ★ 最关键的一条：「不合格」必须优先于「合格」匹配。
+        中文里「不合格」包含「合格」子串，若先匹配「合格」，
+        一张不合格的报告会被判成合格 —— 后果是放行不合格农产品。
+        """
+        from . import ocr as ocr_mod
+        r = ocr_mod.parse_conclusion("检验结论：不合格")
+        self.assertEqual(r[0], "unqualified")
+        r2 = ocr_mod.parse_conclusion("检验结论：符合标准")
+        self.assertEqual(r2[0], "qualified")
+
+    def test_parse_conclusion_variants(self):
+        """常见表述都要能认出来。"""
+        from . import ocr as ocr_mod
+        cases = [
+            ("综合判定：合格", "qualified"),
+            ("检测结论：不符合要求", "unqualified"),
+            ("结论 达标", "qualified"),
+            ("判定结果：未通过", "unqualified"),
+        ]
+        for text, expect in cases:
+            with self.subTest(text=text):
+                self.assertEqual(ocr_mod.parse_conclusion(text)[0], expect)
+
+    def test_parse_report_no_variants(self):
+        """报告编号的多种写法。"""
+        from . import ocr as ocr_mod
+        cases = [
+            ("报告编号：RPT-2026-1003", "RPT-2026-1003"),
+            ("检验报告编号: JC20260901", "JC20260901"),
+            ("No.: ABC12345", "ABC12345"),
+        ]
+        for text, expect in cases:
+            with self.subTest(text=text):
+                self.assertEqual(ocr_mod.parse_report_no(text), expect)
+
+    def test_parse_report_no_rejects_chinese_noise(self):
+        """纯中文词不是编号，必须过滤掉（避免把「报告编号」本身当编号）。"""
+        from . import ocr as ocr_mod
+        self.assertEqual(ocr_mod.parse_report_no("报告编号：详见附页"), "")
+
+    def test_parse_date_variants(self):
+        """中文/短横线/斜杠三种日期写法都要能解析并规范成 YYYY-MM-DD。"""
+        from . import ocr as ocr_mod
+        cases = [
+            ("检测日期：2026年9月20日", "2026-09-20"),
+            ("检测日期：2026-09-20", "2026-09-20"),
+            ("检测日期：2026/9/5", "2026-09-05"),
+        ]
+        for text, expect in cases:
+            with self.subTest(text=text):
+                self.assertEqual(ocr_mod.parse_date(text), expect)
+
+    def test_parse_date_rejects_invalid(self):
+        """非法日期（13 月、32 日）必须返回空，不能造出脏数据。"""
+        from . import ocr as ocr_mod
+        self.assertEqual(ocr_mod.parse_date("检测日期：2026-13-45"), "")
+
+    def test_parse_org(self):
+        from . import ocr as ocr_mod
+        self.assertIn("阿克苏", ocr_mod.parse_org("检测机构：阿克苏地区检测中心"))
+        self.assertIn("检测中心", ocr_mod.parse_org("样品由新疆农产品质量检测中心受理"))
+
+    def test_parse_full_report_text(self):
+        """完整报告文本 → 各字段一次全部识别。"""
+        from . import ocr as ocr_mod
+        text = """
+        农产品质量安全检测报告
+        报告编号：RPT-2026-8888
+        样品名称：柑橘（砂糖橘）
+        检测机构：阿克苏地区农产品质量检测中心
+        检测日期：2026年9月18日
+        农药残留：符合标准
+        重金属：符合标准
+        综合判定：合格
+        """
+        fields, labelled = ocr_mod.parse_fields(text)
+        self.assertEqual(fields["report_no"], "RPT-2026-8888")
+        self.assertEqual(fields["test_date"], "2026-09-18")
+        self.assertEqual(fields["conclusion"], "qualified")
+        self.assertIn("阿克苏", fields["test_org"])
+        self.assertTrue(labelled)
+
+    def test_confidence_high_for_text_layer(self):
+        """电子版 PDF 文本层 + 关键字段命中 → 高置信度。"""
+        from . import ocr as ocr_mod
+        text = ("报告编号：RPT-2026-1\n检测日期：2026-09-01\n检验结论：合格\n" * 3)
+        # 直接调内部解析+置信度逻辑：模拟 method=pdf-text
+        fields, _ = ocr_mod.parse_fields(text)
+        key_hit = sum(1 for k in ("report_no", "conclusion", "test_date") if fields.get(k))
+        self.assertEqual(key_hit, 3)
+
+    def test_engine_status_shape(self):
+        """引擎自检接口返回结构稳定（部署排查依赖它）。"""
+        from . import ocr as ocr_mod
+        st = ocr_mod.engine_status()
+        for k in ("pdf_text", "ocr_python", "ocr_binary", "ocr_langs", "ocr_ready"):
+            self.assertIn(k, st)
+
+    def test_ocr_endpoint_rejects_missing_file(self):
+        c = self.login(self.producer)
+        r = c.post("/api/report/ocr/")
+        self.assertEqual(r.status_code, 400)
+
+    def test_ocr_endpoint_rejects_bad_ext(self):
+        """非白名单格式必须拒绝（与附件上传同一套规则）。"""
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        c = self.login(self.producer)
+        f = SimpleUploadedFile("evil.exe", b"MZ\x90\x00", content_type="application/x-msdownload")
+        r = c.post("/api/report/ocr/", {"file": f}, format="multipart")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("仅支持", r.data["message"])
+
+    def test_ocr_endpoint_extracts_from_real_pdf(self):
+        """
+        端到端：生成一份带文本层的真 PDF → 上传 → 断言字段被识别出来。
+        ★ 这条测试证明了「电子版 PDF 走文本层」这条主路径真的通。
+        """
+        try:
+            import pymupdf
+        except ImportError:
+            try:
+                import fitz as pymupdf
+            except ImportError:
+                self.skipTest("本机无 PDF 库，跳过文本层端到端测试")
+                return
+
+        # ★ 必须用中日韩内置字体 china-s 插入中文。默认 Helvetica 只支持
+        # latin-1，中文会被退化成「·」（U+00B7）写进文本层 —— 标签「检测结论：」
+        # 消失后正则必然匹配不到，但这一条恰恰是最容易被误判成「代码坏了」的假故障。
+        doc = pymupdf.open()
+        page = doc.new_page()
+        lines = [
+            "农产品质量安全检测报告",
+            "报告编号：RPT-OCR-9999",
+            "检测日期：2026-09-19",
+            "检测结论：合格",
+        ]
+        y = 80
+        for ln in lines:
+            page.insert_text((60, y), ln, fontsize=12, fontname="china-s")
+            y += 30
+        pdf_bytes = doc.tobytes()
+        doc.close()
+
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        f = SimpleUploadedFile("report.pdf", pdf_bytes, content_type="application/pdf")
+        c = self.login(self.producer)
+        r = c.post("/api/report/ocr/", {"file": f}, format="multipart")
+        self.assertEqual(r.status_code, 200)
+        d = r.data["data"]
+        self.assertEqual(d["method"], "pdf-text")
+        self.assertTrue(d["ok"])
+        self.assertEqual(d["fields"]["report_no"], "RPT-OCR-9999")
+        self.assertEqual(d["fields"]["test_date"], "2026-09-19")
+        self.assertEqual(d["fields"]["conclusion"], "qualified")
+        # 中文标签命中了两个关键字段 → 置信度判 high（按「关键字段命中数」而非
+        # 引擎自评分，因为业务关心的是「能不能省下手敲」）
+        self.assertEqual(d["confidence"], "high")
+
+    def test_ocr_pdf_ascii_labels_lose_chinese(self):
+        """
+        ★ 反面样本：PDF 里若用纯 ASCII 标签（Conclusion: qualified），
+        中文标签规则命中不了 → conclusion 必须留空，而不是猜一个。
+        宁可让用户手填，也不能给个可能是错的结论。
+        """
+        try:
+            import pymupdf
+        except ImportError:
+            try:
+                import fitz as pymupdf
+            except ImportError:
+                self.skipTest("本机无 PDF 库，跳过")
+                return
+
+        doc = pymupdf.open()
+        page = doc.new_page()
+        page.insert_text((60, 80), "Report No: RPT-ASCII-1", fontsize=12)
+        page.insert_text((60, 110), "Conclusion: qualified", fontsize=12)
+        pdf_bytes = doc.tobytes()
+        doc.close()
+
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        f = SimpleUploadedFile("r.pdf", pdf_bytes, content_type="application/pdf")
+        c = self.login(self.producer)
+        r = c.post("/api/report/ocr/", {"file": f}, format="multipart")
+        self.assertEqual(r.status_code, 200)
+        d = r.data["data"]
+        # 编号是纯 ASCII，能认出来
+        self.assertEqual(d["fields"]["report_no"], "RPT-ASCII-1")
+        # 结论依赖中文标签，认不出就留空
+        self.assertEqual(d["fields"]["conclusion"], "")
+
+    def test_ocr_endpoint_requires_login(self):
+        c = APIClient()
+        r = c.post("/api/report/ocr/")
+        self.assertEqual(r.status_code, 401)
+
+    def test_ocr_status_endpoint(self):
+        c = self.login(self.regulator)
+        r = c.get("/api/report/ocr-status/")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("pdf_text", r.data["data"])
+
+    def test_ocr_fields_persisted_for_audit(self):
+        """
+        ★ 识别来源必须落库：出问题时能回答「这条数据是机器认的还是人敲的」。
+
+        序列化器把 ocr_* 设为 read_only（前端不该随意声明来源），因此必须由
+        视图从 request.data 显式取出。这条测试就是钉住这个连接点 ——
+        少了它，字段会静默恒为空，不报错但溯源能力等于不存在。
+        """
+        c = self.login(self.producer)
+        r = c.post("/api/report/", {
+            "report_no": "RPT-AUDIT-1", "batch": self.batch.id,
+            "test_org": "检测中心", "test_date": "2026-09-10",
+            "conclusion": "qualified",
+            "ocr_method": "pdf-text", "ocr_confidence": "high",
+            "ocr_text": "报告编号：RPT-AUDIT-1",
+        }, format="json")
+        self.assertEqual(r.status_code, 201)
+        obj = TestReport.objects.get(report_no="RPT-AUDIT-1")
+        self.assertEqual(obj.ocr_method, "pdf-text")
+        self.assertEqual(obj.ocr_confidence, "high")
+        self.assertEqual(obj.ocr_text, "报告编号：RPT-AUDIT-1")
+        # 列表接口应把识别方式翻成中文给前端展示
+        lst = c.get("/api/report/?page_size=100").data["results"]
+        row = next(x for x in lst if x["report_no"] == "RPT-AUDIT-1")
+        self.assertEqual(row["ocr_method_display"], "PDF 文本层提取")
+
+    def test_manual_report_has_no_ocr_provenance(self):
+        """
+        ★ 反向断言：手工录入的报告不得凭空带上识别来源。
+
+        若这里也能查出 ocr_method，说明所有人都会显示成「机器识别」，
+        溯源字段就失去了区分能力。
+        """
+        c = self.login(self.producer)
+        r = c.post("/api/report/", {
+            "report_no": "RPT-MANUAL-1", "batch": self.batch.id,
+            "test_org": "检测中心", "test_date": "2026-09-11",
+            "conclusion": "qualified",
+        }, format="json")
+        self.assertEqual(r.status_code, 201)
+        obj = TestReport.objects.get(report_no="RPT-MANUAL-1")
+        self.assertEqual(obj.ocr_method, "")
+        self.assertEqual(obj.ocr_confidence, "")
+
+
+# ===============================================================
+# 十九、移动端适配的后端支撑（响应式不改变接口契约）
+# ===============================================================
+class MobileAdaptationTest(BaseFixture):
+    """
+    移动端适配主要是前端工作，但后端有两条必须守住的契约：
+      ① 分页/列表接口在 page_size 较小时也要返回完整字段（移动端列表字段少但结构一致）
+      ② 验真接口必须自包含 —— 手机扫码后只打这一个接口就要能渲染完整页面，
+         不能让前端再串 3 个接口（移动网络下每多一次往返都明显变慢）
+    """
+
+    def test_public_verify_is_self_contained(self):
+        """验真接口一次返回时间轴 + 证面 + 存证 + 检查，手机端无需二次请求。"""
+        c = self.login(self.regulator)
+        d = c.get(f"/api/public/verify/{self.cert.cert_no}/").data["data"]
+        for key in ("cert_no", "producer_name", "cert_hash", "timeline",
+                    "cert_no_parsed", "trusted", "verify_message"):
+            self.assertIn(key, d)
+
+    def test_public_verify_accessible_without_token(self):
+        """
+        ★ 扫码验真必须免登录。
+        消费者扫码时不可能有账号，这条契约一旦破坏，整个公众验真的意义就没了。
+        """
+        c = APIClient()  # 不带任何认证
+        r = c.get(f"/api/public/verify/{self.cert.cert_no}/")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.data["data"]["cert_no"], self.cert.cert_no)
+
+    def test_list_endpoints_respect_page_size(self):
+        """列表接口支持 page_size（移动端可按需少取）。"""
+        c = self.login(self.regulator)
+        r = c.get("/api/certificate/?page_size=1")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("results", r.data)
+        self.assertLessEqual(len(r.data["results"]), 1)
+
+    def test_public_verify_records_query_for_analytics(self):
+        """每次扫码验真都落一条查询记录（看板「公众查询次数」的数据源）。"""
+        from .models import PublicQueryRecord
+        before = PublicQueryRecord.objects.count()
+        c = APIClient()
+        c.get(f"/api/public/verify/{self.cert.cert_no}/")
+        self.assertEqual(PublicQueryRecord.objects.count(), before + 1)

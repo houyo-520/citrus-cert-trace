@@ -5,7 +5,8 @@ from rest_framework import serializers
 
 from .models import (Producer, ProductBatch, TestReport, Certificate,
                      EvidenceRecord, PublicQueryRecord, SupplyDemand,
-                     MatchIntent, OperationLog, InspectionRecord)
+                     MatchIntent, OperationLog, InspectionRecord,
+                     Notification)
 
 # 检测报告附件允许的扩展名与大小上限（10 MB）
 REPORT_FILE_EXTS = {".pdf", ".jpg", ".jpeg", ".png", ".doc", ".docx"}
@@ -39,10 +40,21 @@ class TestReportSerializer(serializers.ModelSerializer):
     # 前端拼上 API 源即可下载；这里额外给一个带文件名的展示字段）
     file_name = serializers.SerializerMethodField()
     file_url = serializers.SerializerMethodField()
+    # ★ OCR 识别来源（便于审计：这个字段是人填的还是机器认的）
+    ocr_method_display = serializers.SerializerMethodField()
 
     class Meta:
         model = TestReport
         fields = "__all__"
+        read_only_fields = ["ocr_method", "ocr_confidence", "ocr_text"]
+
+    def get_ocr_method_display(self, obj):
+        return {
+            "pdf-text": "PDF 文本层提取",
+            "ocr-pdf": "扫描件 OCR 识别",
+            "ocr-image": "图片 OCR 识别",
+            "manual": "手工录入",
+        }.get(getattr(obj, "ocr_method", "") or "", "")
 
     def get_file_name(self, obj):
         """
@@ -201,3 +213,18 @@ class OperationLogSerializer(serializers.ModelSerializer):
     class Meta:
         model = OperationLog
         fields = "__all__"
+
+
+class NotificationSerializer(serializers.ModelSerializer):
+    category_display = serializers.CharField(source="get_category_display", read_only=True)
+    level_display = serializers.CharField(source="get_level_display", read_only=True)
+    is_read = serializers.BooleanField(read_only=True)
+    actor_name = serializers.CharField(source="actor.username", read_only=True)
+
+    class Meta:
+        model = Notification
+        fields = "__all__"
+        # 全部字段由后端生成，前端只能改「已读」状态（走专门 action）
+        read_only_fields = ["recipient", "category", "level", "title", "content",
+                            "link_route", "link_id", "link_label", "biz_type",
+                            "biz_no", "read_at", "actor"]

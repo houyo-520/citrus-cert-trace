@@ -39,6 +39,18 @@
           <span class="hash-text">{{ (row.report_hash || '').slice(0, 16) }}...</span>
         </template>
       </el-table-column>
+      <!-- ★ 数据来源：人填的还是机器认的，出问题时能追溯 -->
+      <el-table-column label="数据来源" width="120">
+        <template #default="{ row }">
+          <el-tooltip v-if="row.ocr_method" :content="`置信度：${row.ocr_confidence || '—'}`"
+                      placement="top">
+            <el-tag size="small" type="warning" effect="plain">
+              {{ row.ocr_method_display }}
+            </el-tag>
+          </el-tooltip>
+          <el-tag v-else size="small" type="info" effect="plain">手工录入</el-tag>
+        </template>
+      </el-table-column>
       <el-table-column label="操作" width="150" fixed="right">
         <template #default="{ row }">
           <el-button v-if="userStore.perms.can_write_production" link type="primary"
@@ -96,6 +108,51 @@
             </template>
           </el-upload>
         </el-form-item>
+
+        <!-- ★ OCR 智能识别：选完文件自动识别并回填，减少手工录入 -->
+        <el-form-item label="智能识别">
+          <div class="ocr-box">
+            <el-button type="warning" plain :loading="ocrLoading"
+                       :disabled="!pendingFile" @click="runOcr">
+              <el-icon><MagicStick /></el-icon>
+              {{ pendingFile ? '识别并自动填充' : '请先选择报告文件' }}
+            </el-button>
+            <span class="ocr-hint">
+              电子版 PDF 直接读文字（准确率高）；扫描件/图片走 OCR
+            </span>
+          </div>
+        </el-form-item>
+
+        <!-- 识别结果：必须人工确认（识别是概率性的，结论认错后果严重） -->
+        <el-form-item v-if="ocrResult" label="识别结果">
+          <div class="ocr-result" :class="`cf-${ocrResult.confidence}`">
+            <div class="ocr-rhead">
+              <el-tag size="small"
+                      :type="ocrConfTag(ocrResult.confidence)" effect="dark">
+                置信度 {{ confText(ocrResult.confidence) }}
+              </el-tag>
+              <el-tag size="small" type="info" effect="plain">
+                {{ methodText(ocrResult.method) }}
+              </el-tag>
+              <span class="ocr-filled">
+                已识别 {{ ocrResult.filled.length }} 个字段
+              </span>
+            </div>
+            <ul v-if="ocrResult.warnings.length" class="ocr-warn">
+              <li v-for="(w, i) in ocrResult.warnings" :key="i">{{ w }}</li>
+            </ul>
+            <div v-if="ocrResult.filled.length" class="ocr-fields">
+              <span v-for="f in ocrResult.filled" :key="f" class="ocr-chip">
+                {{ fieldLabel(f) }}
+              </span>
+            </div>
+            <el-collapse v-if="ocrResult.text_excerpt" class="ocr-collapse">
+              <el-collapse-item title="查看识别原文（便于人工核对）">
+                <pre class="ocr-raw">{{ ocrResult.text_excerpt }}</pre>
+              </el-collapse-item>
+            </el-collapse>
+          </div>
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
@@ -143,7 +200,10 @@
 <script setup>
 import { ref, onMounted, reactive } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { listReport, createReport, deleteReport, listBatch, uploadReportFile } from '@/api'
+import { MagicStick } from '@element-plus/icons-vue'
+import {
+  listReport, createReport, deleteReport, listBatch, uploadReportFile, ocrReport
+} from '@/api'
 import { useUserStore } from '@/store/user'
 
 const userStore = useUserStore()
@@ -153,6 +213,23 @@ const batches = ref([])
 const loading = ref(false)
 const dialogVisible = ref(false)
 const form = reactive({ conclusion: 'qualified', pesticide_residue: '符合标准', heavy_metal: '符合标准' })
+
+// ---- ★ OCR 识别状态 ----
+const ocrLoading = ref(false)
+const ocrResult = ref(null)
+
+const FIELD_LABELS = {
+  report_no: '报告编号', test_org: '检测机构', test_date: '检测日期',
+  conclusion: '检测结论', pesticide_residue: '农药残留',
+  heavy_metal: '重金属', product_name: '产品名称'
+}
+const fieldLabel = (k) => FIELD_LABELS[k] || k
+const confText = (c) => ({ high: '高', medium: '中', low: '低' }[c] || c)
+const ocrConfTag = (c) => ({ high: 'success', medium: 'warning', low: 'danger' }[c] || 'info')
+const methodText = (m) => ({
+  'pdf-text': 'PDF 文本层提取', 'ocr-pdf': '扫描件 OCR',
+  'ocr-image': '图片 OCR'
+}[m] || m)
 
 // ---- 附件上传：新建报告时随表单一并提交 ----
 const createUploadRef = ref()
@@ -187,15 +264,58 @@ const openDialog = () => {
   Object.assign(form, { conclusion: 'qualified', pesticide_residue: '符合标准', heavy_metal: '符合标准' })
   createFileList.value = []
   pendingFile.value = null
+  ocrResult.value = null
   dialogVisible.value = true
 }
 
 // el-upload 的非自动上传模式：on-change 只在选文件时触发，不会真的发请求
 const onCreateFileChange = (file) => {
   pendingFile.value = file.raw
+  // 换文件就清掉上一次的识别结果，避免「识别结果与当前文件不符」的误导
+  ocrResult.value = null
 }
 const onCreateExceed = () => {
   ElMessage.warning('只能上传 1 个附件，请先移除已选文件')
+}
+
+/**
+ * ★ OCR 识别并回填。
+ *
+ * 只回填「当前为空」的字段 —— 用户已经手填的内容优先级高于机器识别，
+ * 无脑覆盖会让人白填一遍（尤其报告编号这种用户心里有数的字段）。
+ * 识别结论会明确提示「需人工确认」，因为结论认错直接影响能否流通。
+ */
+const runOcr = async () => {
+  if (!pendingFile.value) return
+  ocrLoading.value = true
+  ocrResult.value = null
+  try {
+    const res = await ocrReport(pendingFile.value)
+    const d = res.data || {}
+    ocrResult.value = d
+    if (!d.ok) {
+      ElMessage.warning(res.message || '未能识别出内容，请手工录入')
+      return
+    }
+    const f = d.fields || {}
+    let filledCount = 0
+    Object.keys(f).forEach((k) => {
+      // 只填 form 里存在的字段，且不覆盖用户已填内容
+      if (k in form && f[k] && !form[k]) {
+        form[k] = f[k]
+        filledCount += 1
+      }
+    })
+    if (filledCount > 0) {
+      ElMessage.success(`已自动填充 ${filledCount} 个字段，请核对后保存`)
+    } else {
+      ElMessage.info('识别出的字段与已有内容重复，未做修改')
+    }
+  } catch (e) {
+    ElMessage.error('识别失败，请手工录入')
+  } finally {
+    ocrLoading.value = false
+  }
 }
 
 const save = async () => {
@@ -203,12 +323,21 @@ const save = async () => {
     ElMessage.warning('请填写报告编号并选择批次')
     return
   }
+  // ★ 走 OCR 的字段要留痕：出问题时必须能回答「这条数据是机器认的还是人敲的」
+  const extra = {}
+  if (ocrResult.value && ocrResult.value.ok) {
+    extra.ocr_method = ocrResult.value.method
+    extra.ocr_confidence = ocrResult.value.confidence
+    extra.ocr_text = (ocrResult.value.text_excerpt || '').slice(0, 2000)
+  }
   // multipart 一步到位：有附件时用 FormData，无附件时走原 JSON
-  let payload = form
+  let payload = { ...form, ...extra }
   if (pendingFile.value) {
     const fd = new FormData()
-    Object.keys(form).forEach((k) => {
-      if (form[k] !== undefined && form[k] !== null && form[k] !== '') fd.append(k, form[k])
+    Object.keys(payload).forEach((k) => {
+      if (payload[k] !== undefined && payload[k] !== null && payload[k] !== '') {
+        fd.append(k, payload[k])
+      }
     })
     fd.append('file', pendingFile.value)
     payload = fd
@@ -218,6 +347,7 @@ const save = async () => {
   dialogVisible.value = false
   createFileList.value = []
   pendingFile.value = null
+  ocrResult.value = null
   load()
 }
 
@@ -265,9 +395,48 @@ onMounted(() => { load(); loadBatches() })
 </script>
 
 <style scoped>
-.toolbar { display: flex; gap: 10px; margin-bottom: 14px; }
+.toolbar { display: flex; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
 .hash-text { font-family: monospace; font-size: 12px; color: var(--el-text-color-secondary); }
 .upload-tip { font-size: 12px; color: var(--el-text-color-secondary); line-height: 1.6; }
 .upload-meta { margin-bottom: 14px; }
 .muted { color: var(--el-text-color-secondary); }
+
+/* ---- OCR 识别区 ---- */
+.ocr-box { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.ocr-hint { font-size: 12px; color: var(--el-text-color-secondary); line-height: 1.5; }
+
+.ocr-result {
+  width: 100%;
+  border: 1px solid #e4e7ed;
+  border-left: 3px solid #e6a23c;
+  border-radius: 6px;
+  padding: 10px 12px;
+  background: #fdfbf7;
+}
+/* 置信度低时改成红色警示边框：让用户下意识多核对一遍 */
+.ocr-result.cf-low { border-left-color: #f56c6c; background: #fef8f8; }
+.ocr-result.cf-high { border-left-color: #67c23a; background: #f8fdf6; }
+
+.ocr-rhead { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ocr-filled { font-size: 12px; color: var(--el-text-color-secondary); }
+
+.ocr-warn {
+  margin: 8px 0 0; padding-left: 18px;
+  font-size: 12px; color: #e6a23c; line-height: 1.7;
+}
+.ocr-result.cf-low .ocr-warn { color: #f56c6c; }
+
+.ocr-fields { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.ocr-chip {
+  font-size: 11.5px; color: #67c23a;
+  background: #f0f9eb; border: 1px solid #e1f3d8;
+  border-radius: 4px; padding: 1px 7px;
+}
+.ocr-collapse { margin-top: 8px; }
+.ocr-raw {
+  font-size: 11.5px; line-height: 1.7; color: #606266;
+  white-space: pre-wrap; word-break: break-all;
+  max-height: 200px; overflow-y: auto; margin: 0;
+  background: #fff; padding: 8px; border-radius: 4px;
+}
 </style>

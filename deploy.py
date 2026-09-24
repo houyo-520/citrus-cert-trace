@@ -229,9 +229,20 @@ def do_setup(cli):
              f"-i https://mirrors.aliyun.com/pypi/simple/ "
              f"-r {REMOTE_BACKEND}/requirements.txt gunicorn", timeout=1800)
 
+    # ★ tesseract 是**系统包**，pip 装不了 —— 必须单独 apt 安装。
+    #   电子版 PDF 走文本层不需要它，但扫描件/照片识别要靠它。
+    #   漏装的后果不是报错而是「扫描件永远识别不出来」，很难被发现。
+    print("=== 安装 tesseract（扫描件 OCR 依赖，系统包）===")
+    run(cli, "command -v tesseract >/dev/null 2>&1 && echo 'tesseract 已安装，跳过' || "
+             "(sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && "
+             "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "
+             "tesseract-ocr tesseract-ocr-chi-sim)", timeout=900)
+    run(cli, "tesseract --version 2>&1 | head -1 && tesseract --list-langs 2>&1 | tail -n +2 | tr '\\n' ' '")
+
     print("=== 依赖清单确认 ===")
     run(cli, f"{REMOTE_ROOT}/venv/bin/pip list 2>/dev/null | grep -Ei "
-             f"'django|rest|jwt|cors|qrcode|pillow|web3|gunicorn|pymysql'")
+             f"'django|rest|jwt|cors|qrcode|pillow|web3|gunicorn|pymysql|"
+             f"pymupdf|pdfminer|pytesseract'")
 
 
 # ---------------------------------------------------------------- migrate

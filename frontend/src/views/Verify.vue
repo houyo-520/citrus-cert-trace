@@ -2,12 +2,12 @@
   <div class="verify-page">
     <div class="verify-header">
       <h1><el-icon><Orange /></el-icon> 柑橘合格证追溯验真</h1>
-      <p>输入或扫描合格证编号，查询农产品承诺达标合格证及存证信息</p>
+      <p>输入或扫描合格证编号，查看农产品从生产到流通的全链路存证信息</p>
     </div>
 
     <div class="verify-search">
-      <el-input v-model="certNo" placeholder="请输入合格证编号，如 CERT-2026-1001"
-                size="large" clearable @keyup.enter="doVerify">
+      <el-input v-model="certNo" placeholder="请输入合格证编号" size="large"
+                clearable @keyup.enter="doVerify">
         <template #prefix><el-icon><Search /></el-icon></template>
       </el-input>
       <el-button type="primary" size="large" :loading="loading" @click="doVerify">
@@ -21,21 +21,77 @@
     </div>
 
     <div v-if="result" class="verify-result">
-      <el-alert
-        :type="result.trusted ? 'success' : 'error'"
-        :closable="false"
-        show-icon
-        class="result-alert"
-      >
-        <template #title>
-          <span class="result-title">
-            {{ result.trusted ? '✓ 验真通过：数据可信' : '✗ 验真失败：数据不可信' }}
-          </span>
-        </template>
-        <div class="result-msg">{{ result.verify_message }}</div>
-      </el-alert>
+      <!-- ===== 验真结论：放最顶部，一眼可见 ===== -->
+      <div class="verdict" :class="result.trusted ? 'ok' : 'bad'">
+        <div class="verdict-icon">
+          <el-icon :size="34">
+            <component :is="result.trusted ? 'CircleCheckFilled' : 'CircleCloseFilled'" />
+          </el-icon>
+        </div>
+        <div class="verdict-text">
+          <div class="verdict-title">
+            {{ result.trusted ? '验真通过 · 数据可信' : '验真失败 · 数据不可信' }}
+          </div>
+          <div class="verdict-sub">{{ result.verify_message }}</div>
+        </div>
+      </div>
 
-      <!-- 双层校验状态（答辩亮点） -->
+      <!-- ===== ★ 追溯链时间轴：一件柑橘的旅程 ===== -->
+      <div v-if="timeline.length" class="tl-panel">
+        <div class="tl-head">
+          <div class="tl-head-left">
+            <el-icon><Guide /></el-icon>
+            <span>全链路追溯</span>
+          </div>
+          <div class="tl-head-right">
+            <el-tag size="small" type="info" effect="plain">
+              {{ timeline.length }} 个环节
+            </el-tag>
+            <el-tag v-if="timelineSummary.anchored_nodes" size="small"
+                    type="success" effect="plain">
+              {{ timelineSummary.anchored_nodes }} 项已上链
+            </el-tag>
+          </div>
+        </div>
+
+        <div class="timeline">
+          <div v-for="(n, i) in timeline" :key="n.key + i"
+               class="tl-item" :class="[`lv-${n.level}`, { done: n.done }]">
+            <!-- 轴：圆点 + 连接线 -->
+            <div class="tl-axis">
+              <div class="tl-dot">
+                <el-icon :size="15"><component :is="n.icon" /></el-icon>
+              </div>
+              <div v-if="i < timeline.length - 1" class="tl-line"></div>
+            </div>
+            <!-- 内容 -->
+            <div class="tl-content">
+              <div class="tl-row1">
+                <span class="tl-title">{{ n.title }}</span>
+                <span class="tl-time">{{ n.time }}</span>
+              </div>
+              <div class="tl-desc">{{ n.desc }}</div>
+              <div v-if="n.detail && n.detail.length" class="tl-detail">
+                <div v-for="(d, di) in n.detail" :key="di" class="tl-drow">
+                  <span class="tl-dk">{{ d[0] }}</span>
+                  <span class="tl-dv">{{ d[1] }}</span>
+                </div>
+              </div>
+              <!-- 链上锚点：证明这个环节被固化在联盟链上 -->
+              <div v-if="n.anchor" class="tl-anchor">
+                <el-icon><Lock /></el-icon>
+                <span v-if="n.anchor.anchored">
+                  已上链 · 区块 #{{ n.anchor.block_height }} ·
+                  <span class="hash-text">{{ (n.anchor.tx_hash || '').slice(0, 22) }}…</span>
+                </span>
+                <span v-else>已存证（模拟模式，未上链）</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== 双层校验状态（答辩亮点） ===== -->
       <div class="dual-check">
         <div class="check-item" :class="result.trusted ? 'ok' : 'bad'">
           <div class="check-head">
@@ -68,29 +124,33 @@
         </div>
       </div>
 
-      <el-descriptions :column="2" border class="result-desc">
-        <el-descriptions-item label="合格证编号">{{ result.cert_no }}</el-descriptions-item>
-        <el-descriptions-item label="证书状态">
-          <el-tag :type="statusTagType(result.status)" size="small">
-            {{ result.status_display }}
-          </el-tag>
-        </el-descriptions-item>
-        <el-descriptions-item label="生产主体">{{ result.producer_name }}</el-descriptions-item>
-        <el-descriptions-item label="产品名称">
-          {{ result.product_name }} <span class="text-muted">（{{ result.variety }}）</span>
-        </el-descriptions-item>
-        <el-descriptions-item label="产地">{{ result.origin }}</el-descriptions-item>
-        <el-descriptions-item label="开具数量">{{ result.quantity_kg }} kg</el-descriptions-item>
-        <el-descriptions-item label="生产批次">{{ result.batch_no }}</el-descriptions-item>
-        <el-descriptions-item label="检测报告">
-          {{ result.report_no }}
-          <el-tag v-if="result.conclusion" type="success" size="small" style="margin-left:6px">
-            {{ result.conclusion }}
-          </el-tag>
-        </el-descriptions-item>
-        <el-descriptions-item label="签发日期">{{ result.issue_date }}</el-descriptions-item>
-        <el-descriptions-item label="有效期至">{{ result.valid_until }}</el-descriptions-item>
-      </el-descriptions>
+      <!-- ===== 证面基础信息 ===== -->
+      <div class="info-panel">
+        <div class="info-title"><el-icon><Postcard /></el-icon> 合格证信息</div>
+        <el-descriptions :column="isMobile ? 1 : 2" border class="result-desc">
+          <el-descriptions-item label="合格证编号">{{ result.cert_no }}</el-descriptions-item>
+          <el-descriptions-item label="证书状态">
+            <el-tag :type="statusTagType(result.status)" size="small">
+              {{ result.status_display }}
+            </el-tag>
+          </el-descriptions-item>
+          <el-descriptions-item label="生产主体">{{ result.producer_name }}</el-descriptions-item>
+          <el-descriptions-item label="产品名称">
+            {{ result.product_name }} <span class="text-muted">（{{ result.variety }}）</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="产地">{{ result.origin }}</el-descriptions-item>
+          <el-descriptions-item label="开具数量">{{ result.quantity_kg }} kg</el-descriptions-item>
+          <el-descriptions-item label="生产批次">{{ result.batch_no }}</el-descriptions-item>
+          <el-descriptions-item label="检测报告">
+            {{ result.report_no }}
+            <el-tag v-if="result.conclusion" type="success" size="small" style="margin-left:6px">
+              {{ result.conclusion }}
+            </el-tag>
+          </el-descriptions-item>
+          <el-descriptions-item label="签发日期">{{ result.issue_date }}</el-descriptions-item>
+          <el-descriptions-item label="有效期至">{{ result.valid_until }}</el-descriptions-item>
+        </el-descriptions>
+      </div>
 
       <!-- 编号构成：让消费者看懂 19 位编号的含义 -->
       <div v-if="result.cert_no_parsed && result.cert_no_parsed.valid" class="no-parse">
@@ -109,42 +169,6 @@
             <div class="seg-lbl">当日流水号</div>
           </div>
         </div>
-      </div>
-
-      <!-- ★ 监督检查公示：扫码即可看到这张证是否被查出过问题 -->
-      <div v-if="result.inspection_count > 0" class="insp-panel">
-        <div class="insp-title">
-          <el-icon><Stamp /></el-icon> 监督检查公示
-          <el-tag size="small" type="info" effect="plain">
-            共 {{ result.inspection_count }} 次
-          </el-tag>
-        </div>
-        <el-descriptions v-if="result.inspection" :column="2" border>
-          <el-descriptions-item label="检查结论">
-            <el-tag size="small"
-                    :type="result.inspection.check_result === '不合格' ? 'danger' : 'success'">
-              {{ result.inspection.check_result }}
-            </el-tag>
-          </el-descriptions-item>
-          <el-descriptions-item label="检查类型">
-            {{ result.inspection.check_type }}
-          </el-descriptions-item>
-          <el-descriptions-item label="检查时间">{{ result.inspection.check_time }}</el-descriptions-item>
-          <el-descriptions-item label="检查评分">{{ result.inspection.check_score }}</el-descriptions-item>
-          <el-descriptions-item label="检查部门" :span="2">
-            {{ result.inspection.department || '—' }}
-          </el-descriptions-item>
-          <el-descriptions-item label="发现问题" :span="2">
-            {{ result.inspection.problem || '—' }}
-          </el-descriptions-item>
-          <el-descriptions-item label="整改状态" :span="2">
-            {{ result.inspection.rectify_status }}
-          </el-descriptions-item>
-        </el-descriptions>
-        <p class="insp-note">
-          检查结论已上链存证（摘要 {{ (result.inspection.record_hash || '').slice(0, 24) }}…），
-          事后任何一方均无法单方面否认当时的判定。
-        </p>
       </div>
 
       <el-alert v-if="result.status === 'suspended'" type="error" :closable="false"
@@ -193,9 +217,8 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
-import { ElMessage } from 'element-plus'
 import { publicVerify } from '@/api'
 
 const route = useRoute()
@@ -205,16 +228,22 @@ const loading = ref(false)
 const searched = ref(false)
 const samples = ['CERT-2026-1001', 'CERT-2026-1002']
 
+// 移动端：验真页是扫码后的落地页，手机上必须好用 —— 描述列表要单列
+const MQ = '(max-width: 768px)'
+const isMobile = ref(window.matchMedia(MQ).matches)
+let mq = null
+const onMq = (e) => { isMobile.value = e.matches }
+
+const timeline = computed(() => result.value?.timeline || [])
+const timelineSummary = computed(() => result.value?.timeline_summary || {})
+
 const statusTagType = (s) => ({
   issued: 'success', draft: 'info', pending: 'warning',
   suspended: 'danger', revoked: 'danger'
 }[s] || 'info')
 
 const doVerify = async () => {
-  if (!certNo.value.trim()) {
-    ElMessage.warning('请输入合格证编号')
-    return
-  }
+  if (!certNo.value.trim()) return
   loading.value = true
   searched.value = true
   result.value = null
@@ -233,7 +262,12 @@ const quick = (n) => {
   doVerify()
 }
 
-if (certNo.value) doVerify()
+onMounted(() => {
+  mq = window.matchMedia(MQ)
+  mq.addEventListener('change', onMq)
+  if (certNo.value) doVerify()
+})
+onUnmounted(() => { mq?.removeEventListener('change', onMq) })
 </script>
 
 <style scoped>
@@ -259,18 +293,96 @@ if (certNo.value) doVerify()
 .quick-tips { margin-top: 12px; display: flex; align-items: center; gap: 8px; }
 .sample { cursor: pointer; }
 .verify-result { margin-top: 24px; }
-.result-alert { margin-bottom: 16px; }
-.result-title { font-size: 16px; font-weight: 600; }
-.result-msg { font-size: 13px; margin-top: 4px; }
-.result-desc { margin-bottom: 20px; }
+
+/* ===== 验真结论（顶部大色块，一眼可见）===== */
+.verdict {
+  display: flex; align-items: center; gap: 16px;
+  padding: 18px 20px; border-radius: 10px; margin-bottom: 16px;
+  color: #fff;
+}
+.verdict.ok { background: linear-gradient(135deg, #3f9d5c, #2d7d46); }
+.verdict.bad { background: linear-gradient(135deg, #e05b5b, #c33c3c); }
+.verdict-icon { flex: 0 0 auto; display: flex; }
+.verdict-title { font-size: 19px; font-weight: 700; letter-spacing: 0.5px; }
+.verdict-sub { font-size: 13px; opacity: 0.92; margin-top: 4px; }
+
+/* ============================================================
+   ★ 追溯链时间轴
+   ============================================================ */
+.tl-panel {
+  background: #fff; border: 1px solid #e4e7ed; border-radius: 10px;
+  padding: 18px; margin-bottom: 20px;
+}
+.tl-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; flex-wrap: wrap; margin-bottom: 18px;
+  padding-bottom: 12px; border-bottom: 1px solid #ebeef5;
+}
+.tl-head-left {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 16px; font-weight: 700; color: #0f5c3f;
+}
+.tl-head-right { display: flex; gap: 8px; }
+
+.timeline { position: relative; }
+.tl-item { display: flex; gap: 14px; }
+
+/* 轴：圆点 + 竖线 */
+.tl-axis {
+  flex: 0 0 34px; display: flex; flex-direction: column;
+  align-items: center; position: relative;
+}
+.tl-dot {
+  width: 32px; height: 32px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  background: #f2f6fc; color: #909399;
+  border: 2px solid #dcdfe6; flex: 0 0 32px; z-index: 1;
+}
+.tl-line {
+  flex: 1; width: 2px; background: #e4e7ed; margin: 2px 0 0;
+  min-height: 20px;
+}
+
+/* 节点状态配色：让"哪一环出问题"一眼可见 */
+.lv-success .tl-dot { background: #f0f9eb; color: #67c23a; border-color: #b3e19d; }
+.lv-info .tl-dot { background: #ecf5ff; color: #409eff; border-color: #a0cfff; }
+.lv-warning .tl-dot { background: #fdf6ec; color: #e6a23c; border-color: #f3d19e; }
+.lv-danger .tl-dot { background: #fef0f0; color: #f56c6c; border-color: #fab6b6; }
+.lv-success .tl-line { background: #b3e19d; }
+.lv-danger .tl-line { background: #fab6b6; }
+
+.tl-content { flex: 1; min-width: 0; padding-bottom: 20px; }
+.tl-row1 {
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+}
+.tl-title { font-size: 15px; font-weight: 600; color: #303133; }
+.tl-time { font-size: 12px; color: #909399; }
+.tl-desc {
+  font-size: 13px; color: #606266; line-height: 1.7; margin-top: 4px;
+}
+.tl-detail {
+  margin-top: 8px; background: #fafbfc; border-radius: 6px;
+  padding: 8px 12px; border: 1px solid #f0f2f5;
+}
+.tl-drow { display: flex; gap: 10px; font-size: 12.5px; line-height: 1.9; }
+.tl-dk { flex: 0 0 84px; color: #909399; }
+.tl-dv { flex: 1; color: #303133; word-break: break-all; }
+.tl-anchor {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 11.5px; color: #67c23a; margin-top: 8px;
+  background: #f0f9eb; border-radius: 4px; padding: 4px 8px;
+}
+.lv-danger .tl-anchor { color: #e6a23c; background: #fdf6ec; }
+
+/* 最后一个节点不要留大段空白 */
+.tl-item:last-child .tl-content { padding-bottom: 0; }
+
+/* ===== 双层校验 ===== */
 .dual-check {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 12px;
   margin-bottom: 20px;
-}
-@media (max-width: 640px) {
-  .dual-check { grid-template-columns: 1fr; }
 }
 .check-item {
   border: 1px solid #e4e7ed;
@@ -293,6 +405,21 @@ if (certNo.value) doVerify()
 .check-head span { flex: 1; }
 .check-body { font-size: 12px; color: #606266; line-height: 1.6; }
 .check-body b { color: #303133; }
+
+/* ===== 信息面板 ===== */
+.info-panel {
+  background: #fff; border: 1px solid #e4e7ed; border-radius: 10px;
+  padding: 16px; margin-bottom: 16px;
+}
+.info-title {
+  font-size: 15px; font-weight: 600; margin-bottom: 12px;
+  display: flex; align-items: center; gap: 6px; color: #0f5c3f;
+}
+.result-desc { margin-bottom: 0; }
+.result-alert { margin-bottom: 16px; }
+.result-title { font-size: 16px; font-weight: 600; }
+.result-msg { font-size: 13px; margin-top: 4px; }
+
 .chain-panel {
   background: #fff;
   border: 1px solid #e4e7ed;
@@ -338,29 +465,51 @@ if (certNo.value) doVerify()
   color: #0f5c3f;
 }
 .seg-lbl { font-size: 11px; color: #909399; margin-top: 4px; }
-.insp-panel {
-  background: #fff;
-  border: 1px solid #e4e7ed;
-  border-left: 3px solid #e6a23c;
-  border-radius: 8px;
-  padding: 16px;
-  margin-bottom: 16px;
-}
-.insp-title {
-  font-size: 15px;
-  font-weight: 600;
-  margin-bottom: 12px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: #b88230;
-}
-.insp-note {
-  font-size: 12px;
-  color: #909399;
-  line-height: 1.7;
-  margin: 12px 0 0;
-}
 .suspend-alert { margin-bottom: 16px; }
 .verify-footer { text-align: center; margin-top: 30px; }
+
+/* ============================================================
+   移动端：验真页是「扫码落地页」，手机上必须比桌面更好用
+   ============================================================ */
+@media (max-width: 768px) {
+  .verify-page { padding: 18px 12px 44px; }
+  .verify-header { margin-bottom: 18px; }
+  .verify-header h1 { font-size: 19px; }
+  .verify-header p { font-size: 12px; line-height: 1.6; }
+
+  /* 搜索区改竖排：横排在 375px 下输入框只剩一半宽 */
+  .verify-search { flex-direction: column; gap: 10px; }
+  .verify-search :deep(.el-button) { width: 100%; }
+
+  .quick-tips { flex-wrap: wrap; }
+
+  /* 结论块更紧凑 */
+  .verdict { padding: 14px; gap: 12px; }
+  .verdict-title { font-size: 16px; }
+  .verdict-sub { font-size: 12px; }
+
+  /* 时间轴：缩小轴宽与圆点，把宽度让给内容（手机上横轴很贵） */
+  .tl-panel { padding: 14px 12px; }
+  .tl-head { margin-bottom: 14px; }
+  .tl-head-left { font-size: 15px; }
+  .tl-item { gap: 10px; }
+  .tl-axis { flex: 0 0 26px; }
+  .tl-dot { width: 26px; height: 26px; flex: 0 0 26px; }
+  .tl-dot :deep(.el-icon) { font-size: 13px !important; }
+  .tl-title { font-size: 14px; }
+  .tl-desc { font-size: 12.5px; }
+  /* 键值对改上下排：84px 标签 + 内容在窄屏会被压成窄条 */
+  .tl-drow { flex-direction: column; gap: 0; line-height: 1.6; padding: 3px 0; }
+  .tl-dk { flex: none; font-size: 11.5px; }
+  .tl-dv { font-size: 12.5px; }
+
+  /* 双层校验改单列 */
+  .dual-check { grid-template-columns: 1fr; }
+
+  /* 编号构成：三格改两格，避免每格过窄 */
+  .seg { min-width: 46%; padding: 8px 10px; }
+  .seg-val { font-size: 14px; }
+
+  .chain-panel, .info-panel, .no-parse { padding: 13px; }
+}
 </style>

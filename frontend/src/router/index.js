@@ -26,6 +26,12 @@ const routes = [
         meta: { title: '数据看板' }
       },
       {
+        path: 'notice',
+        name: 'Notification',
+        component: () => import('@/views/Notification.vue'),
+        meta: { title: '消息中心' }
+      },
+      {
         path: 'producer',
         name: 'Producer',
         component: () => import('@/views/Producer.vue'),
