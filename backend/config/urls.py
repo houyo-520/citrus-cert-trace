@@ -7,7 +7,14 @@ from django.conf import settings
 from django.views.static import serve
 
 urlpatterns = [
-    path("admin/", admin.site.urls),
+    # ---------------------------------------------------------------
+    # ★ Django 自带 /admin/ 后台已关闭。
+    # 理由：它是面向开发期「直接改数据库」的裸后门，公网暴露下等于
+    # 多一个不受本系统权限体系约束的登录入口，与「登录页不暴露凭据」
+    # 同一安全考量。业务操作一律走 /api/ 权限体系，无需 admin。
+    # 如需临时管理数据，用 `manage.py shell` 或 init_data 命令。
+    # ---------------------------------------------------------------
+    # path("admin/", admin.site.urls),
     path("api/auth/", include("apps.accounts.urls")),
     path("api/", include("apps.traceability.urls")),
     # ---------------------------------------------------------------

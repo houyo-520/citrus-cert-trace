@@ -36,6 +36,20 @@ SECRET_KEY = os.environ.get(
 )
 # 生产环境务必在 .env 里设 DJANGO_DEBUG=false
 DEBUG = os.environ.get("DJANGO_DEBUG", "true").lower() == "true"
+
+# ★ 生产安全断言：DEBUG=false 时若仍用默认/明显弱密钥，直接拒绝启动。
+#   防止「代码能跑、功能正常」但密钥是模板值的假上线 —— 攻击者拿到 SECRET_KEY
+#   即可伪造会话/签名。默认值只在本地开发（DEBUG=true）允许。
+_DEFAULT_INSECURE_KEYS = {
+    "django-insecure-citrus-cert-trace-2026-change-me-in-production",
+}
+if not DEBUG and SECRET_KEY in _DEFAULT_INSECURE_KEYS:
+    raise RuntimeError(
+        "生产环境未设置 DJANGO_SECRET_KEY，拒绝启动。"
+        "请在 .env 中设置一个随机强密钥（如 `python -c "
+        "\"import secrets; print(secrets.token_urlsafe(64))\"` 生成）。"
+    )
+
 ALLOWED_HOSTS = [
     h.strip()
     for h in os.environ.get("DJANGO_ALLOWED_HOSTS", "*").split(",")
@@ -152,10 +166,23 @@ SIMPLE_JWT = {
 }
 
 # ---------------------------------------------------------------
-# CORS：前后端分离，允许前端开发服务器访问
+# CORS：前后端分离，白名单控制跨域来源。
+# ★ 之前 CORS_ALLOW_ALL_ORIGINS=True 意味着任意网站都能跨域调用本 API，
+#   公网暴露下等于把接口开放给所有站点。改为白名单：
+#   - 同源部署（nginx 反代，前端与 /api 同域）时，浏览器不跨域，无需 CORS
+#   - 本地开发时前端跑 5173，需放行 localhost:5173
+#   - 可通过 CORS_ALLOWED_ORIGINS 环境变量追加（逗号分隔）
 # ---------------------------------------------------------------
-CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOW_ALL_ORIGINS = False
 CORS_ALLOW_CREDENTIALS = True
+CORS_ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.environ.get(
+        "CORS_ALLOWED_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173",
+    ).split(",")
+    if o.strip()
+]
 
 # 前端验真页地址（二维码指向）
 FRONTEND_VERIFY_BASE = os.environ.get(

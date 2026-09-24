@@ -308,6 +308,16 @@ NGINX = """server {
 
     client_max_body_size 20m;
 
+    # ★ 安全响应头（全局）
+    #   X-Frame-Options     防点击劫持（iframe 嵌套）
+    #   X-Content-Type-Options  防 MIME 嗅探攻击
+    #   Referrer-Policy     控制请求跨站时是否携带来源信息
+    #   X-XSS-Protection    浏览器 XSS 过滤兜底（现代浏览器多用 CSP，此为兼容垫）
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+
     # 前端静态站点（Vue3 SPA，hash 路由）
     root /home/ubuntu/citrus/frontend_dist;
     index index.html;
@@ -318,9 +328,15 @@ NGINX = """server {
 
     # ★ index.html 绝不缓存：它是 SPA 的唯一入口，引用的 chunk 名每次构建都变。
     #   一旦被缓存，用户会长期停留在旧版本（配合残留的旧 chunk 就更难察觉）。
+    #   注意：nginx 里 location 内的 add_header 会覆盖 server 级的同名继承，
+    #   所以这里必须重复安全头，否则 index.html 会丢掉 X-Frame-Options 等。
     location = /index.html {
         add_header Cache-Control "no-store, no-cache, must-revalidate";
         add_header Pragma "no-cache";
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        add_header X-XSS-Protection "1; mode=block" always;
         expires -1;
     }
 
@@ -334,13 +350,8 @@ NGINX = """server {
         proxy_read_timeout 120s;
     }
 
-    # Django admin 与静态资源
-    location /admin/ {
-        proxy_pass http://127.0.0.1:8000;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    }
+    # ★ Django admin 已下线（config/urls.py 已注释 path("admin/")），
+    #   这里不再反代 /admin/，避免留一个死路由暴露面。
     location /static/ {
         alias /home/ubuntu/citrus/backend/staticfiles/;
     }
@@ -355,17 +366,29 @@ NGINX = """server {
         alias /home/ubuntu/citrus/backend/media/;
         expires 1d;
         add_header Cache-Control "public";
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        add_header X-XSS-Protection "1; mode=block" always;
     }
 
     # 静态资源长缓存：文件名含内容哈希，内容变则文件名变，可放心 immutable
     location ^~ /assets/ {
         expires 1y;
         add_header Cache-Control "public, immutable";
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        add_header X-XSS-Protection "1; mode=block" always;
         try_files $uri =404;
     }
     location ~* \\.(js|css|png|jpg|jpeg|gif|ico|svg|woff2?)$ {
         expires 7d;
         add_header Cache-Control "public, immutable";
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        add_header X-XSS-Protection "1; mode=block" always;
         try_files $uri =404;
     }
 

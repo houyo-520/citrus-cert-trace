@@ -2193,3 +2193,55 @@ class MobileAdaptationTest(BaseFixture):
         c = APIClient()
         c.get(f"/api/public/verify/{self.cert.cert_no}/")
         self.assertEqual(PublicQueryRecord.objects.count(), before + 1)
+
+
+# ===============================================================
+# 二十、登录限流（#安全加固）
+# ===============================================================
+class LoginThrottleTest(BaseFixture):
+    """登录接口防暴力破解：IP / 用户名任一路失败超阈值即 429。"""
+
+    def tearDown(self):
+        """每条用例结束后清空失败记录，避免跨用例累加相互干扰。"""
+        from apps.accounts.throttling import LoginAttempt
+        LoginAttempt.objects.all().delete()
+
+    def _login(self, username, password):
+        c = APIClient()
+        return c.post("/api/auth/login/", {"username": username, "password": password},
+                      format="json")
+
+    def test_normal_login_never_throttled(self):
+        """正常账号密码组合（即便错位）不会误伤登录主流程。"""
+        from apps.accounts.throttling import LoginAttempt  # noqa: F401
+        r = self._login("t_admin", "wrong-password-1")
+        self.assertEqual(r.status_code, 400, "密码错误应 400 而非 429")
+        # 成功登录仍然可用
+        r2 = self._login("t_admin", "admin123")
+        self.assertEqual(r2.status_code, 200)
+
+    def test_ip_blocked_after_repeated_failures(self):
+        """同 IP 连续失败超阈值 → 429（即便换正确密码也应被拦，因为 IP 已锁定）。"""
+        for _ in range(11):
+            self._login("t_admin", "definitely-wrong")
+        r = self._login("t_admin", "admin123")
+        self.assertEqual(r.status_code, 429,
+                         f"IP 连续失败后应 429，实际 {r.status_code}")
+
+    def test_username_blocked_across_ip(self):
+        """同一用户名跨请求持续失败也触发限流（防分布式单账号爆破）。"""
+        # 用不同来源 IP 模拟：直接调 record_failure 注入失败记录
+        from apps.accounts.throttling import record_failure, is_blocked
+        for i in range(11):
+            record_failure(f"10.0.0.{i}", "victim_user")
+        self.assertTrue(is_blocked("1.2.3.4", "victim_user"),
+                        "用户名失败超阈值后，新 IP 访问也应被判定 blocked")
+
+    def test_success_clears_failures(self):
+        """登录成功后清空失败记录，正常用户不被误锁。"""
+        from apps.accounts.throttling import clear_failures, is_blocked, record_failure
+        for _ in range(5):
+            record_failure("5.5.5.5", "t_admin")
+        self.assertFalse(is_blocked("5.5.5.5", "t_admin"), "5 次未达阈值")
+        clear_failures(ip="5.5.5.5", username="t_admin")
+        self.assertFalse(is_blocked("5.5.5.5", "t_admin"), "清空后更不该锁")

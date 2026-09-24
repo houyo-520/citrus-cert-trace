@@ -9,6 +9,7 @@ from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from .serializers import UserSerializer
+from .throttling import clear_failures, is_blocked, record_failure, _client_ip
 
 
 class LoginView(APIView):
@@ -17,8 +18,20 @@ class LoginView(APIView):
     def post(self, request):
         username = request.data.get("username", "").strip()
         password = request.data.get("password", "")
+        ip = _client_ip(request)
+
+        # ★ 限流：同一 IP 或同一用户名短期内频繁失败 → 直接 429，
+        #   不进入密码校验，从根上阻断暴力破解。
+        if is_blocked(ip, username):
+            self._log(request, username, success=False,
+                      detail=f"账号 {username} 登录被限流拦截（来源 {ip}）")
+            return Response(
+                {"code": 429, "message": "尝试过于频繁，请稍后再试"},
+                status=status.HTTP_429_TOO_MANY_REQUESTS)
+
         user = authenticate(username=username, password=password)
         if user is None:
+            record_failure(ip, username)
             # 登录失败也留痕（安全审计需要）
             self._log(request, username, success=False,
                       detail=f"账号 {username} 登录失败：用户名或密码错误")
@@ -31,6 +44,8 @@ class LoginView(APIView):
                             status=status.HTTP_400_BAD_REQUEST)
 
         refresh = RefreshToken.for_user(user)
+        # 登录成功：清空该用户/该 IP 的失败记录，避免正常用户被误锁
+        clear_failures(ip=ip, username=username)
         self._log(request, username, success=True,
                   detail=f"{user.username}({user.get_role_display()}) 登录成功",
                   operator=user)
