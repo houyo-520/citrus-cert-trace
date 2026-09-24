@@ -14,12 +14,16 @@
  *   3. 图片类断言必须查 naturalWidth > 0。
  *   4. 非破坏性：只读，不改生产数据（批量签发只验对话框出现，不真提交）。
  *
- * 用法：node verify_tier1.mjs
+ * 用法：
+ *   验收线上：node verify_tier1.mjs
+ *   验收本地：FRONTEND_VERIFY_BASE=http://localhost:5173 node verify_tier1.mjs
  */
 import { chromium } from 'file:///C:/Users/houyo/.workbuddy/binaries/node/workspace/node_modules/playwright/index.mjs'
 
-const BASE = 'http://<your-server-ip>:8090'
-const EDGE = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe'
+// ★ 不把服务器 IP 硬编码进仓库（见 memory「git 凭据清理」教训），
+//    改为从环境变量读取，默认指向答辩演示地址。
+const BASE = (process.env.FRONTEND_VERIFY_BASE || 'http://<your-server-ip>:8090').replace(/\/+$/, '')
+const EDGE = process.env.EDGE_PATH || 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe'
 
 let pass = 0, fail = 0
 const ok = (n, e = '') => { pass++; console.log(`  [PASS] ${n}${e ? ' -> ' + e : ''}`) }
