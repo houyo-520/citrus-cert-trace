@@ -24,6 +24,42 @@
       <el-header class="header">
         <div class="header-title">{{ route.meta.title }}</div>
         <div class="header-right">
+          <!-- ★ 风险预警红点：有待办才出现，点击展开清单并可直接跳转处理 -->
+          <el-popover v-if="alertStore.hasAlert" placement="bottom-end" width="380"
+                      trigger="click">
+            <template #reference>
+              <el-badge :value="alertStore.total"
+                        :type="alertStore.hasDanger ? 'danger' : 'warning'"
+                        class="alert-badge">
+                <el-button size="small" :type="alertStore.hasDanger ? 'danger' : 'warning'"
+                           plain>
+                  <el-icon><WarningFilled /></el-icon>
+                  预警
+                </el-button>
+              </el-badge>
+            </template>
+            <div class="alert-pop">
+              <div class="alert-pop-head">
+                <span>风险预警（{{ alertStore.total }} 项）</span>
+                <el-button link type="primary" size="small" @click="alertStore.fetch(true)">
+                  刷新
+                </el-button>
+              </div>
+              <div class="alert-pop-list">
+                <div v-for="a in alertStore.alerts" :key="a.key"
+                     class="alert-pop-item" @click="gotoAlert(a.action_route)">
+                  <el-tag :type="levelTag(a.level)" size="small" effect="dark">
+                    {{ levelText(a.level) }}
+                  </el-tag>
+                  <div class="ap-text">
+                    <div class="ap-title">{{ a.title }} × {{ a.count }}</div>
+                    <div class="ap-desc">{{ a.desc }}</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </el-popover>
+
           <el-tag type="success" effect="plain" size="small">可信存证已启用</el-tag>
           <el-tag type="warning" effect="plain" size="small">{{ scopeLabel }}</el-tag>
           <el-dropdown @command="onCommand">
@@ -50,14 +86,25 @@
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, watch, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessageBox } from 'element-plus'
+import { WarningFilled } from '@element-plus/icons-vue'
 import { useUserStore } from '@/store/user'
+import { useAlertStore } from '@/store/alerts'
 
 const route = useRoute()
 const router = useRouter()
 const userStore = useUserStore()
+const alertStore = useAlertStore()
+
+const levelTag = (lv) => ({ danger: 'danger', warning: 'warning', info: 'info' }[lv] || 'info')
+const levelText = (lv) => ({ danger: '紧急', warning: '关注', info: '提示' }[lv] || '提示')
+const gotoAlert = (path) => { if (path) router.push(`/${path}`) }
+
+// 进入后台即拉一次预警；之后每次切页顺带刷新（store 内部 30 秒节流）
+onMounted(() => alertStore.fetch())
+watch(() => route.path, () => alertStore.fetch())
 
 const activeMenu = computed(() => route.path)
 const roleMap = {
@@ -102,6 +149,8 @@ const onCommand = async (cmd) => {
   }
   if (cmd === 'logout') {
     await ElMessageBox.confirm('确认退出登录？', '提示', { type: 'warning' })
+    // 退出时清掉预警缓存，避免下一个账号登录时闪出上个账号的红点
+    alertStore.reset()
     userStore.logout()
     router.push('/login')
   }
@@ -145,4 +194,23 @@ const onCommand = async (cmd) => {
   color: #303133;
 }
 .main { background: #f5f7fa; padding: 16px; }
+
+/* 预警红点与弹出清单 */
+.alert-badge { margin-right: 4px; }
+.alert-pop-head {
+  display: flex; justify-content: space-between; align-items: center;
+  font-weight: 600; font-size: 13.5px; padding-bottom: 8px;
+  border-bottom: 1px solid #ebeef5;
+}
+.alert-pop-list {
+  max-height: 340px; overflow-y: auto; padding-top: 6px;
+}
+.alert-pop-item {
+  display: flex; gap: 8px; align-items: flex-start;
+  padding: 8px; border-radius: 6px; cursor: pointer;
+}
+.alert-pop-item:hover { background: #f5f7fa; }
+.ap-text { min-width: 0; }
+.ap-title { font-size: 13px; font-weight: 600; color: #303133; }
+.ap-desc { font-size: 11.5px; color: #909399; margin-top: 2px; line-height: 1.5; }
 </style>

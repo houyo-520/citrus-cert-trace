@@ -11,8 +11,9 @@ import io
 
 import qrcode
 from django.conf import settings
-from django.db.models import Q, Sum
+from django.db.models import Avg, Count, Q, Sum
 from django.http import HttpResponse
+from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -38,6 +39,21 @@ from .serializers import (CertificateSerializer, EvidenceRecordSerializer,
 class BaseViewSet(viewsets.ModelViewSet):
     """所有业务 ViewSet 的基类：默认要求登录。"""
     permission_classes = [IsAuthenticated]
+
+
+def now_str(fmt: str = "%Y-%m-%d %H:%M") -> str:
+    """
+    当前时间字符串（安全版）。
+
+    ★ 不要直接写 timezone.localtime() —— 当 settings.USE_TZ=False 时
+    timezone.now() 返回的是 **naive** datetime，localtime() 会抛
+    "localtime() cannot be applied to a naive datetime"。
+    本项目开发用 SQLite + USE_TZ=False，生产同理，所以必须做分支。
+    """
+    now = timezone.now()
+    if timezone.is_aware(now):
+        now = timezone.localtime(now)
+    return now.strftime(fmt)
 
 
 # ===============================================================
@@ -240,8 +256,8 @@ class CertificateViewSet(RoleScopedQuerySetMixin, BaseViewSet):
         return qs.none()
 
     def get_permissions(self):
-        # 签发/作废/驳回是监管专属动作
-        if self.action in ("issue", "revoke", "reject"):
+        # 签发/作废/驳回/批量签发是监管专属动作
+        if self.action in ("issue", "revoke", "reject", "batch_issue"):
             return [IsRegulator()]
         if self.action in ("create", "update", "partial_update", "destroy", "submit"):
             return [ReadOnlyOrProducerOrRegulator()]
@@ -297,6 +313,102 @@ class CertificateViewSet(RoleScopedQuerySetMixin, BaseViewSet):
             },
         })
 
+    @action(detail=False, methods=["post"], url_path="batch-issue")
+    def batch_issue(self, request):
+        """
+        ★ 批量签发合格证。
+
+        设计要点（为什么不是简单 for 循环调 issue）：
+          1. **逐张独立成败**：一张证缺检测报告/缺主体，不能连累其余合规的证。
+             整体事务回滚会让监管「一次操作全废」，体验极差。因此逐张
+             try/except，各自独立提交，逐张返回结果。
+          2. **编号仍然逐张原子分配**：复用 certno.save_with_cert_no 的
+             「唯一索引 + IntegrityError 重试」机制，所以批量签发出来的
+             编号依然连续递增、不会互相覆盖。
+          3. **上限保护**：单次最多 50 张，避免有人一次提交上千条把
+             链上存证队列打满（链上写入是同步阻塞的）。
+        """
+        ids = request.data.get("ids") or []
+        if not isinstance(ids, list) or not ids:
+            return Response({"code": 400, "message": "请提供要签发的合格证 ID 列表"},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if len(ids) > 50:
+            return Response({"code": 400, "message": "单次批量签发不超过 50 张"},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        # 保持与视图一致的数据级隔离：只允许操作本角色可见的证
+        qs = self.filter_queryset(self.get_queryset()).filter(id__in=ids)
+        found = {c.id: c for c in qs.select_related("batch", "batch__producer")}
+
+        results, ok_count, fail_count = [], 0, 0
+        from datetime import date as _date
+        for cid in ids:
+            obj = found.get(cid)
+            label = f"合格证#{cid}"
+            if obj is None:
+                results.append({"id": cid, "label": label, "ok": False,
+                                "cert_no": "", "message": "不存在或无权操作"})
+                fail_count += 1
+                continue
+
+            label = obj.cert_no or f"草稿#{obj.id}"
+            if obj.status == Certificate.Status.REVOKED:
+                results.append({"id": cid, "label": label, "ok": False, "cert_no": "",
+                                "message": "已作废，不可签发"})
+                fail_count += 1
+                continue
+            # 与单张签发保持同一条业务规则：无检测报告不可签发
+            if not obj.report_id:
+                results.append({"id": cid, "label": label, "ok": False,
+                                "cert_no": obj.cert_no or "",
+                                "message": "缺少关联的检测报告，不可签发"})
+                fail_count += 1
+                continue
+
+            producer = obj.batch.producer if obj.batch_id and obj.batch.producer_id else None
+            try:
+                if not obj.cert_no:
+                    if producer is None:
+                        raise ValueError("未关联生产主体，无法分配编号")
+                    certno.save_with_cert_no(obj, producer)  # 逐张原子取号
+                update_fields = ["status", "cert_no", "updated_at"]
+                obj.status = Certificate.Status.ISSUED
+                obj.suspend_reason = ""
+                if not obj.issue_date:
+                    obj.issue_date = _date.today()
+                    update_fields.append("issue_date")
+                if not obj.producer_name and producer is not None:
+                    obj.producer_name = producer.name
+                    update_fields.append("producer_name")
+                obj.issuer = request.user
+                update_fields.append("issuer")
+                obj.save(update_fields=update_fields)
+
+                services.anchor_certificate(obj)
+                audit.log_operation(request, OperationLog.Action.ISSUE,
+                                    target_type="合格证", target_id=obj.id,
+                                    target_no=obj.cert_no,
+                                    detail=f"批量签发合格证 {obj.cert_no}")
+                results.append({"id": obj.id, "label": label, "ok": True,
+                                "cert_no": obj.cert_no, "message": "签发并存证成功"})
+                ok_count += 1
+            except (ValueError, RuntimeError) as exc:
+                results.append({"id": cid, "label": label, "ok": False,
+                                "cert_no": obj.cert_no or "", "message": str(exc)})
+                fail_count += 1
+            except Exception as exc:  # noqa: BLE001 单张异常不应中断整批
+                results.append({"id": cid, "label": label, "ok": False,
+                                "cert_no": obj.cert_no or "",
+                                "message": f"处理异常：{exc}"})
+                fail_count += 1
+
+        return Response({
+            "code": 200,
+            "message": f"批量签发完成：成功 {ok_count} 张，失败 {fail_count} 张",
+            "data": {"success_count": ok_count, "fail_count": fail_count,
+                     "total": len(ids), "results": results},
+        })
+
     @action(detail=True, methods=["post"])
     def submit(self, request, pk=None):
         """提交审核：草稿 -> 待审核（仍不占号）。"""
@@ -346,6 +458,12 @@ class CertificateViewSet(RoleScopedQuerySetMixin, BaseViewSet):
         obj = self.get_object()
         if obj.status == Certificate.Status.REVOKED:
             return Response({"code": 400, "message": "已作废的合格证不可签发"},
+                            status=status.HTTP_400_BAD_REQUEST)
+        # ★ 签发前必须有关联的合格检测报告 —— 这是「承诺达标」的事实依据。
+        # 正常流程里 submit 已拦过一次，这里再拦一次是防御性校验：
+        # 若有人绕过 submit 直接改库造出 pending 状态，签发口仍能兜住。
+        if not obj.report_id:
+            return Response({"code": 400, "message": "缺少关联的检测报告，不可签发"},
                             status=status.HTTP_400_BAD_REQUEST)
 
         already = bool(obj.cert_no)
@@ -418,6 +536,91 @@ class CertificateViewSet(RoleScopedQuerySetMixin, BaseViewSet):
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         return HttpResponse(buf.getvalue(), content_type="image/png")
+
+    @action(detail=True, methods=["get"], url_path="certificate-data")
+    def certificate_data(self, request, pk=None):
+        """
+        ★ 单张合格证的「证面打印数据」。
+
+        为什么单独开一个接口而不复用列表序列化结果：
+          合格证是要**打印出来贴在箱子上**的实物凭证，证面字段与列表页字段
+          不是同一套口径 —— 证面需要主体详细地址、批次产地、报告检测机构、
+          存证交易哈希、验真链接等列表页不展示的内容。
+          统一在这里聚合，前端拿到即可直接渲染打印模板，无需再串多个接口。
+
+        同时把 status 校验放在这里：草稿/待审核的证**没有编号也无法验真**，
+        证面不完整，因此不允许打印（前端按钮也会同步禁用）。
+        """
+        obj = self.get_object()
+        if not obj.cert_no:
+            return Response({"code": 400, "message": "合格证尚未签发（无编号），不可打印"},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        batch = obj.batch
+        producer = batch.producer if batch and batch.producer_id else None
+        report = obj.report
+
+        # 存证记录（取该合格证最新一条证书类存证）
+        record = EvidenceRecord.objects.filter(
+            biz_type=EvidenceRecord.BizType.CERTIFICATE, biz_id=obj.id
+        ).order_by("-id").first()
+
+        # ★ FRONTEND_VERIFY_BASE 本身已含路由（默认 "http://host/#/verify"），
+        # 这里只能追加证号。曾经写成 BASE + "/#/verify/" + cert_no，
+        # 结果生成 "…/#/verify/#/verify/CERT-xxx" 这种双路由链接 ——
+        # 二维码照样能生成、图也有尺寸，只有扫出来才发现打不开，极难肉眼发现。
+        verify_url = f"{settings.FRONTEND_VERIFY_BASE.rstrip('/')}/{obj.cert_no}"
+
+        data = {
+            "cert_no": obj.cert_no,
+            "status": obj.status,
+            "status_display": obj.get_status_display(),
+            "suspend_reason": obj.suspend_reason,
+            # 主体
+            "producer_name": obj.producer_name or (producer.name if producer else ""),
+            "producer_address": producer.address if producer else "",
+            "producer_contact": producer.contact if producer else "",
+            "producer_phone": producer.phone if producer else "",
+            "producer_credit_code": producer.credit_code if producer else "",
+            # 产品
+            "product_name": obj.product_name,
+            "variety": batch.variety if batch else "",
+            "origin": batch.origin if batch else "",
+            "batch_no": batch.batch_no if batch else "",
+            "harvest_date": batch.harvest_date if batch else None,
+            "farming_record": batch.farming_record if batch else "",
+            "quantity_kg": str(obj.quantity_kg),
+            # 检测
+            "report_no": report.report_no if report else "",
+            "test_org": report.test_org if report else "",
+            "test_date": report.test_date if report else None,
+            "conclusion": report.get_conclusion_display() if report else "",
+            "pesticide_residue": report.pesticide_residue if report else "",
+            "heavy_metal": report.heavy_metal if report else "",
+            # 期间
+            "issue_date": obj.issue_date,
+            "valid_until": obj.valid_until,
+            "issuer_name": obj.issuer.get_full_name() or obj.issuer.username
+            if obj.issuer_id else "",
+            # 可信存证
+            "cert_hash": obj.cert_hash,
+            "is_anchored": obj.is_anchored,
+            "anchored_at": obj.anchored_at,
+            "tx_hash": record.tx_hash if record else "",
+            "block_height": record.block_height if record else 0,
+            "chain_status": record.chain_status if record else "",
+            # 追溯
+            "verify_url": verify_url,
+            "cert_no_parsed": certno.parse_cert_no(obj.cert_no),
+            # 公告依据（证面下方注明样式来源，答辩时也是政策依据）
+            "notice": "本证样式依据农业农村部《农产品质量安全承诺达标合格证"
+                      "内容及样式》公告（第989号）设计",
+            "printed_at": now_str(),
+        }
+        audit.log_operation(request, OperationLog.Action.VERIFY,
+                            target_type="合格证", target_id=obj.id,
+                            target_no=obj.cert_no, detail="导出/打印合格证证面")
+        return Response({"code": 200, "message": "ok", "data": data})
 
     @action(detail=True, methods=["get"], url_path="inspection-summary")
     def inspection_summary(self, request, pk=None):
@@ -1016,6 +1219,8 @@ class DashboardView(APIView):
                 status=Certificate.Status.PENDING).count(),
             "suspended_count": Certificate.objects.filter(
                 status=Certificate.Status.SUSPENDED).count(),
+            "revoked_count": Certificate.objects.filter(
+                status=Certificate.Status.REVOKED).count(),
             "evidence_count": EvidenceRecord.objects.count(),
             "supply_count": SupplyDemand.objects.filter(
                 kind=SupplyDemand.Kind.SUPPLY).count(),
@@ -1034,9 +1239,33 @@ class DashboardView(APIView):
                                     InspectionRecord.RectifyStatus.ONGOING]).count(),
             "rectify_overdue_count": InspectionRecord.objects.filter(
                 rectify_status=InspectionRecord.RectifyStatus.OVERDUE).count(),
+            "rectify_done_count": InspectionRecord.objects.filter(
+                rectify_status=InspectionRecord.RectifyStatus.DONE).count(),
             "penalty_total": str(InspectionRecord.objects.aggregate(
                 s=Sum("penalty_amount"))["s"] or 0),
+            # ★ 检测报告 / 存证质量维度（看板增强）
+            "report_count": TestReport.objects.count(),
+            "report_unqualified_count": TestReport.objects.filter(
+                conclusion=TestReport.Conclusion.UNQUALIFIED).count(),
+            # 批次存证数：ProductBatch 模型上没有 is_anchored 字段
+            # （批次存证落在 EvidenceRecord 里），必须从存证表反查，
+            # 不能写成 ProductBatch.objects.filter(is_anchored=True) —— 那会 FieldError。
+            "batch_anchored_count": EvidenceRecord.objects.filter(
+                biz_type=EvidenceRecord.BizType.BATCH
+            ).values("biz_id").distinct().count(),
+            "public_query_count": PublicQueryRecord.objects.count(),
+            "matched_supply_count": SupplyDemand.objects.filter(
+                deal_status=SupplyDemand.DealStatus.MATCHED).count(),
+            # ★ 平均匹配度：产销对接质量的量化指标（智能匹配算法的效果度量）
+            "avg_match_score": self._avg_match_score(),
         }
+        # ★ 近 6 个月签发趋势（折线图数据源）
+        base["issue_trend"] = self._issue_trend()
+        # ★ 检查类型分布（监管看板饼图）
+        base["inspection_type_dist"] = self._inspection_type_dist()
+        # ★ 各主体签发量 TOP5（对比柱图）
+        base["top_producers"] = self._top_producers()
+
         if user.role in (Role.ADMIN, Role.REGULATOR):
             base["scope_label"] = "全量数据（监管视角）"
             base["pending_audit_count"] = Producer.objects.filter(
@@ -1101,6 +1330,304 @@ class DashboardView(APIView):
             })
             return base
         return base
+
+    # ---- 看板增强：三个统计辅助 ----
+
+    @staticmethod
+    def _issue_trend(months: int = 6):
+        """
+        近 N 个月合格证签发趋势。
+
+        用 TruncMonth 在数据库侧按自然月分组 —— 不要在 Python 里
+        for 循环 6 次各查一遍（那就是 6 条 SQL），一次聚合出全部月份。
+
+        注意补零：没有任何签发的月份数据库不会返回行，
+        折线图会出现「断点」而不是「0」，所以必须自己把月份轴补全。
+        """
+        from datetime import date as _date
+        from django.db.models.functions import TruncMonth
+
+        today = _date.today()
+        # 构造连续 N 个月的 (year, month) 轴，从 N-1 个月前到本月
+        axis = []
+        y, m = today.year, today.month
+        for _ in range(months):
+            axis.append((y, m))
+            m -= 1
+            if m == 0:
+                m = 12
+                y -= 1
+        axis.reverse()
+
+        start = axis[0]
+        start_date = _date(start[0], start[1], 1)
+        rows = (Certificate.objects
+                .filter(status=Certificate.Status.ISSUED,
+                        issue_date__gte=start_date)
+                .annotate(mth=TruncMonth("issue_date"))
+                .values("mth")
+                .annotate(c=Count("id")))
+        bucket = {(r["mth"].year, r["mth"].month): r["c"]
+                  for r in rows if r["mth"]}
+        return [{"month": f"{yy}-{mm:02d}", "count": bucket.get((yy, mm), 0)}
+                for yy, mm in axis]
+
+    @staticmethod
+    def _inspection_type_dist():
+        """检查类型分布（监管看板饼图）。"""
+        rows = (InspectionRecord.objects.values("check_type")
+                .annotate(c=Count("id")))
+        label = dict(InspectionRecord.CheckType.choices)
+        return [{"name": label.get(r["check_type"], r["check_type"]),
+                 "value": r["c"]} for r in rows]
+
+    @staticmethod
+    def _top_producers(limit: int = 5):
+        """签发量 TOP N 生产主体（横向对比柱图）。"""
+        rows = (Producer.objects
+                .annotate(c=Count("batches__certificates",
+                                  filter=Q(batches__certificates__status=
+                                           Certificate.Status.ISSUED)))
+                .filter(c__gt=0)
+                .order_by("-c")
+                .values("name", "c")[:limit])
+        return [{"name": r["name"], "count": r["c"]} for r in rows]
+
+    @staticmethod
+    def _avg_match_score():
+        """
+        平均产销匹配度（智能匹配算法的效果度量）。
+
+        只统计有评分的意向单（match_score > 0）——
+        没走智能匹配直接发起对接的那些是 0，混进去会把均值拉低失真。
+        """
+        from django.db.models import Avg
+        v = MatchIntent.objects.filter(match_score__gt=0).aggregate(
+            a=Avg("match_score"))["a"]
+        return round(float(v), 1) if v is not None else 0
+
+
+# ===============================================================
+# ★ 风险预警汇总（首页红点 + 预警清单）
+# ===============================================================
+class AlertView(APIView):
+    """
+    风险预警聚合。
+
+    为什么需要：系统里原本有 6 类「需要人去处理」的信号，但分散在 6 个页面，
+    监管不逐个点开就发现不了 —— 逾期整改、抽检不合格、暂停证未复查、
+    草稿堆积、待审核主体、检查不合格持有的有效证。
+    这里把它们统一聚合成一份「待办清单」，首页给红点数字，点开看明细。
+
+    设计原则：
+      - **按角色裁剪**：只返回该角色有权处理/有权知晓的预警。
+        种植主体只看到「自己被检查出的问题」，不该看到别人的。
+      - **严重度分级**：danger 需立即处置（逾期/不合格），warning 需关注，
+        info 仅提示。前端据此着色排序，避免满屏红字导致告警疲劳。
+      - **每条预警带 action 路由**：点一下直接跳到对应页面，
+        而不是只告诉用户「有问题」却不告诉他去哪儿解决。
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    # 预警条目统一结构：
+    #   {key, level, title, desc, count, action_route, action_label, items[]}
+    def get(self, request):
+        user = request.user
+        alerts = []
+        if user.role in (Role.ADMIN, Role.REGULATOR):
+            alerts = self._regulator_alerts()
+        elif user.role == Role.PRODUCER:
+            alerts = self._producer_alerts(user)
+        elif user.role == Role.BUYER:
+            alerts = self._buyer_alerts()
+
+        total = sum(a["count"] for a in alerts)
+        danger = sum(a["count"] for a in alerts if a["level"] == "danger")
+        return Response({
+            "code": 200, "message": "ok",
+            "data": {
+                "total": total,
+                "danger": danger,
+                "alerts": alerts,
+                "role": user.role,
+                "generated_at": now_str(),
+            },
+        })
+
+    # ---- 各角色的预警构造 ----
+
+    def _regulator_alerts(self):
+        from datetime import date as _date
+        today = _date.today()
+        alerts = []
+
+        # ① 逾期未整改（最严重：执法时限已过）
+        overdue = InspectionRecord.objects.filter(
+            rectify_status=InspectionRecord.RectifyStatus.OVERDUE)
+        alerts.append(self._pack(
+            "rectify_overdue", "danger", "整改逾期未完成",
+            "已超过整改期限仍未闭环，需启动后续处置",
+            overdue, "inspection", "去处理",
+            self._inspection_items(overdue)))
+
+        # ② 抽查不合格但尚在期限内（预警，别等到逾期）
+        pending_bad = InspectionRecord.objects.filter(
+            check_result=InspectionRecord.CheckResult.UNQUALIFIED,
+            rectify_deadline__gte=today,
+        ).exclude(rectify_status__in=[
+            InspectionRecord.RectifyStatus.DONE,
+            InspectionRecord.RectifyStatus.NOT_REQUIRED])
+        alerts.append(self._pack(
+            "rectify_pending", "warning", "不合格整改中",
+            "检查判定不合格，仍在整改期限内，需跟踪复查",
+            pending_bad, "inspection", "去跟踪",
+            self._inspection_items(pending_bad)))
+
+        # ③ 合格证被暂停使用（流通受阻，要么复查恢复要么作废）
+        suspended = Certificate.objects.filter(status=Certificate.Status.SUSPENDED)
+        alerts.append(self._pack(
+            "cert_suspended", "warning", "合格证暂停使用",
+            "因检查不合格被暂停流通，复查合格可恢复",
+            suspended, "certificate", "去查看",
+            [{"label": c.cert_no or f"#{c.id}", "extra": c.producer_name or "",
+              "desc": c.suspend_reason} for c in suspended[:20]]))
+
+        # ④ 待审核主体（卡在入门环节，主体无法开展业务）
+        pending_producer = Producer.objects.filter(
+            audit_status=Producer.AuditStatus.PENDING)
+        alerts.append(self._pack(
+            "producer_pending", "warning", "主体待审核",
+            "尚未审核的生产主体无法正常开展业务",
+            pending_producer, "producer", "去审核",
+            [{"label": p.name, "extra": p.region or "", "desc": p.address}
+             for p in pending_producer[:20]]))
+
+        # ⑤ 待签发合格证（已提交但未签发，主体在等）
+        pending_cert = Certificate.objects.filter(status=Certificate.Status.PENDING)
+        alerts.append(self._pack(
+            "cert_pending", "info", "合格证待签发",
+            "已提交审核，等待监管签发分配编号",
+            pending_cert, "certificate", "去签发",
+            [{"label": c.producer_name or f"#{c.id}", "extra": c.product_name,
+              "desc": f"{c.quantity_kg} kg"} for c in pending_cert[:20]]))
+
+        # ⑥ 草稿堆积（建档后长期不提交，容易变成垃圾数据）
+        draft_cert = Certificate.objects.filter(status=Certificate.Status.DRAFT)
+        alerts.append(self._pack(
+            "cert_draft", "info", "合格证草稿未提交",
+            "已建档但未提交审核（草稿不占号，可安全删除）",
+            draft_cert, "certificate", "去整理",
+            [{"label": c.producer_name or f"#{c.id}", "extra": c.product_name,
+              "desc": "草稿"} for c in draft_cert[:20]]))
+
+        return [a for a in alerts if a["count"] > 0]
+
+    def _producer_alerts(self, user):
+        """种植主体：只看自己被查出的问题 + 自己待办的证。"""
+        from datetime import date as _date
+        today = _date.today()
+        alerts = []
+
+        my_ins = InspectionRecord.objects.filter(
+            certificate__batch__producer__owner=user)
+        overdue = my_ins.filter(
+            rectify_status=InspectionRecord.RectifyStatus.OVERDUE)
+        alerts.append(self._pack(
+            "rectify_overdue", "danger", "整改已逾期",
+            "监督检查发现的整改事项已超过期限，请尽快整改并申请复查",
+            overdue, "inspection", "去查看",
+            self._inspection_items(overdue)))
+
+        need_fix = my_ins.filter(
+            check_result=InspectionRecord.CheckResult.UNQUALIFIED,
+            rectify_deadline__gte=today,
+        ).exclude(rectify_status__in=[
+            InspectionRecord.RectifyStatus.DONE,
+            InspectionRecord.RectifyStatus.NOT_REQUIRED])
+        alerts.append(self._pack(
+            "rectify_pending", "warning", "待整改事项",
+            "监督检查判定不合格，请在期限内完成整改",
+            need_fix, "inspection", "去查看",
+            self._inspection_items(need_fix)))
+
+        my_certs = Certificate.objects.filter(batch__producer__owner=user)
+        suspended = my_certs.filter(status=Certificate.Status.SUSPENDED)
+        alerts.append(self._pack(
+            "cert_suspended", "warning", "我的合格证被暂停",
+            "该证当前不可用于流通交易，完成整改并通过复查后可恢复",
+            suspended, "certificate", "去查看",
+            [{"label": c.cert_no or f"#{c.id}", "extra": c.product_name,
+              "desc": c.suspend_reason} for c in suspended[:20]]))
+
+        draft_cert = my_certs.filter(status=Certificate.Status.DRAFT)
+        alerts.append(self._pack(
+            "cert_draft", "info", "合格证草稿未提交",
+            "完善检测报告关联后即可提交审核",
+            draft_cert, "certificate", "去提交",
+            [{"label": c.producer_name or f"#{c.id}", "extra": c.product_name,
+              "desc": "草稿"} for c in draft_cert[:20]]))
+
+        # 主体自身未通过审核（影响后续所有业务）
+        my_producer = Producer.objects.filter(
+            owner=user).exclude(audit_status=Producer.AuditStatus.APPROVED)
+        alerts.append(self._pack(
+            "producer_unapproved", "info", "主体尚未通过审核",
+            "审核通过后才能正常开展批次建档与合格证申请",
+            my_producer, "producer", "去查看",
+            [{"label": p.name, "extra": p.get_audit_status_display(),
+              "desc": p.remark} for p in my_producer[:20]]))
+
+        return [a for a in alerts if a["count"] > 0]
+
+    def _buyer_alerts(self):
+        """收购商：进货风险提示 + 自己的对接待办。"""
+        from django.db.models import Q
+        issued = Certificate.objects.filter(status=Certificate.Status.ISSUED)
+        alerts = []
+
+        # ① 已签发证上出现过不合格检查（进货前必须知道）
+        risky = InspectionRecord.objects.filter(
+            certificate__in=issued,
+            check_result=InspectionRecord.CheckResult.UNQUALIFIED)
+        alerts.append(self._pack(
+            "incoming_risk", "danger", "货源存在检查不合格记录",
+            "这些已签发合格证曾被判定不合格，采购前建议核实整改情况",
+            risky, "inspection", "去核实",
+            self._inspection_items(risky)))
+
+        # ② 收到但未回应的对接意向
+        waiting = MatchIntent.objects.filter(
+            supply__publisher=self.request.user,
+            status=MatchIntent.Status.PENDING)
+        alerts.append(self._pack(
+            "intent_waiting", "warning", "待回应的对接意向",
+            "采购方已发起对接，请及时接受或拒绝",
+            waiting, "intent", "去回应",
+            [{"label": i.supply.title if i.supply_id else f"#{i.id}",
+              "extra": f"{i.quantity_kg} kg",
+              "desc": f"匹配度 {i.match_score}"} for i in waiting[:20]]))
+
+        return [a for a in alerts if a["count"] > 0]
+
+    # ---- 工具方法 ----
+
+    @staticmethod
+    def _pack(key, level, title, desc, qs, route, action_label, items):
+        return {
+            "key": key, "level": level, "title": title, "desc": desc,
+            "count": qs.count(),
+            "action_route": route, "action_label": action_label,
+            "items": items or [],
+        }
+
+    @staticmethod
+    def _inspection_items(qs):
+        return [{
+            "label": f"检查#{r.id}",
+            "extra": (r.certificate.cert_no if r.certificate_id else ""),
+            "desc": (r.problem_description or r.get_check_result_display())[:60],
+        } for r in qs.select_related("certificate")[:20]]
 
 
 # ===============================================================

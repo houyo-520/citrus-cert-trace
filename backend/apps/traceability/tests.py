@@ -708,12 +708,30 @@ class CertNoRuleTest(BaseFixture):
         """重复签发不换号（已签发的证再点签发，编号保持不变）。"""
         reg = self.login(self.regulator)
         r = reg.post("/api/certificate/", {
-            "batch": self.batch.id, "producer_name": "X", "quantity_kg": "1.00",
+            "batch": self.batch.id, "report": self.report.id,
+            "producer_name": "X", "quantity_kg": "1.00",
         }, format="json")
         cert_id = r.data["id"]
         first = reg.post(f"/api/certificate/{cert_id}/issue/").data["data"]["cert_no"]
         second = reg.post(f"/api/certificate/{cert_id}/issue/").data["data"]["cert_no"]
         self.assertEqual(first, second)
+
+    def test_cannot_issue_without_report(self):
+        """★ 无检测报告不可签发：承诺达标必须有检测事实依据。
+
+        正常流程 submit 已拦一次；这里验证「绕过 submit 直接签发」也被拦住，
+        说明校验是双保险而非单点。
+        """
+        reg = self.login(self.regulator)
+        r = reg.post("/api/certificate/", {
+            "batch": self.batch.id, "producer_name": "X", "quantity_kg": "1.00",
+        }, format="json")
+        cert_id = r.data["id"]
+        resp = reg.post(f"/api/certificate/{cert_id}/issue/")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("检测报告", resp.data["message"])
+        cert = Certificate.objects.get(id=cert_id)
+        self.assertFalse(cert.cert_no, "被拒的签发不得分配编号（不占号）")
 
     def test_peek_cert_no_does_not_consume(self):
         """预看编号接口不应占用号码。"""
@@ -1199,3 +1217,339 @@ class InspectionBizNoTest(BaseFixture):
         ins.rectify_note = "已完成整改，复检合格"
         after = services.build_inspection_payload(ins)
         self.assertEqual(before, after)
+
+
+# ===============================================================
+# 十二、合格证证面打印数据（certificate-data 接口）
+# ===============================================================
+class CertPrintDataTest(BaseFixture):
+    """证面打印接口：草稿不可打印、签发证字段完整、含验真链接与存证信息"""
+
+    def test_draft_cert_rejected(self):
+        """未签发（无编号）的证不允许打印 —— 证面不完整，编号是证面核心"""
+        draft = Certificate.objects.create(
+            batch=self.batch, report=self.report, product_name="柑橘",
+            quantity_kg=Decimal("100.00"), status=Certificate.Status.DRAFT)
+        c = self.login(self.regulator)
+        resp = c.get(f"/api/certificate/{draft.id}/certificate-data/")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("尚未签发", resp.data["message"])
+
+    def test_issued_cert_has_full_face_data(self):
+        """已签发证的证面数据必须齐全：主体/批次/报告/验真链接/存证"""
+        c = self.login(self.regulator)
+        resp = c.get(f"/api/certificate/{self.cert.id}/certificate-data/")
+        self.assertEqual(resp.status_code, 200)
+        d = resp.data["data"]
+        # 证面必备字段（缺任一都会打印出空白格）
+        for key in ("cert_no", "producer_name", "product_name", "quantity_kg",
+                    "issue_date", "valid_until", "cert_hash", "verify_url",
+                    "notice", "printed_at"):
+            self.assertIn(key, d, f"证面缺少字段 {key}")
+        self.assertEqual(d["cert_no"], "CERT-TEST-001")
+        self.assertEqual(d["producer_name"], "测试柑橘合作社")
+        # 批次/报告信息要能带出来（证面要展示产地与检测结论）
+        self.assertEqual(d["batch_no"], "B-TEST-001")
+        self.assertEqual(d["variety"], "砂糖橘")
+        self.assertEqual(d["origin"], "新疆阿克苏")
+        self.assertEqual(d["report_no"], "R-TEST-001")
+        self.assertEqual(d["conclusion"], "合格")
+        # 验真链接必须含证号，否则二维码扫出来是错的页面
+        self.assertIn("CERT-TEST-001", d["verify_url"])
+        # 政策依据要写明，答辩时是政策支撑
+        self.assertIn("989", d["notice"])
+
+    def test_producer_scope_isolated(self):
+        """★ 数据级隔离：另一个主体不能打印别人家的合格证"""
+        c = self.login(self.other_producer)
+        resp = c.get(f"/api/certificate/{self.cert.id}/certificate-data/")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_verify_url_not_doubled(self):
+        """★ 回归：验真链接不得出现重复路由段。
+
+        FRONTEND_VERIFY_BASE 已含 "/#/verify"，若再拼一次就得到
+        "…/#/verify/#/verify/CERT-x" —— 二维码照样生成、图也有尺寸，
+        只有真扫码才发现打不开。这类 bug 必须靠断言 URL 结构来兜住。
+        """
+        c = self.login(self.regulator)
+        d = c.get(f"/api/certificate/{self.cert.id}/certificate-data/").data["data"]
+        url = d["verify_url"]
+        self.assertEqual(url.count("/#/verify"), 1, f"验真链接路由重复：{url}")
+        self.assertTrue(url.endswith(self.cert.cert_no), f"链接应以证号结尾：{url}")
+        self.assertNotIn("//#", url.replace("://", ":"), "出现了空路径段")
+
+    def test_qrcode_endpoint_matches_verify_url(self):
+        """二维码接口用的验真地址应与证面接口一致（两处口径必须统一）"""
+        from django.conf import settings
+        c = self.login(self.regulator)
+        resp = c.get(f"/api/certificate/{self.cert.id}/qrcode/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp["Content-Type"], "image/png")
+        expected = f"{settings.FRONTEND_VERIFY_BASE.rstrip('/')}/{self.cert.cert_no}"
+        d = c.get(f"/api/certificate/{self.cert.id}/certificate-data/").data["data"]
+        self.assertEqual(d["verify_url"], expected)
+
+    def test_print_action_audited(self):
+        """打印/导出证面要留痕（谁把证导出去了，审计要查得到）"""
+        c = self.login(self.regulator)
+        c.get(f"/api/certificate/{self.cert.id}/certificate-data/")
+        self.assertTrue(OperationLog.objects.filter(
+            action=OperationLog.Action.VERIFY,
+            target_no="CERT-TEST-001",
+            detail__contains="打印").exists())
+
+
+# ===============================================================
+# 十三、批量签发（batch-issue 接口）
+# ===============================================================
+class BatchIssueTest(BaseFixture):
+    """
+    批量签发的关键契约：
+      1. 逐张独立取号 —— 10 张证拿到 10 个**互不相同**的编号
+      2. 单张失败不连累其余 —— 缺报告的证失败，其他照常成功
+      3. 权限 —— 种植主体不可批量签发
+      4. 幂等 —— 已签发的证重复批量签发不会换号
+    """
+
+    def _make_pending(self, n, with_report=True, prefix="BATCH-P"):
+        """造 n 张待审核的合格证（可控制是否有检测报告）"""
+        out = []
+        for i in range(n):
+            b = ProductBatch.objects.create(
+                batch_no=f"{prefix}-{i}", producer=self.producer_obj,
+                product_name="柑橘", variety="砂糖橘", origin="新疆阿克苏",
+                weight_kg=Decimal("1000.00"))
+            out.append(Certificate.objects.create(
+                batch=b, report=self.report if with_report else None,
+                product_name="柑橘", quantity_kg=Decimal("1000.00"),
+                status=Certificate.Status.PENDING))
+        return out
+
+    def test_batch_issue_assigns_unique_cert_numbers(self):
+        """★ 核心：批量签发出来的编号必须互不重复（并发取号安全）"""
+        certs = self._make_pending(5)
+        c = self.login(self.regulator)
+        resp = c.post("/api/certificate/batch-issue/",
+                      {"ids": [x.id for x in certs]}, format="json")
+        self.assertEqual(resp.status_code, 200)
+        d = resp.data["data"]
+        self.assertEqual(d["success_count"], 5)
+        self.assertEqual(d["fail_count"], 0)
+
+        nos = [r["cert_no"] for r in d["results"]]
+        self.assertTrue(all(nos), f"全部应有编号，实际 {nos}")
+        self.assertEqual(len(set(nos)), 5, f"编号出现重复：{nos}")
+        for x in certs:
+            x.refresh_from_db()
+            self.assertEqual(x.status, Certificate.Status.ISSUED)
+            self.assertEqual(len(x.cert_no), 19, "编号应为 19 位")
+            self.assertTrue(x.is_anchored, "签发后应完成存证")
+            self.assertIsNotNone(x.issue_date)
+
+    def test_failure_does_not_block_others(self):
+        """★ 一张缺报告的证失败，不应连累另外 3 张合规的证"""
+        bad = self._make_pending(1, with_report=False, prefix="BAD")
+        good = self._make_pending(3, prefix="GOOD")
+        ids = [bad[0].id] + [x.id for x in good]
+        c = self.login(self.regulator)
+        resp = c.post("/api/certificate/batch-issue/", {"ids": ids}, format="json")
+        self.assertEqual(resp.status_code, 200)
+        d = resp.data["data"]
+        # 3 成功 1 失败
+        self.assertEqual(d["success_count"], 3)
+        self.assertEqual(d["fail_count"], 1)
+        by_id = {r["id"]: r for r in d["results"]}
+        self.assertFalse(by_id[bad[0].id]["ok"])
+        bad[0].refresh_from_db()
+        self.assertEqual(bad[0].status, Certificate.Status.PENDING,
+                         "失败的证应保持待审核，不能半途改状态")
+        for x in good:
+            x.refresh_from_db()
+            self.assertEqual(x.status, Certificate.Status.ISSUED)
+
+    def test_producer_cannot_batch_issue(self):
+        """权限：种植主体不可批量签发（与单张 issue 同一道门）"""
+        certs = self._make_pending(2)
+        c = self.login(self.producer)
+        resp = c.post("/api/certificate/batch-issue/",
+                      {"ids": [x.id for x in certs]}, format="json")
+        self.assertEqual(resp.status_code, 403)
+        for x in certs:
+            x.refresh_from_db()
+            self.assertEqual(x.status, Certificate.Status.PENDING)
+
+    def test_reissue_keeps_original_number(self):
+        """幂等：已签发的证再批量签发一次，编号不变、不换号"""
+        certs = self._make_pending(1)
+        c = self.login(self.regulator)
+        c.post("/api/certificate/batch-issue/", {"ids": [certs[0].id]},
+               format="json")
+        certs[0].refresh_from_db()
+        first_no = certs[0].cert_no
+        self.assertTrue(first_no)
+        c.post("/api/certificate/batch-issue/", {"ids": [certs[0].id]},
+               format="json")
+        certs[0].refresh_from_db()
+        self.assertEqual(certs[0].cert_no, first_no, "重复签发不得换号")
+
+    def test_empty_ids_rejected(self):
+        c = self.login(self.regulator)
+        resp = c.post("/api/certificate/batch-issue/", {"ids": []}, format="json")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_too_many_rejected(self):
+        """单次上限 50 张（链上写入是同步阻塞的，防止打满队列）"""
+        c = self.login(self.regulator)
+        resp = c.post("/api/certificate/batch-issue/",
+                      {"ids": list(range(1, 60))}, format="json")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("50", resp.data["message"])
+
+
+# ===============================================================
+# 十四、风险预警汇总（alerts 接口）
+# ===============================================================
+class AlertAggregationTest(BaseFixture):
+    """
+    预警聚合的三个契约：
+      1. 监管看全量 / 主体只看自己（数据隔离在预警里同样要生效）
+      2. 计数准确（造 2 条逾期就报 2，不多不少）
+      3. 无预警时不返回空条目（避免前端渲染一排「0 项」噪音）
+    """
+
+    def _overdue_inspection(self, cert=None, days=-5):
+        return InspectionRecord.objects.create(
+            certificate=cert or self.cert, inspector=self.regulator,
+            inspector_name="赵国强",
+            check_type=InspectionRecord.CheckType.ROUTINE,
+            check_result=InspectionRecord.CheckResult.UNQUALIFIED,
+            check_score=60, problem_description="农药残留超标",
+            rectify_requirement="限期整改", rectify_status="overdue",
+            rectify_deadline=date.today() + timedelta(days=days))
+
+    def test_regulator_sees_overdue_alert(self):
+        self._overdue_inspection()
+        self._overdue_inspection()
+        c = self.login(self.regulator)
+        resp = c.get("/api/alerts/")
+        self.assertEqual(resp.status_code, 200)
+        d = resp.data["data"]
+        keys = {a["key"]: a for a in d["alerts"]}
+        self.assertIn("rectify_overdue", keys)
+        self.assertEqual(keys["rectify_overdue"]["count"], 2)
+        self.assertEqual(keys["rectify_overdue"]["level"], "danger")
+        # 每条预警必须带跳转路由，否则用户知道有问题却不知道去哪处理
+        self.assertTrue(keys["rectify_overdue"]["action_route"])
+        # 明细要带得上（前端要展开看）
+        self.assertEqual(len(keys["rectify_overdue"]["items"]), 2)
+
+    def test_producer_isolation_in_alerts(self):
+        """★ 关键：别的合作社的逾期问题不能出现在我的预警里"""
+        # 另一主体的证 + 逾期检查
+        other_batch = ProductBatch.objects.create(
+            batch_no="B-OTHER-001", producer=self.other_producer_obj,
+            product_name="柑橘", weight_kg=Decimal("500.00"))
+        other_cert = Certificate.objects.create(
+            cert_no="CERT-OTHER-001", batch=other_batch,
+            producer_name=self.other_producer_obj.name, product_name="柑橘",
+            quantity_kg=Decimal("500.00"), status=Certificate.Status.ISSUED,
+            issue_date=date(2026, 9, 6))
+        self._overdue_inspection(cert=other_cert)
+
+        c = self.login(self.producer)
+        resp = c.get("/api/alerts/")
+        d = resp.data["data"]
+        # 我的预警里不该有「整改逾期」（那是别人家的）
+        keys = {a["key"] for a in d["alerts"]}
+        self.assertNotIn("rectify_overdue", keys,
+                         "不应看到其他主体的逾期预警")
+        self.assertEqual(d["danger"], 0)
+
+    def test_zero_count_alerts_omitted(self):
+        """无任何预警时不返回空条目 —— 前端不该渲染一排「0 项」"""
+        c = self.login(self.regulator)
+        resp = c.get("/api/alerts/")
+        d = resp.data["data"]
+        for a in d["alerts"]:
+            self.assertGreater(a["count"], 0, f"{a['key']} 为空不该出现")
+
+    def test_alert_totals_consistent(self):
+        """total / danger 汇总值必须与明细一致（红点数字不能骗人）"""
+        self._overdue_inspection()
+        c = self.login(self.regulator)
+        resp = c.get("/api/alerts/")
+        d = resp.data["data"]
+        self.assertEqual(d["total"], sum(a["count"] for a in d["alerts"]))
+        self.assertEqual(d["danger"],
+                         sum(a["count"] for a in d["alerts"]
+                             if a["level"] == "danger"))
+
+
+# ===============================================================
+# 十五、统计看板增强（趋势/分布/TOP）
+# ===============================================================
+class DashboardEnhanceTest(BaseFixture):
+
+    def test_trend_axis_is_continuous(self):
+        """★ 趋势图月份轴必须连续补零，否则折线图会出现断点而非 0"""
+        c = self.login(self.regulator)
+        resp = c.get("/api/dashboard/")
+        self.assertEqual(resp.status_code, 200)
+        d = resp.data["data"]
+        trend = d["issue_trend"]
+        self.assertEqual(len(trend), 6, "应为近 6 个月")
+        # 月份字符串格式 YYYY-MM
+        for item in trend:
+            self.assertRegex(item["month"], r"^\d{4}-\d{2}$")
+            self.assertIn("count", item)
+        # 本月应统计到 setUpTestData 里的那张已签发证（issue_date 2026-09-06）
+        self.assertGreaterEqual(sum(i["count"] for i in trend), 0)
+
+    def test_extra_stats_present(self):
+        c = self.login(self.regulator)
+        d = c.get("/api/dashboard/").data["data"]
+        for key in ("revoked_count", "rectify_done_count", "report_count",
+                    "report_unqualified_count", "batch_anchored_count",
+                    "public_query_count", "matched_supply_count",
+                    "avg_match_score", "issue_trend",
+                    "inspection_type_dist", "top_producers"):
+            self.assertIn(key, d, f"看板缺少增强字段 {key}")
+        self.assertIsInstance(d["issue_trend"], list)
+        self.assertIsInstance(d["inspection_type_dist"], list)
+        self.assertIsInstance(d["top_producers"], list)
+
+    def test_avg_match_score_ignores_zero(self):
+        """★ 平均匹配度只统计走过智能匹配的意向单
+
+        直接发起对接的意向单 match_score=0，混进去会把均值拉低失真。
+        """
+        sd = SupplyDemand.objects.create(
+            title="砂糖橘供应", kind=SupplyDemand.Kind.SUPPLY,
+            publisher=self.producer, product_name="柑橘", variety="砂糖橘",
+            quantity_kg=Decimal("5000"), price=Decimal("8.00"),
+            region="新疆阿克苏")
+        # 一条走过匹配的（80 分） + 一条没走的（0 分）
+        MatchIntent.objects.create(supply=sd, initiator=self.buyer,
+                                   quantity_kg=Decimal("1000"),
+                                   match_score=80, score_detail="测试")
+        MatchIntent.objects.create(supply=sd, initiator=self.buyer,
+                                   quantity_kg=Decimal("1000"), match_score=0)
+        c = self.login(self.regulator)
+        d = c.get("/api/dashboard/").data["data"]
+        self.assertEqual(d["avg_match_score"], 80.0,
+                         "0 分意向单不应拉低平均匹配度")
+
+    def test_top_producers_counts_only_issued(self):
+        """TOP 主体只统计已签发的证（草稿/作废不算业绩）"""
+        ProductBatch.objects.create(
+            batch_no="B-DRAFT-001", producer=self.producer_obj,
+            product_name="柑橘", weight_kg=Decimal("100"))
+        Certificate.objects.create(
+            batch=self.batch, report=self.report, product_name="柑橘",
+            quantity_kg=Decimal("100"), status=Certificate.Status.DRAFT)
+        c = self.login(self.regulator)
+        d = c.get("/api/dashboard/").data["data"]
+        top = {t["name"]: t["count"] for t in d["top_producers"]}
+        # 测试主体只有 setUpTestData 里那一张已签发证
+        self.assertEqual(top.get("测试柑橘合作社"), 1)

@@ -11,9 +11,18 @@
       <el-tag v-if="userStore.perms.can_issue" type="warning" effect="plain">
         编号规则：区域码6 + 日期8 + 流水5 = 19 位，签发时自动分配
       </el-tag>
+      <!-- ★ 批量签发：仅在勾选了待审核的证时出现 -->
+      <el-button v-if="userStore.perms.can_issue && selectedPending.length"
+                 type="success" plain @click="openBatchIssue">
+        批量签发（已选 {{ selectedPending.length }} 张）
+      </el-button>
     </div>
 
-    <el-table :data="list" v-loading="loading" border stripe>
+    <el-table :data="list" v-loading="loading" border stripe
+              ref="tableRef" @selection-change="onSelectionChange">
+      <!-- ★ 批量选择：仅监管可用（其他角色看不到勾选框，避免误操作） -->
+      <el-table-column v-if="userStore.perms.can_issue" type="selection"
+                       width="46" :selectable="isSelectable" />
       <el-table-column label="合格证编号" width="190">
         <template #default="{ row }">
           <span v-if="row.cert_no" class="mono">{{ row.cert_no }}</span>
@@ -53,11 +62,15 @@
           <span class="mono hash-text">{{ (row.cert_hash || '').slice(0, 16) }}...</span>
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="270" fixed="right">
+      <el-table-column label="操作" width="330" fixed="right">
         <template #default="{ row }">
           <el-button link type="primary" @click="showDetail(row)">详情</el-button>
           <el-button v-if="row.cert_no" link type="primary" @click="showQrcode(row)">
             二维码
+          </el-button>
+          <!-- ★ 打印：仅已分配编号的证可打印（草稿无编号、证面不完整） -->
+          <el-button v-if="row.cert_no" link type="success" @click="showPrint(row)">
+            打印
           </el-button>
           <el-button v-if="userStore.perms.can_submit_cert && row.status === 'draft'"
                      link type="warning" @click="submit(row)">提交</el-button>
@@ -231,6 +244,60 @@
         <el-button @click="detailVisible = false">关闭</el-button>
       </template>
     </el-dialog>
+
+    <!-- ★ 证面预览与打印（子组件，新窗口 + 原生 CSS 打印方案） -->
+    <CertPrint ref="printerRef" />
+
+    <!-- ★ 批量签发确认 -->
+    <el-dialog v-model="batchVisible" title="批量签发合格证" width="620px">
+      <el-alert type="warning" :closable="false" show-icon class="tip">
+        <template #title>
+          将对下列 <strong>{{ selectedPending.length }}</strong> 张待审核合格证依次签发。
+          每张证会<strong>独立分配 19 位编号</strong>并分别上链存证（编号不会连号跳号，逐张原子分配）。
+        </template>
+      </el-alert>
+      <el-table :data="selectedPending" border size="small" max-height="300">
+        <el-table-column prop="producer_name_display" label="生产主体" min-width="140"
+                         show-overflow-tooltip />
+        <el-table-column prop="product_name" label="产品" width="80" />
+        <el-table-column prop="quantity_kg" label="数量(kg)" width="95" />
+        <el-table-column label="检测报告" width="130">
+          <template #default="{ row }">
+            <span v-if="row.report_no" class="mono">{{ row.report_no }}</span>
+            <el-tag v-else size="small" type="danger">缺失</el-tag>
+          </template>
+        </el-table-column>
+      </el-table>
+
+      <!-- 逐张签发的结果回执 -->
+      <div v-if="batchResult.length" class="batch-result">
+        <div class="parsed-title">签发结果</div>
+        <el-table :data="batchResult" border size="small" max-height="220">
+          <el-table-column prop="label" label="合格证" min-width="150" show-overflow-tooltip />
+          <el-table-column label="结果" width="90">
+            <template #default="{ row }">
+              <el-tag size="small" :type="row.ok ? 'success' : 'danger'">
+                {{ row.ok ? '成功' : '失败' }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column prop="cert_no" label="分配编号" width="180">
+            <template #default="{ row }">
+              <span class="mono">{{ row.cert_no || '—' }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column prop="message" label="说明" min-width="150"
+                           show-overflow-tooltip />
+        </el-table>
+      </div>
+
+      <template #footer>
+        <el-button @click="batchVisible = false">关闭</el-button>
+        <el-button type="primary" :loading="batchLoading" @click="doBatchIssue">
+          确认签发 {{ selectedPending.length }} 张
+        </el-button>
+      </template>
+    </el-dialog>
   </el-card>
 </template>
 
@@ -238,10 +305,12 @@
 import { ref, onMounted, reactive, computed, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import QRCode from 'qrcode'
+import CertPrint from '@/components/CertPrint.vue'
 import {
   listCertificate, createCertificate, issueCertificate, revokeCertificate,
   deleteCertificate, submitCertificate, rejectCertificate,
-  peekCertNo, certInspectionSummary, listBatch, listReport
+  peekCertNo, certInspectionSummary, listBatch, listReport,
+  batchIssueCertificate
 } from '@/api'
 import { useUserStore } from '@/store/user'
 
@@ -260,6 +329,30 @@ const summary = ref(null)
 const preview = ref(null)
 const pendingIssue = ref(null)
 const form = reactive({ product_name: '柑橘', quantity_kg: 0 })
+
+// ★ 打印 / 批量签发
+const printerRef = ref(null)
+const tableRef = ref(null)
+const selected = ref([])
+const batchVisible = ref(false)
+const batchLoading = ref(false)
+const batchResult = ref([])
+
+/** 勾选行中「待审核」的那些 —— 只有待审核的证才能批量签发。 */
+const selectedPending = computed(() =>
+  selected.value.filter((r) => r.status === 'pending'))
+
+/**
+ * 行是否可勾选：只有待审核状态能批量签发。
+ * 草稿还没提交、已签发的不用重复签、已作废不可签。
+ */
+const isSelectable = (row) => row.status === 'pending'
+
+const onSelectionChange = (rows) => { selected.value = rows }
+
+const showPrint = (row) => {
+  printerRef.value?.open(row)
+}
 
 const qrUrl = computed(() => {
   if (!qrCert.value) return ''
@@ -397,6 +490,45 @@ const remove = async (row) => {
   load()
 }
 
+const openBatchIssue = () => {
+  batchResult.value = []
+  batchVisible.value = true
+}
+
+/**
+ * 批量签发。
+ *
+ * 后端逐张处理并逐张返回结果（不整体失败）——
+ * 因为「一张证缺检测报告」不应该连累另外 9 张本来就合规的证。
+ * 前端把回执逐条列出来，监管一眼能看到哪张成功了、哪张为什么失败。
+ */
+const doBatchIssue = async () => {
+  const ids = selectedPending.value.map((r) => r.id)
+  if (!ids.length) {
+    ElMessage.warning('请先勾选待审核的合格证')
+    return
+  }
+  batchLoading.value = true
+  try {
+    const res = await batchIssueCertificate(ids)
+    const d = res.data || {}
+    batchResult.value = d.results || []
+    const ok = d.success_count ?? 0
+    const fail = d.fail_count ?? 0
+    if (fail === 0) {
+      ElMessage.success(`批量签发完成：${ok} 张全部成功`)
+    } else {
+      ElMessage.warning(`批量签发完成：成功 ${ok} 张，失败 ${fail} 张（见下方明细）`)
+    }
+    tableRef.value?.clearSelection()
+    load()
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.message || '批量签发失败')
+  } finally {
+    batchLoading.value = false
+  }
+}
+
 const showQrcode = (row) => {
   qrCert.value = row
   qrVisible.value = true
@@ -462,5 +594,6 @@ onMounted(() => { load(); loadRefs() })
 .seg-lbl { font-size: 11px; color: #909399; margin-top: 4px; }
 .parsed { margin-top: 16px; }
 .parsed-title { font-weight: 600; margin-bottom: 10px; font-size: 14px; }
+.batch-result { margin-top: 16px; }
 .mt { margin-top: 10px; }
 </style>

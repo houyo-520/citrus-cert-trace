@@ -47,6 +47,14 @@ export const peekCertNo = (producerId) =>
 // ★ 某张合格证的监督检查汇总
 export const certInspectionSummary = (id) =>
   request.get(`/certificate/${id}/inspection-summary/`)
+// ★ 单张合格证的证面打印数据（含主体/批次/报告/存证/验真链接）
+export const certPrintData = (id) =>
+  request.get(`/certificate/${id}/certificate-data/`)
+// ★ 批量签发（一次提交多张待审核合格证）
+export const batchIssueCertificate = (ids) =>
+  request.post('/certificate/batch-issue/', { ids })
+// ★ 风险预警汇总（首页红点 + 预警清单）
+export const getAlerts = () => request.get('/alerts/')
 
 // ---- 监督检查（监管执法闭环）----
 export const listInspection = (params) => request.get('/inspection/', { params })

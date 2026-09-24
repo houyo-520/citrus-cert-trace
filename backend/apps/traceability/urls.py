@@ -4,11 +4,11 @@
 from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
-from .views import (CertificateViewSet, DashboardView, EvidenceViewSet,
-                    InspectionRecordViewSet, MatchIntentViewSet,
-                    OperationLogViewSet, ProducerViewSet, ProductBatchViewSet,
-                    PublicVerifyView, RoleMatrixView, SupplyDemandViewSet,
-                    TestReportViewSet)
+from .views import (AlertView, CertificateViewSet, DashboardView,
+                    EvidenceViewSet, InspectionRecordViewSet,
+                    MatchIntentViewSet, OperationLogViewSet, ProducerViewSet,
+                    ProductBatchViewSet, PublicVerifyView, RoleMatrixView,
+                    SupplyDemandViewSet, TestReportViewSet)
 
 router = DefaultRouter()
 router.register(r"producer", ProducerViewSet, basename="producer")
@@ -26,5 +26,6 @@ urlpatterns = [
     path("public/verify/<str:cert_no>/", PublicVerifyView.as_view(),
          name="public-verify"),
     path("dashboard/", DashboardView.as_view(), name="dashboard"),
+    path("alerts/", AlertView.as_view(), name="alerts"),
     path("role-matrix/", RoleMatrixView.as_view(), name="role-matrix"),
 ]
