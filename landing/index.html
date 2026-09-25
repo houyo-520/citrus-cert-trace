@@ -42,8 +42,8 @@
       display: grid; place-items: center; color: #fff; font-size: 15px;
     }
     .nav .menu { display: flex; gap: 26px; font-size: 14.5px; color: #4a554e; }
-    .nav .menu a { transition: color .15s; }
-    .nav .menu a:hover { color: var(--green); }
+    .nav .menu span { transition: color .15s; cursor: default; }
+    .nav .menu span:hover { color: var(--green); }
 
     /* Hero */
     .hero {
@@ -74,18 +74,6 @@
     }
     .hero h1 { font-size: 52px; font-weight: 800; letter-spacing: 2px; }
     .hero .sub { margin-top: 16px; font-size: 17px; color: #d7ecdf; max-width: 560px; margin-left: auto; margin-right: auto; }
-    .hero .links { margin-top: 40px; display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; }
-    .hero .links a {
-      display: inline-flex; align-items: center; gap: 8px;
-      padding: 13px 32px; border-radius: 10px;
-      font-size: 15px; font-weight: 600;
-      transition: transform .18s, box-shadow .18s;
-    }
-    .hero .links a:hover { transform: translateY(-2px); }
-    .btn-primary { background: #fff; color: var(--green); box-shadow: 0 8px 24px rgba(0,0,0,.22); }
-    .btn-primary:hover { box-shadow: 0 12px 30px rgba(0,0,0,.28); }
-    .btn-ghost { background: rgba(255,255,255,0.08); color: #fff; border: 1px solid rgba(255,255,255,0.55); }
-    .btn-ghost:hover { background: rgba(255,255,255,0.16); }
     .hero .stats {
       margin-top: 52px; display: flex; gap: 48px; justify-content: center; flex-wrap: wrap;
     }
@@ -146,8 +134,8 @@
   <nav class="nav">
     <div class="logo"><span class="dot">朴</span>厚朴小栈</div>
     <div class="menu">
-      <a href="#features">能力</a>
-      <a href="#about">关于</a>
+      <span>课题实践</span>
+      <span>关于</span>
     </div>
   </nav>
 
@@ -156,10 +144,6 @@
     <div class="badge">个人技术空间 · 农产品质量安全</div>
     <h1>厚朴小栈</h1>
     <p class="sub">个人学习与毕业设计作品展示：以农产品合格证追溯为题，实践可信存证与二维码溯源技术。</p>
-    <div class="links">
-      <a class="btn-primary" href="https://trace.example.com/">进入追溯系统 →</a>
-      <a class="btn-ghost" href="https://trace.example.com/#/verify">公众验真</a>
-    </div>
     <div class="stats">
       <div class="s"><b>区块链</b><span>存证实践</span></div>
       <div class="s"><b>一证一码</b><span>二维码溯源</span></div>
