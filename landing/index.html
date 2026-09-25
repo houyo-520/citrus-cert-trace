@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>example.com — 厚朴小栈</title>
+  <style>
+    :root {
+      --green: #0f5c3f;
+      --green-light: #2d7d46;
+      --text: #303133;
+      --muted: #909399;
+      --bg: #f5f7fa;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                   "Microsoft YaHei", sans-serif;
+      color: var(--text);
+      background: var(--bg);
+      line-height: 1.7;
+    }
+    .hero {
+      background: linear-gradient(160deg, #0a4a33 0%, var(--green) 60%, var(--green-light) 100%);
+      color: #fff;
+      text-align: center;
+      padding: 90px 24px 70px;
+    }
+    .hero .badge {
+      display: inline-block;
+      background: rgba(255,255,255,0.15);
+      border: 1px solid rgba(255,255,255,0.25);
+      border-radius: 999px;
+      padding: 6px 18px;
+      font-size: 13px;
+      letter-spacing: 1px;
+      margin-bottom: 22px;
+    }
+    .hero h1 { font-size: 42px; font-weight: 700; letter-spacing: 1px; }
+    .hero .sub { margin-top: 14px; font-size: 16px; color: #cfe8dd; }
+    .hero .links { margin-top: 34px; display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+    .hero .links a {
+      display: inline-block;
+      padding: 12px 30px;
+      border-radius: 8px;
+      text-decoration: none;
+      font-size: 15px;
+      font-weight: 600;
+      transition: transform .15s, box-shadow .15s;
+    }
+    .hero .links a:hover { transform: translateY(-2px); }
+    .btn-primary { background: #fff; color: var(--green); box-shadow: 0 6px 20px rgba(0,0,0,.15); }
+    .btn-ghost { background: transparent; color: #fff; border: 1px solid rgba(255,255,255,.55); }
+    .main { max-width: 900px; margin: 0 auto; padding: 56px 24px; }
+    .card {
+      background: #fff;
+      border-radius: 12px;
+      padding: 28px 32px;
+      margin-bottom: 20px;
+      box-shadow: 0 2px 10px rgba(0,0,0,.04);
+      border: 1px solid #eef1f4;
+    }
+    .card h2 { font-size: 19px; color: var(--green); margin-bottom: 12px; }
+    .card p { color: #606266; font-size: 14.5px; }
+    .footer {
+      text-align: center;
+      padding: 30px 16px 40px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .footer a { color: var(--muted); text-decoration: none; }
+    .footer a:hover { color: #606266; text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="hero">
+    <div class="badge">厚朴小栈 · 个人空间</div>
+    <h1>example.com</h1>
+    <p class="sub">专注农产品质量安全与可信追溯的个人技术空间</p>
+    <div class="links">
+      <a class="btn-primary" href="http://trace.example.com:8090/">进入柑橘合格证追溯系统 →</a>
+      <a class="btn-ghost" href="http://trace.example.com:8090/#/verify">公众验真入口</a>
+    </div>
+  </div>
+
+  <div class="main">
+    <div class="card">
+      <h2>关于本站</h2>
+      <p>本域名（example.com）为个人学习与毕业设计作品展示空间。站内项目为《基于 Django 的柑橘合格证追溯系统》，用于研究与实践农产品质量安全承诺达标合格证的数字化存证与二维码追溯技术。本站为非经营性个人技术站点，不提供任何收费或商业服务。</p>
+    </div>
+  </div>
+
+  <div class="footer">
+    <span>© 2026 example.com · 厚朴小栈</span><br />
+    <a href="https://beian.miit.gov.cn/" target="_blank" rel="noreferrer">蜀ICP备2026052817号</a>
+  </div>
+</body>
+</html>
