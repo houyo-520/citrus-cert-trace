@@ -62,3 +62,6 @@ _srv.py
 
 # 验收脚本产出的截图
 frontend/shot_*.png
+
+# vite 构建临时文件
+frontend/vite.config.js.timestamp-*.mjs

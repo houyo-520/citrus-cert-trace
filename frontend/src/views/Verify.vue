@@ -212,6 +212,7 @@
 
     <div class="verify-footer">
       <el-button link @click="$router.push('/login')">后台管理登录 →</el-button>
+      <BeianFooter />
     </div>
   </div>
 </template>
@@ -220,6 +221,7 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { publicVerify } from '@/api'
+import BeianFooter from '@/components/BeianFooter.vue'
 
 const route = useRoute()
 const certNo = ref(route.params.certNo || '')
@@ -466,7 +468,7 @@ onUnmounted(() => { mq?.removeEventListener('change', onMq) })
 }
 .seg-lbl { font-size: 11px; color: #909399; margin-top: 4px; }
 .suspend-alert { margin-bottom: 16px; }
-.verify-footer { text-align: center; margin-top: 30px; }
+.verify-footer { text-align: center; margin-top: 30px; display: flex; flex-direction: column; align-items: center; gap: 4px; }
 
 /* ============================================================
    移动端：验真页是「扫码落地页」，手机上必须比桌面更好用
