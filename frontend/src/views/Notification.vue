@@ -172,7 +172,7 @@ onMounted(() => { load(); loadCategories(); noticeStore.fetch(true) })
 /* 未读用浅底 + 左侧色条区分：比只改文字颜色更容易一眼扫到 */
 .notice-item.unread { background: #f7fbf9; }
 .notice-item.lv-success { border-left-color: #67c23a; }
-.notice-item.lv-info { border-left-color: #409eff; }
+.notice-item.lv-info { border-left-color: #E8743B; }
 .notice-item.lv-warning { border-left-color: #e6a23c; }
 .notice-item.lv-danger { border-left-color: #f56c6c; }
 
@@ -182,7 +182,7 @@ onMounted(() => { load(); loadCategories(); noticeStore.fetch(true) })
   border-radius: 50%; background: #f2f6fc; color: #606266;
 }
 .lv-success .ni-icon { background: #f0f9eb; color: #67c23a; }
-.lv-info .ni-icon { background: #ecf5ff; color: #409eff; }
+.lv-info .ni-icon { background: #FDEEE3; color: #E8743B; }
 .lv-warning .ni-icon { background: #fdf6ec; color: #e6a23c; }
 .lv-danger .ni-icon { background: #fef0f0; color: #f56c6c; }
 

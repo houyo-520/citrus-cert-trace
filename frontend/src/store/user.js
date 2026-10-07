@@ -14,6 +14,7 @@ export const useUserStore = defineStore('user', {
     perms: (state) => state.user?.permissions || {},
     isRegulator: (state) =>
       ['admin', 'regulator'].includes(state.user?.role || ''),
+    isAdmin: (state) => (state.user?.role || '') === 'admin',
     isProducer: (state) => (state.user?.role || '') === 'producer',
     isBuyer: (state) => (state.user?.role || '') === 'buyer'
   },

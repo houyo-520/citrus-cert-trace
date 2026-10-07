@@ -115,7 +115,7 @@
 
     <!-- ★ 监管执法闭环态势（仅监管/管理员可见） -->
     <el-row :gutter="16" style="margin-top:16px" v-if="userStore.perms.can_view_all">
-      <el-col :span="24">
+      <el-col :span="13">
         <el-card shadow="never">
           <div class="card-title">
             监督检查与执法闭环
@@ -134,6 +134,41 @@
           <div ref="inspRef" style="height:260px; margin-top:12px"></div>
         </el-card>
       </el-col>
+      <el-col :span="11">
+        <el-card shadow="never">
+          <div class="card-title">
+            主体信用评分排行
+            <el-tag size="small" type="info" effect="plain" style="margin-left:8px">
+              低分 = 高风险
+            </el-tag>
+          </div>
+          <el-table :data="stats.credit_ranking || []" size="small" border
+                    max-height="320">
+            <el-table-column type="index" label="#" width="46" />
+            <el-table-column prop="name" label="主体" min-width="110" show-overflow-tooltip />
+            <el-table-column label="信用分" width="92" align="center">
+              <template #default="{ row }">
+                <span :class="'grade-' + row.grade">{{ row.score }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="等级" width="72" align="center">
+              <template #default="{ row }">
+                <el-tag :type="creditTagType(row.grade)" size="small" effect="light">
+                  {{ row.grade }}
+                </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="扣分项" width="76" align="center">
+              <template #default="{ row }">
+                <span v-if="row.deduction_count" class="deduct-count">{{ row.deduction_count }}</span>
+                <span v-else class="muted">0</span>
+              </template>
+            </el-table-column>
+          </el-table>
+          <el-empty v-if="!(stats.credit_ranking && stats.credit_ranking.length)"
+                    description="暂无已评级主体" :image-size="60" />
+        </el-card>
+      </el-col>
     </el-row>
 
     <el-card shadow="never" style="margin-top:16px">
@@ -147,7 +182,7 @@
           19 位：区域码(6) + 日期(8) + 流水(5)，签发时分配（草稿不占号）
         </el-descriptions-item>
         <el-descriptions-item label="监管闭环">
-          现场检查 → 结论上链 → 整改期限 → 复查 → 合格证暂停/恢复
+          现场检查 → 结论上链 → 整改期限 → 复查 → 原证作废/重申领
         </el-descriptions-item>
         <el-descriptions-item label="技术栈">
           前端 Vue3 + Element Plus ｜ 后端 Django + DRF ｜ 联盟链 FISCO BCOS
@@ -188,7 +223,7 @@ const stats = ref({
 const cards = computed(() => {
   const s = stats.value
   const base = [
-    { label: '生产主体', value: s.producer_count, color: '#409eff' },
+    { label: '生产主体', value: s.producer_count, color: '#E8743B' },
     { label: '生产批次', value: s.batch_count, color: '#67c23a' },
     { label: '已签发合格证', value: s.issued_count, color: '#e6a23c' }
   ]
@@ -204,7 +239,7 @@ const cards = computed(() => {
 const inspCards = computed(() => {
   const s = stats.value
   return [
-    { label: '检查总数', value: s.inspection_count ?? 0, color: '#409eff' },
+    { label: '检查总数', value: s.inspection_count ?? 0, color: '#E8743B' },
     { label: '检查不合格', value: s.inspection_unqualified_count ?? 0, color: '#f56c6c' },
     { label: '整改中/待整改', value: s.rectify_pending_count ?? 0, color: '#e6a23c' },
     { label: '罚款合计(元)', value: s.penalty_total ?? '0.00', color: '#303133' }
@@ -225,7 +260,7 @@ const metrics = computed(() => {
   const anchoredRate = certTotal
     ? Math.round((s.issued_count || 0) / certTotal * 100) : 0
   return [
-    { label: '检测报告', value: s.report_count ?? 0, color: '#409eff',
+    { label: '检测报告', value: s.report_count ?? 0, color: '#E8743B',
       tip: `其中不合格 ${s.report_unqualified_count ?? 0} 份` },
     { label: '批次已存证', value: s.batch_anchored_count ?? 0, color: '#0f5c3f',
       tip: '批次信息已上链锚定' },
@@ -233,16 +268,17 @@ const metrics = computed(() => {
       tip: '免登录扫码查询累计' },
     { label: '产销已对接', value: s.matched_supply_count ?? 0, color: '#67c23a',
       tip: `平均匹配度 ${s.avg_match_score ?? 0} 分` },
-    { label: '有效证占比', value: `${anchoredRate}%`, color: '#409eff',
+    { label: '有效证占比', value: `${anchoredRate}%`, color: '#E8743B',
       tip: '已签发 / 全部证' },
     { label: '已整改闭环', value: s.rectify_done_count ?? 0, color: '#67c23a',
-      tip: '复查合格并恢复' }
+      tip: '复查通过，原证作废' }
   ]
 })
 
 const levelTag = (lv) => ({ danger: 'danger', warning: 'warning', info: 'info' }[lv] || 'info')
 const levelText = (lv) => ({ danger: '紧急', warning: '关注', info: '提示' }[lv] || '提示')
 const goto = (route) => { if (route) router.push(`/${route}`) }
+const creditTagType = (g) => ({ 优秀: 'success', 良好: 'primary', 一般: 'warning', 警示: 'danger' }[g] || 'info')
 
 /**
  * ★ 安全初始化图表
@@ -331,7 +367,7 @@ const renderTrend = () => {
       smooth: true,
       symbolSize: 7,
       data: trend.map((t) => t.count),
-      itemStyle: { color: '#409eff' },
+      itemStyle: { color: '#E8743B' },
       lineStyle: { width: 3 },
       areaStyle: {
         color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
@@ -349,7 +385,7 @@ const renderType = () => {
   const chart = safeInit(typeRef.value)
   if (!chart) return
   const dist = stats.value.inspection_type_dist || []
-  const palette = ['#409eff', '#e6a23c', '#f56c6c', '#0f5c3f']
+  const palette = ['#E8743B', '#e6a23c', '#f56c6c', '#0f5c3f']
   chart.setOption({
     tooltip: { trigger: 'item' },
     legend: { bottom: 0 },
@@ -405,7 +441,7 @@ const renderInsp = () => {
     series: [{
       type: 'bar',
       data: [
-        { value: s.inspection_count ?? 0, itemStyle: { color: '#409eff' } },
+        { value: s.inspection_count ?? 0, itemStyle: { color: '#E8743B' } },
         { value: s.inspection_unqualified_count ?? 0, itemStyle: { color: '#f56c6c' } },
         { value: s.rectify_pending_count ?? 0, itemStyle: { color: '#e6a23c' } },
         { value: s.rectify_overdue_count ?? 0, itemStyle: { color: '#c45656' } },
@@ -494,7 +530,7 @@ onBeforeUnmount(() => {
 }
 .alert-item.danger { border-left-color: #f56c6c; background: #fef0f0; }
 .alert-item.warning { border-left-color: #e6a23c; background: #fdf6ec; }
-.alert-item.info { border-left-color: #409eff; background: #ecf5ff; }
+.alert-item.info { border-left-color: #E8743B; background: #FDEEE3; }
 .ai-left { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .ai-text { min-width: 0; }
 .ai-title { font-size: 13.5px; font-weight: 600; color: #303133; }
@@ -511,4 +547,11 @@ onBeforeUnmount(() => {
 .metric-val { font-size: 22px; font-weight: 700; }
 .metric-lbl { font-size: 12px; color: #606266; margin-top: 4px; }
 .metric-tip { font-size: 11px; color: #a8abb2; margin-top: 2px; }
+/* 信用评分排行 */
+.grade-优秀 { color: #67c23a; font-weight: 700; }
+.grade-良好 { color: #409eff; font-weight: 700; }
+.grade-一般 { color: #e6a23c; font-weight: 700; }
+.grade-警示 { color: #f56c6c; font-weight: 700; }
+.deduct-count { color: #f56c6c; font-weight: 600; }
+.muted { color: #c0c4cc; }
 </style>

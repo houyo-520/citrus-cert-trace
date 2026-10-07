@@ -9,9 +9,9 @@
       <el-menu
         :default-active="activeMenu"
         router
-        background-color="#1f2d3d"
-        text-color="#c0c4cc"
-        active-text-color="#ffd04b"
+        background-color="#0a2b1d"
+        text-color="#cfe3d8"
+        active-text-color="#ffb98a"
       >
         <!-- 菜单按角色渲染：menus 已按当前角色过滤 -->
         <el-menu-item v-for="m in menus" :key="m.path" :index="m.path">
@@ -30,8 +30,8 @@
           <span>柑橘合格证追溯</span>
         </div>
         <el-menu :default-active="activeMenu" router
-                 background-color="#1f2d3d" text-color="#c0c4cc"
-                 active-text-color="#ffd04b" @select="drawerOpen = false">
+                 background-color="#0a2b1d" text-color="#cfe3d8"
+                 active-text-color="#ffb98a" @select="drawerOpen = false">
           <el-menu-item v-for="m in menus" :key="m.path" :index="m.path">
             <el-icon><component :is="m.icon" /></el-icon>
             <span>{{ m.label }}</span>
@@ -194,6 +194,7 @@ const ALL_MENUS = [
   { path: '/supply', label: '产销对接', icon: 'ShoppingCart', roles: [] },
   { path: '/intent', label: '产销意向单', icon: 'Connection', roles: [] },
   { path: '/log', label: '操作日志', icon: 'Tickets', roles: [] },
+  { path: '/login-monitor', label: '登录监控', icon: 'Monitor', roles: ['admin'] },
   { path: '/roles', label: '权限说明', icon: 'Key', roles: [] }
 ]
 
@@ -226,7 +227,7 @@ const onCommand = async (cmd) => {
 <style scoped>
 .layout { height: 100%; }
 .aside {
-  background: #1f2d3d;
+  background: #0a2b1d;
   overflow-x: hidden;
 }
 .logo {
@@ -241,6 +242,13 @@ const onCommand = async (cmd) => {
   border-bottom: 1px solid rgba(255,255,255,0.08);
 }
 .aside :deep(.el-menu) { border-right: none; }
+/* 选中的菜单项：深绿底上叠一层橙色半透明底，突出当前页 */
+.aside :deep(.el-menu-item.is-active) {
+  background: rgba(232, 116, 59, 0.18);
+}
+.aside :deep(.el-menu-item:hover) {
+  background: rgba(255, 255, 255, 0.06);
+}
 .header {
   background: #fff;
   display: flex;

@@ -125,11 +125,18 @@
 
         <!-- 识别结果：必须人工确认（识别是概率性的，结论认错后果严重） -->
         <el-form-item v-if="ocrResult" label="识别结果">
-          <div class="ocr-result" :class="`cf-${ocrResult.confidence}`">
+          <div class="ocr-result"
+               :class="[`cf-${ocrResult.confidence}`, { 'cf-below': lowConf(ocrResult) }]">
             <div class="ocr-rhead">
               <el-tag size="small"
                       :type="ocrConfTag(ocrResult.confidence)" effect="dark">
                 置信度 {{ confText(ocrResult.confidence) }}
+                <template v-if="typeof ocrResult.confidence_score === 'number'">
+                  · {{ ocrResult.confidence_score }}%
+                </template>
+              </el-tag>
+              <el-tag v-if="lowConf(ocrResult)" size="small" type="danger" effect="plain">
+                低于 70%，请重点人工核对
               </el-tag>
               <el-tag size="small" type="info" effect="plain">
                 {{ methodText(ocrResult.method) }}
@@ -226,6 +233,10 @@ const FIELD_LABELS = {
 const fieldLabel = (k) => FIELD_LABELS[k] || k
 const confText = (c) => ({ high: '高', medium: '中', low: '低' }[c] || c)
 const ocrConfTag = (c) => ({ high: 'success', medium: 'warning', low: 'danger' }[c] || 'info')
+// ★ 数值置信度（后端派生 0~100），用于 <70% 显式警示
+const confScore = (r) => (r && typeof r.confidence_score === 'number')
+  ? r.confidence_score : 0
+const lowConf = (r) => !r || !r.ok || confScore(r) < 70
 const methodText = (m) => ({
   'pdf-text': 'PDF 文本层提取', 'ocr-pdf': '扫描件 OCR',
   'ocr-image': '图片 OCR'
@@ -416,6 +427,15 @@ onMounted(() => { load(); loadBatches() })
 /* 置信度低时改成红色警示边框：让用户下意识多核对一遍 */
 .ocr-result.cf-low { border-left-color: #f56c6c; background: #fef8f8; }
 .ocr-result.cf-high { border-left-color: #67c23a; background: #f8fdf6; }
+/* ★ <70% 显式强调：加红框 + 顶部的警示条更醒目（比仅 cf-low 更突出） */
+.ocr-result.cf-below {
+  border-color: #f56c6c;
+  border-left-width: 4px;
+  background: #fff5f5;
+}
+.ocr-result.cf-below .ocr-fields .ocr-chip {
+  color: #c0392b; background: #fdecea; border-color: #f5c6c6;
+}
 
 .ocr-rhead { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .ocr-filled { font-size: 12px; color: var(--el-text-color-secondary); }

@@ -42,11 +42,6 @@
         </div>
       </div>
     </div>
-
-    <!-- 备案号：悬挂于登录页底部，链接至工信部备案官网 -->
-    <div class="beian">
-      <BeianFooter />
-    </div>
   </div>
 </template>
 
@@ -55,7 +50,6 @@ import { ref, reactive } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { useUserStore } from '@/store/user'
-import BeianFooter from '@/components/BeianFooter.vue'
 
 const router = useRouter()
 const userStore = useUserStore()
@@ -134,17 +128,4 @@ const onSubmit = async () => {
 .login-right { flex: 1; padding: 44px 40px; display: flex; flex-direction: column; justify-content: center; }
 .login-right h2 { font-size: 18px; margin: 0 0 22px; text-align: center; }
 .verify-entry { margin-top: 16px; text-align: center; }
-
-/* 备案号：覆盖照片背景底部，浅色文字需置于遮罩上方 */
-.beian {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  z-index: 1;
-  padding: 14px 0 16px;
-  text-align: center;
-}
-.beian :deep(a) { color: rgba(255, 255, 255, 0.75); }
-.beian :deep(a:hover) { color: #fff; }
 </style>

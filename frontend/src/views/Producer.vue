@@ -25,6 +25,16 @@
           </el-tag>
         </template>
       </el-table-column>
+      <!-- ★ 主体信用评分：监管快速识别高风险主体，点击查看扣分明细 -->
+      <el-table-column v-if="userStore.perms.can_audit" label="信用评分" width="130">
+        <template #default="{ row }">
+          <el-tag v-if="row.credit_grade" :type="creditTagType(row.credit_grade)"
+                  size="small" effect="light" @click="showCredit(row)">
+            {{ row.credit_grade }} {{ row.credit_score }}
+          </el-tag>
+          <span v-else class="muted">—</span>
+        </template>
+      </el-table-column>
       <el-table-column label="操作" width="220" fixed="right">
         <template #default="{ row }">
           <el-button v-if="userStore.perms.can_write_production" link type="primary"
@@ -76,13 +86,43 @@
         <el-button type="primary" @click="save">保存</el-button>
       </template>
     </el-dialog>
+
+    <!-- ★ 信用评分明细（负向扣分制，逐条可回溯） -->
+    <el-dialog v-model="creditVisible" :title="`信用评分 - ${creditData.producer_name || ''}`" width="620px">
+      <div v-if="creditLoading" v-loading="creditLoading" style="min-height:120px" />
+      <template v-else>
+        <div class="credit-head">
+          <div class="credit-score" :class="'grade-' + creditData.grade">
+            <span class="num">{{ creditData.score }}</span>
+            <span class="label">/ 100 · {{ creditData.grade }}</span>
+          </div>
+          <div class="credit-stats">
+            <div>作废证 {{ creditData.stats?.revoked_certificates ?? 0 }}</div>
+            <div>检查不合格 {{ creditData.stats?.unqualified_inspections ?? 0 }}</div>
+            <div>整改逾期 {{ creditData.stats?.overdue_rectifies ?? 0 }}</div>
+            <div>不合格报告 {{ creditData.stats?.unqualified_reports ?? 0 }}</div>
+          </div>
+        </div>
+        <el-divider content-position="left">扣分明细</el-divider>
+        <el-table :data="creditData.deductions" size="small" border>
+          <el-table-column prop="item" label="扣分项" min-width="120" />
+          <el-table-column prop="points" label="分值" width="90">
+            <template #default="{ row }">
+              <span class="deduct">{{ row.points }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column prop="ref" label="依据" min-width="120" />
+        </el-table>
+        <el-empty v-if="!creditData.deductions?.length" description="无扣分项，信用良好" :image-size="60" />
+      </template>
+    </el-dialog>
   </el-card>
 </template>
 
 <script setup>
 import { ref, onMounted, reactive } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { listProducer, createProducer, updateProducer, deleteProducer, auditProducer } from '@/api'
+import { listProducer, createProducer, updateProducer, deleteProducer, auditProducer, getProducerCredit } from '@/api'
 import { useUserStore } from '@/store/user'
 
 const userStore = useUserStore()
@@ -96,7 +136,25 @@ const loading = ref(false)
 const dialogVisible = ref(false)
 const form = reactive({})
 
+// ★ 信用评分弹窗
+const creditVisible = ref(false)
+const creditLoading = ref(false)
+const creditData = reactive({ score: 0, grade: '', deductions: [], stats: {} })
+
 const statusType = (s) => ({ pending: 'warning', approved: 'success', rejected: 'danger' }[s] || 'info')
+
+const creditTagType = (g) => ({ 优秀: 'success', 良好: 'primary', 一般: 'warning', 警示: 'danger' }[g] || 'info')
+
+const showCredit = async (row) => {
+  creditVisible.value = true
+  creditLoading.value = true
+  try {
+    const res = await getProducerCredit(row.id)
+    Object.assign(creditData, res.data || {})
+  } finally {
+    creditLoading.value = false
+  }
+}
 
 const load = async () => {
   loading.value = true
@@ -150,4 +208,15 @@ onMounted(load)
 
 <style scoped>
 .toolbar { display: flex; gap: 10px; margin-bottom: 14px; }
+.muted { color: #c0c4cc; }
+.credit-head { display: flex; gap: 24px; align-items: center; margin-bottom: 8px; }
+.credit-score { display: flex; align-items: baseline; gap: 6px; }
+.credit-score .num { font-size: 36px; font-weight: 700; }
+.credit-score .label { color: #909399; }
+.credit-score.grade-优秀 .num { color: #67c23a; }
+.credit-score.grade-良好 .num { color: #409eff; }
+.credit-score.grade-一般 .num { color: #e6a23c; }
+.credit-score.grade-警示 .num { color: #f56c6c; }
+.credit-stats { display: flex; flex-wrap: wrap; gap: 12px; color: #606266; font-size: 13px; }
+.deduct { color: #f56c6c; font-weight: 600; }
 </style>

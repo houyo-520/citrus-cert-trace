@@ -575,7 +575,7 @@ onMounted(() => { load(); loadRefs() })
   font-size: 26px;
   font-weight: 700;
   letter-spacing: 2px;
-  color: #409eff;
+  color: #E8743B;
   margin-bottom: 16px;
 }
 .segments {

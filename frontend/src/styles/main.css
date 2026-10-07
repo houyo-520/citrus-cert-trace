@@ -1,3 +1,26 @@
+/* ============================================================
+   柑橘橙主题（覆盖 Element Plus 默认蓝 #409EFF）
+   ------------------------------------------------------------
+   设计思路：不用「逐页改颜色」这种会漏的活，而是在全局通过 CSS
+   变量覆盖 EP 的语义色。主色从“大众脸默认蓝”换成柑橘橙，形成
+   与通用后台模板（含 ncp 等开源项目）的辨识度区分。
+
+   回退方式：删掉下面这个 :root 块 + 侧栏色还原，即回到默认蓝。
+
+   色板（柑橘橙，主色 #E8743B）：
+   - light-3/5/7/9 用于 hover、边框、浅底
+   - dark-2 用于按下态
+   ============================================================ */
+:root {
+  --el-color-primary: #E8743B;
+  --el-color-primary-light-3: #ED925F;
+  --el-color-primary-light-5: #F3B08A;
+  --el-color-primary-light-7: #F8CFB5;
+  --el-color-primary-light-8: #FADDCB;
+  --el-color-primary-light-9: #FDEEE3;
+  --el-color-primary-dark-2: #C85A25;
+}
+
 * {
   box-sizing: border-box;
 }

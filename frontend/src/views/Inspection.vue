@@ -222,8 +222,8 @@
         <el-alert v-if="form.check_result === 'unqualified'" type="warning"
                   :closable="false" show-icon class="tip">
           <template #title>
-            判定不合格后，关联合格证将自动置为「暂停使用」（不是作废，复查合格可恢复），
-            并生成一条监督检查存证上链 —— 事后任何一方都无法否认当时的判定。
+            判定不合格后，关联合格证将自动置为「暂停使用」（不是作废），并生成一条监督检查存证上链 ——
+            事后任何一方都无法否认当时的判定。整改复查通过后，原批次合格证将作废（终态），需重新申领新批次。
           </template>
         </el-alert>
 
@@ -302,7 +302,7 @@
       <el-form :model="rectifyForm" label-width="100px" size="small">
         <el-form-item label="复查结论" required>
           <el-radio-group v-model="rectifyForm.result">
-            <el-radio-button label="done">已整改（恢复合格证）</el-radio-button>
+            <el-radio-button label="done">已整改（原证作废）</el-radio-button>
             <el-radio-button label="ongoing">整改中</el-radio-button>
             <el-radio-button label="recheck_failed">复查仍不合格</el-radio-button>
           </el-radio-group>

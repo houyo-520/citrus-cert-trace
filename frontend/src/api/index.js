@@ -11,6 +11,8 @@ export const updateProducer = (id, data) => request.put(`/producer/${id}/`, data
 export const deleteProducer = (id) => request.delete(`/producer/${id}/`)
 export const auditProducer = (id, audit_status) =>
   request.post(`/producer/${id}/audit/`, { audit_status })
+// ★ 主体信用评分（返回 score/grade/deductions/stats）
+export const getProducerCredit = (id) => request.get(`/producer/${id}/credit/`)
 
 // ---- 生产批次 ----
 export const listBatch = (params) => request.get('/batch/', { params })
@@ -114,6 +116,10 @@ export const deleteIntent = (id) => request.delete(`/intent/${id}/`)
 
 // ---- 操作日志 ----
 export const listLog = (params) => request.get('/log/', { params })
+
+// ---- 登录监控（系统管理员专属）----
+export const listLoginMonitor = (params) => request.get('/login-monitor/', { params })
+export const loginMonitorSummary = () => request.get('/login-monitor/summary/')
 
 // ---- 权限矩阵 ----
 export const getRoleMatrix = () => request.get('/role-matrix/')

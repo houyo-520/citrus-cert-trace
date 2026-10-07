@@ -168,14 +168,14 @@ onMounted(load)
   justify-content: space-between;
   font-weight: 600;
 }
-.txt-hl { color: #409EFF; font-weight: 600; }
+.txt-hl { color: #E8743B; font-weight: 600; }
 .mono { font-family: Consolas, Monaco, monospace; }
 .rule-box { padding: 4px 0; }
 .rule-example {
   font-size: 24px;
   font-weight: 700;
   letter-spacing: 3px;
-  color: #409eff;
+  color: #E8743B;
   text-align: center;
   margin-bottom: 16px;
 }

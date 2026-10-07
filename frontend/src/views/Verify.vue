@@ -21,8 +21,13 @@
     </div>
 
     <div v-if="result" class="verify-result">
+      <!-- ★ 动态防伪水印：铺在结果区底层，截图泄露可溯源 -->
+      <div v-if="result.watermark" class="watermark-layer" aria-hidden="true">
+        <span v-for="i in 6" :key="i" class="wm-text">{{ result.watermark }}</span>
+      </div>
+
       <!-- ===== 验真结论：放最顶部，一眼可见 ===== -->
-      <div class="verdict" :class="result.trusted ? 'ok' : 'bad'">
+      <div class="verdict" :class="result.revoked ? 'revoked' : (result.trusted ? 'ok' : 'bad')">
         <div class="verdict-icon">
           <el-icon :size="34">
             <component :is="result.trusted ? 'CircleCheckFilled' : 'CircleCloseFilled'" />
@@ -30,7 +35,7 @@
         </div>
         <div class="verdict-text">
           <div class="verdict-title">
-            {{ result.trusted ? '验真通过 · 数据可信' : '验真失败 · 数据不可信' }}
+            {{ result.revoked ? '该合格证已作废 · 不可流通' : (result.trusted ? '验真通过 · 数据可信' : '验真失败 · 数据不可信') }}
           </div>
           <div class="verdict-sub">{{ result.verify_message }}</div>
         </div>
@@ -212,7 +217,6 @@
 
     <div class="verify-footer">
       <el-button link @click="$router.push('/login')">后台管理登录 →</el-button>
-      <BeianFooter />
     </div>
   </div>
 </template>
@@ -221,7 +225,6 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { publicVerify } from '@/api'
-import BeianFooter from '@/components/BeianFooter.vue'
 
 const route = useRoute()
 const certNo = ref(route.params.certNo || '')
@@ -294,7 +297,22 @@ onUnmounted(() => { mq?.removeEventListener('change', onMq) })
 .verify-search { display: flex; gap: 12px; }
 .quick-tips { margin-top: 12px; display: flex; align-items: center; gap: 8px; }
 .sample { cursor: pointer; }
-.verify-result { margin-top: 24px; }
+.verify-result { margin-top: 24px; position: relative; }
+
+/* ===== 动态防伪水印层：半透明铺底，不干扰阅读，截图可溯源 ===== */
+.watermark-layer {
+  position: absolute; inset: 0; overflow: hidden;
+  pointer-events: none; user-select: none; z-index: 0;
+  display: flex; flex-direction: column; justify-content: space-around;
+  padding: 20px 0;
+}
+.wm-text {
+  font-size: 13px; color: #909399; opacity: 0.10;
+  transform: rotate(-18deg); white-space: nowrap;
+  text-align: center; letter-spacing: 2px; padding: 12px 0;
+}
+/* 让结果区内容浮在水印之上，保证可读 */
+.verify-result > *:not(.watermark-layer) { position: relative; z-index: 1; }
 
 /* ===== 验真结论（顶部大色块，一眼可见）===== */
 .verdict {
@@ -304,6 +322,7 @@ onUnmounted(() => { mq?.removeEventListener('change', onMq) })
 }
 .verdict.ok { background: linear-gradient(135deg, #3f9d5c, #2d7d46); }
 .verdict.bad { background: linear-gradient(135deg, #e05b5b, #c33c3c); }
+.verdict.revoked { background: linear-gradient(135deg, #8c7a3c, #6b5c28); }
 .verdict-icon { flex: 0 0 auto; display: flex; }
 .verdict-title { font-size: 19px; font-weight: 700; letter-spacing: 0.5px; }
 .verdict-sub { font-size: 13px; opacity: 0.92; margin-top: 4px; }
@@ -347,7 +366,7 @@ onUnmounted(() => { mq?.removeEventListener('change', onMq) })
 
 /* 节点状态配色：让"哪一环出问题"一眼可见 */
 .lv-success .tl-dot { background: #f0f9eb; color: #67c23a; border-color: #b3e19d; }
-.lv-info .tl-dot { background: #ecf5ff; color: #409eff; border-color: #a0cfff; }
+.lv-info .tl-dot { background: #FDEEE3; color: #E8743B; border-color: #F3B08A; }
 .lv-warning .tl-dot { background: #fdf6ec; color: #e6a23c; border-color: #f3d19e; }
 .lv-danger .tl-dot { background: #fef0f0; color: #f56c6c; border-color: #fab6b6; }
 .lv-success .tl-line { background: #b3e19d; }

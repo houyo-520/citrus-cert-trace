@@ -86,6 +86,12 @@ const routes = [
         meta: { title: '操作日志' }
       },
       {
+        path: 'login-monitor',
+        name: 'LoginMonitor',
+        component: () => import('@/views/LoginMonitor.vue'),
+        meta: { title: '登录监控', roles: ['admin'] }
+      },
+      {
         path: 'roles',
         name: 'RoleMatrix',
         component: () => import('@/views/RoleMatrix.vue'),
