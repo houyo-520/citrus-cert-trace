@@ -66,11 +66,23 @@ def _node(key, title, icon, time_text, desc, detail=None, done=True,
     }
 
 
-def _anchor_of(biz_type: str, biz_id: int):
-    """取某业务对象的存证信息（用于在节点上显示链上交易）。"""
-    rec = (EvidenceRecord.objects
-           .filter(biz_type=biz_type, biz_id=biz_id)
-           .order_by("-id").first())
+def _anchor_of(biz_type: str, biz_id: int, cache=None):
+    """
+    取某业务对象的当前存证信息（用于在节点上显示链上交易）。
+
+    ★ 性能（M11）：接受可选 cache（{(biz_type, biz_id): rec}）。
+    公众验真接口是 AllowAny，每次扫码若对每个节点各查一次存证（4+ 次），
+    再叠加检查/统计查询，单次 15-20 条 SQL。build_timeline 预先一次性把
+    需要的存证取进 cache，这里命中就零查询。
+    """
+    rec = None
+    if cache is not None:
+        rec = cache.get((biz_type, biz_id))
+    if rec is None:
+        # ★ 只取当前版本（B3 追加式版本），避免取到历史归档版本
+        rec = (EvidenceRecord.objects
+               .filter(biz_type=biz_type, biz_id=biz_id, is_current=True)
+               .order_by("-version").first())
     if not rec:
         return None
     return {
@@ -80,6 +92,38 @@ def _anchor_of(biz_type: str, biz_id: int):
         "chain_status": rec.chain_status,
         "anchored": bool(rec.tx_hash and rec.tx_hash.startswith("0x")),
     }
+
+
+def _prefetch_anchors(cert, batch, report):
+    """
+    一次性取回本证相关对象的当前存证，返回 {(biz_type, biz_id): rec}。
+
+    ★ M11：公众验真接口是 AllowAny，逐节点查询会让单次扫码打出 15-20 条 SQL。
+    这里合并成 1~2 条查询；失败时返回空 dict，_anchor_of 会退回逐条查询（不影响正确性）。
+    """
+    cache = {}
+    try:
+        conds = []
+        if batch:
+            conds.append((EvidenceRecord.BizType.BATCH, batch.id))
+        if report:
+            conds.append((EvidenceRecord.BizType.REPORT, report.id))
+        conds.append((EvidenceRecord.BizType.CERTIFICATE, cert.id))
+        # 用 (biz_type, biz_id) 的 OR 组合，单条查询取回
+        from django.db.models import Q
+        q = Q()
+        for bt, bid in conds:
+            q |= Q(biz_type=bt, biz_id=bid)
+        # 该证相关检查记录的存证（可能多条）
+        insp_ids = list(cert.inspections.values_list("id", flat=True)[:20])
+        if insp_ids:
+            q |= Q(biz_type=EvidenceRecord.BizType.INSPECTION,
+                   biz_id__in=insp_ids)
+        for rec in EvidenceRecord.objects.filter(q, is_current=True):
+            cache[(rec.biz_type, rec.biz_id)] = rec
+    except Exception:  # noqa: BLE001 预取失败不应影响主流程
+        return {}
+    return cache
 
 
 def build_timeline(cert: Certificate) -> dict:
@@ -92,6 +136,9 @@ def build_timeline(cert: Certificate) -> dict:
     batch = cert.batch if cert.batch_id else None
     producer = batch.producer if (batch and batch.producer_id) else None
     report = cert.report if cert.report_id else None
+
+    # ★ 一次性预取本证相关的当前存证（M11：消除逐节点的查询）。
+    anchor_cache = _prefetch_anchors(cert, batch, report)
 
     # ---- ① 主体备案 ----
     if producer:
@@ -123,7 +170,7 @@ def build_timeline(cert: Certificate) -> dict:
                 ("种植面积", f"{batch.plant_area_mu} 亩"),
                 ("批次重量", f"{batch.weight_kg} kg"),
             ],
-            anchor=_anchor_of(EvidenceRecord.BizType.BATCH, batch.id),
+            anchor=_anchor_of(EvidenceRecord.BizType.BATCH, batch.id, anchor_cache),
         ))
 
     # ---- ③ 农事记录（有内容才出现）----
@@ -151,7 +198,7 @@ def build_timeline(cert: Certificate) -> dict:
                 ("检测结论", report.get_conclusion_display()),
             ],
             level="success" if good else "danger",
-            anchor=_anchor_of(EvidenceRecord.BizType.REPORT, report.id),
+            anchor=_anchor_of(EvidenceRecord.BizType.REPORT, report.id, anchor_cache),
         ))
 
     # ---- ⑤ 签发上链（核心节点）----
@@ -169,7 +216,7 @@ def build_timeline(cert: Certificate) -> dict:
                 ("存证时间", _dt(cert.anchored_at, "%Y-%m-%d") or "—"),
             ],
             level="success" if cert.status == Certificate.Status.ISSUED else "warning",
-            anchor=_anchor_of(EvidenceRecord.BizType.CERTIFICATE, cert.id),
+            anchor=_anchor_of(EvidenceRecord.BizType.CERTIFICATE, cert.id, anchor_cache),
         ))
 
     # ---- ⑥ 流通（产销对接）----
@@ -220,7 +267,7 @@ def build_timeline(cert: Certificate) -> dict:
             + (f"，{ins.get_rectify_status_display()}" if ins.rectify_deadline else ""),
             detail,
             level="danger" if bad else "success",
-            anchor=_anchor_of(EvidenceRecord.BizType.INSPECTION, ins.id),
+            anchor=_anchor_of(EvidenceRecord.BizType.INSPECTION, ins.id, anchor_cache),
         ))
 
     # ---- 当前状态收尾 ----

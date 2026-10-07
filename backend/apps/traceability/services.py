@@ -96,49 +96,66 @@ def _save_record(biz_type: str, biz_id: int, biz_no: str, digest: str,
     """
     把上链结果写入存证记录（含链上交易哈希与区块高度）。
 
-    ★ 存证不可变性（原 M3 修复）：
-      原实现用 update_or_create 无条件覆盖旧记录，导致「改数据 → 重新 anchor」
-      就能把 data_hash/tx_hash 刷成新值，双层校验重新自洽 —— 防篡改窗口被压缩到
-      「篡改后、重存证前」。这违背存证的初衷。
-      现在改为：
-        - 首次存证：正常创建；
-        - 已存在且摘要**一致**：只补齐链上信息（如之前是 mock，这次真上链了）；
-        - 已存在但摘要**不一致**：**保留原始 data_hash 不动**（存证一经写下即固化），
-          只更新链上交易信息（代表「对该对象又发生了一次上链动作」），
-          使本地比对能持续如实反映「当前数据 ≠ 最初存证摘要」。
-    """
-    existing = EvidenceRecord.objects.filter(
-        biz_type=biz_type, biz_id=biz_id).first()
+    ★ 追加式版本（B3 修复：替代早期的「冻结原摘要」语义）：
 
+    背景 —— 合约是**单值槽**（`records[bizType][bizNo]` 重复上链会覆盖），
+    所以链上永远只有「最新一次」的摘要。早期「摘要分歧就冻结本地 hash」的做法
+    会与链上分叉：本地存旧、链上存新 → 公众验真页每张重存证过的证都变红，
+    且 rehash_all（加盐迁移的唯一用途）整条路被堵死。
+
+    现在改为**追加式版本**：
+      - 首次存证：version=1, is_current=True；
+      - 摘要相同：在原行上补齐链上信息（如 mock → 真上链）；
+      - 摘要不同（重存证 / 加盐迁移）：把原行 is_current=False 归档，
+        **追加**一条 version+1, is_current=True 的新行。
+    这样：① 历史版本全部留痕（可展示「摘要演进：旧→新」）；
+          ② 当前比对以 is_current 为准，与链上单槽天然一致；
+          ③ 防篡改与「合法重存证/换盐迁移」不再互斥。
+    """
     chain_ok = "success" if result.get("ok") else result.get("mode", "mock")
-    if existing is None:
+
+    current = EvidenceRecord.objects.filter(
+        biz_type=biz_type, biz_id=biz_id, is_current=True).first()
+
+    # 1) 首次存证
+    if current is None:
+        # 兼容历史数据：若存在但都被标为非 current，取最大版本续号
+        last_ver = (EvidenceRecord.objects
+                    .filter(biz_type=biz_type, biz_id=biz_id)
+                    .order_by("-version")
+                    .values_list("version", flat=True)
+                    .first()) or 0
         return EvidenceRecord.objects.create(
             biz_type=biz_type, biz_id=biz_id, biz_no=biz_no,
             data_hash=digest, payload=payload,
+            version=last_ver + 1, is_current=True,
             tx_hash=result.get("tx_hash", ""),
             block_height=result.get("block_height", 0),
             chain_status=chain_ok,
         )
 
-    # 已存在：摘要不变才允许「补齐链上信息」；摘要变了则冻结原摘要
-    if existing.data_hash == digest:
-        existing.biz_no = biz_no or existing.biz_no
-        existing.payload = payload
+    # 2) 摘要一致：在原行补齐链上信息即可（不新增版本）
+    if current.data_hash == digest:
+        current.biz_no = biz_no or current.biz_no
+        current.payload = payload
         if result.get("ok"):
-            existing.tx_hash = result.get("tx_hash", existing.tx_hash)
-            existing.block_height = result.get("block_height", existing.block_height)
-            existing.chain_status = chain_ok
-        existing.save()
-    else:
-        # ★ 摘要分歧：原存证摘要必须保留（这是防篡改的锚点）。
-        #   仅当本次真上链成功时，刷新链上锚点信息，供链上核验比对。
-        if result.get("ok"):
-            existing.tx_hash = result.get("tx_hash", existing.tx_hash)
-            existing.block_height = result.get("block_height", existing.block_height)
-            existing.chain_status = chain_ok
-            existing.save(update_fields=["tx_hash", "block_height",
-                                         "chain_status", "updated_at"])
-    return existing
+            current.tx_hash = result.get("tx_hash", current.tx_hash)
+            current.block_height = result.get("block_height", current.block_height)
+            current.chain_status = chain_ok
+        current.save()
+        return current
+
+    # 3) 摘要不同：归档旧版本，追加新版本
+    current.is_current = False
+    current.save(update_fields=["is_current", "updated_at"])
+    return EvidenceRecord.objects.create(
+        biz_type=biz_type, biz_id=biz_id, biz_no=biz_no,
+        data_hash=digest, payload=payload,
+        version=current.version + 1, is_current=True,
+        tx_hash=result.get("tx_hash", ""),
+        block_height=result.get("block_height", 0),
+        chain_status=chain_ok,
+    )
 
 
 def anchor_certificate(cert: Certificate) -> EvidenceRecord:
@@ -352,8 +369,10 @@ def verify_certificate(cert: Certificate, check_chain: bool = False) -> dict:
     返回 {trusted, current_hash, stored_hash, message, chain_verified, chain_detail}
     """
     current = compute_certificate_hash(cert)
+    # ★ 取「当前版本」记录（B3 追加式版本）：历史版本 is_current=False，不参与比对
     record = EvidenceRecord.objects.filter(
-        biz_type=EvidenceRecord.BizType.CERTIFICATE, biz_id=cert.id
+        biz_type=EvidenceRecord.BizType.CERTIFICATE, biz_id=cert.id,
+        is_current=True
     ).first()
     stored = record.data_hash if record else ""
     local_trusted = bool(stored) and (current == stored)

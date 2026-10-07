@@ -71,8 +71,9 @@ def build_certificate_merkle_root(cert) -> str:
         (EvidenceRecord.BizType.REPORT, cert.report_id),
         (EvidenceRecord.BizType.CERTIFICATE, cert.id),
     ):
+        # ★ 只取当前版本（B3 追加式版本）：历史版本是归档留痕，不参与证据树汇聚
         rec = EvidenceRecord.objects.filter(
-            biz_type=biz_type, biz_id=obj_id).first()
+            biz_type=biz_type, biz_id=obj_id, is_current=True).first()
         if rec and rec.data_hash:
             leaves.append(rec.data_hash)
 

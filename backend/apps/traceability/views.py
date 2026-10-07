@@ -1267,7 +1267,7 @@ class SupplyDemandViewSet(RoleScopedQuerySetMixin, BaseViewSet):
 class MatchIntentViewSet(RoleScopedQuerySetMixin, viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
     queryset = MatchIntent.objects.select_related(
-        "supply", "initiator").all()
+        "supply", "counterpart", "initiator").all()
     serializer_class = MatchIntentSerializer
 
     def scope_queryset(self, qs, user):
@@ -1283,6 +1283,22 @@ class MatchIntentViewSet(RoleScopedQuerySetMixin, viewsets.ModelViewSet):
         if status_:
             qs = qs.filter(status=status_)
         return qs
+
+    # ★ D 残留修复：意向单不由通用 CRUD 创建/删除 ——
+    #   创建走 supply/{id}/intent/（后端写入 supply/counterpart + 打分），
+    #   这里只保留读 + respond 动作，避免绕过归属校验直接 POST/DELETE 意向。
+    def create(self, request, *args, **kwargs):
+        return Response({"code": 405,
+                         "message": "请通过供需单的「发起对接」创建意向"},
+                        status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    def destroy(self, request, *args, **kwargs):
+        return Response({"code": 405, "message": "意向单不允许直接删除"},
+                        status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    def update(self, request, *args, **kwargs):
+        return Response({"code": 405, "message": "请使用「回应」更新意向状态"},
+                        status=status.HTTP_405_METHOD_NOT_ALLOWED)
 
     @action(detail=True, methods=["post"])
     def respond(self, request, pk=None):

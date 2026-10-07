@@ -2781,35 +2781,69 @@ class SecurityHardeningTest(BaseFixture):
         draft.refresh_from_db()
         self.assertNotEqual(draft.status, Certificate.Status.REVOKED)
 
-    # ---- M3：存证摘要不可被覆盖（防「改数据后重新 anchor」洗白）----
-    def test_evidence_hash_not_overwritten_on_reanchor(self):
-        """篡改数据后重新存证，原始 data_hash 必须保持不变（防篡改锚点）。"""
+    # ---- M3/B3：存证改追加式版本（防篡改锚点 = 历史版本留痕）----
+    def test_evidence_reanchor_appends_version_keeping_history(self):
+        """
+        重存证应为**追加新版本**而非覆盖：旧版本归档保留，当前版本=新摘要。
+        这样「改数据 → 重存证」后，历史版本仍留痕（可回溯），且验真按当前版本比对。
+        """
         services.anchor_certificate(self.cert)
-        original = EvidenceRecord.objects.get(
-            biz_type=EvidenceRecord.BizType.CERTIFICATE, biz_id=self.cert.id).data_hash
+        v1 = EvidenceRecord.objects.get(
+            biz_type=EvidenceRecord.BizType.CERTIFICATE, biz_id=self.cert.id,
+            is_current=True)
+        self.assertEqual(v1.version, 1)
+        original_hash = v1.data_hash
+
         # 篡改业务数据后重新存证
         Certificate.objects.filter(id=self.cert.id).update(
             quantity_kg=Decimal("1.00"))
         self.cert.refresh_from_db()
         services.anchor_certificate(self.cert)
-        after = EvidenceRecord.objects.get(
-            biz_type=EvidenceRecord.BizType.CERTIFICATE, biz_id=self.cert.id).data_hash
-        self.assertEqual(original, after,
-                         "重新存证不得覆盖原始存证摘要（否则防篡改失效）")
-        # 且此时验真应仍判不可信
+
+        rows = EvidenceRecord.objects.filter(
+            biz_type=EvidenceRecord.BizType.CERTIFICATE, biz_id=self.cert.id)
+        self.assertEqual(rows.count(), 2, "重存证应追加一条新版本（历史保留）")
+        v1.refresh_from_db()
+        self.assertFalse(v1.is_current, "旧版本应被归档（is_current=False）")
+        self.assertEqual(v1.data_hash, original_hash, "旧版本摘要不得被改写")
+        cur = rows.get(is_current=True)
+        self.assertEqual(cur.version, 2)
+        # 当前版本 = 篡改后重算的哈希；验真按当前版本比对 → 一致（数据与当前存证自洽）
+        self.assertEqual(cur.data_hash, services.compute_certificate_hash(self.cert))
+
+    def test_evidence_reanchor_same_digest_no_new_version(self):
+        """摘要未变时重存证不应产生新版本（只补齐链上信息）。"""
+        services.anchor_certificate(self.cert)
+        services.anchor_certificate(self.cert)  # 数据没变
+        rows = EvidenceRecord.objects.filter(
+            biz_type=EvidenceRecord.BizType.CERTIFICATE, biz_id=self.cert.id)
+        self.assertEqual(rows.count(), 1, "摘要一致时不应新增版本")
+        self.assertEqual(rows.get(is_current=True).version, 1)
+
+    def test_tampered_data_verify_false_against_current(self):
+        """篡改数据但**不**重存证 → 当前版本摘要与重算不符 → 验真判不可信。"""
+        services.anchor_certificate(self.cert)
+        Certificate.objects.filter(id=self.cert.id).update(
+            quantity_kg=Decimal("999.00"))
+        self.cert.refresh_from_db()
         result = services.verify_certificate(self.cert)
-        self.assertFalse(result["trusted"], "篡改后验真必须判不可信")
+        self.assertFalse(result["trusted"], "篡改未重存证时验真必须判不可信")
 
     # ---- M5：降级（mock）存证不做链上核验 ----
     def test_mock_evidence_skips_chain_check(self):
         """mock 存证不应触发链上核验（chain_status != success）。"""
         services.anchor_certificate(self.cert)
         rec = EvidenceRecord.objects.get(
-            biz_type=EvidenceRecord.BizType.CERTIFICATE, biz_id=self.cert.id)
+            biz_type=EvidenceRecord.BizType.CERTIFICATE, biz_id=self.cert.id,
+            is_current=True)
         if rec.chain_status != "success":
             result = services.verify_certificate(self.cert, check_chain=True)
             self.assertFalse(result["chain_verified"])
             self.assertIn("降级", result["chain_detail"])
+        else:
+            # 链可用时应真的比对（避免「条件断言等于没测」）
+            result = services.verify_certificate(self.cert, check_chain=True)
+            self.assertTrue(result["chain_detail"])
 
     # ---- M10：C3 /media 需登录 ----
     def test_media_requires_authentication(self):
@@ -2819,23 +2853,36 @@ class SecurityHardeningTest(BaseFixture):
         self.assertEqual(r.status_code, 401,
                          "匿名访问 /media/ 必须被拒（原为匿名可下载）")
 
-    # ---- M6：IP 取信不应无条件取 XFF 第一段 ----
-    def test_client_ip_prefers_real_ip(self):
-        """get_client_ip 应优先 X-Real-IP，忽略可伪造的 XFF 第一段。"""
-        from .audit import get_client_ip
+    # ---- B4/M6：IP 取信受可信代理白名单约束 ----
+    def test_client_ip_prefers_real_ip_behind_trusted_proxy(self):
+        """REMOTE_ADDR 是可信代理时，优先 X-Real-IP。"""
+        from apps.accounts.netutil import get_client_ip
         from django.test import RequestFactory
         rf = RequestFactory()
-        req = rf.get("/", HTTP_X_FORWARDED_FOR="1.2.3.4, 10.0.0.1",
+        req = rf.get("/", REMOTE_ADDR="127.0.0.1",
+                     HTTP_X_FORWARDED_FOR="1.2.3.4, 10.0.0.1",
                      HTTP_X_REAL_IP="203.0.113.9")
         self.assertEqual(get_client_ip(req), "203.0.113.9")
 
     def test_client_ip_falls_back_to_last_xff(self):
         """无 X-Real-IP 时取 XFF 最后一段（可信代理追加的那跳），而非第一段。"""
-        from .audit import get_client_ip
+        from apps.accounts.netutil import get_client_ip
         from django.test import RequestFactory
         rf = RequestFactory()
-        req = rf.get("/", HTTP_X_FORWARDED_FOR="1.2.3.4, 10.0.0.1")
+        req = rf.get("/", REMOTE_ADDR="127.0.0.1",
+                     HTTP_X_FORWARDED_FOR="1.2.3.4, 10.0.0.1")
         self.assertEqual(get_client_ip(req), "10.0.0.1")
+
+    def test_client_ip_ignores_headers_when_direct(self):
+        """★ B4：直连（REMOTE_ADDR 非可信代理）时，伪造的 X-Real-IP 必须被忽略。"""
+        from apps.accounts.netutil import get_client_ip
+        from django.test import RequestFactory
+        rf = RequestFactory()
+        req = rf.get("/", REMOTE_ADDR="203.0.113.7",
+                     HTTP_X_REAL_IP="1.2.3.4",
+                     HTTP_X_FORWARDED_FOR="1.2.3.4")
+        self.assertEqual(get_client_ip(req), "203.0.113.7",
+                         "直连时不得采信可伪造的转发头")
 
     # ---- M1：跨租户挂靠被拒 ----
     def test_producer_cannot_attach_batch_to_others_producer(self):
@@ -2856,7 +2903,8 @@ class SecurityHardeningTest(BaseFixture):
         from io import StringIO
         services.anchor_certificate(self.cert)
         rec = EvidenceRecord.objects.get(
-            biz_type=EvidenceRecord.BizType.CERTIFICATE, biz_id=self.cert.id)
+            biz_type=EvidenceRecord.BizType.CERTIFICATE, biz_id=self.cert.id,
+            is_current=True)
         before_hash, before_chain = rec.data_hash, rec.chain_status
         out = StringIO()
         call_command("rehash_all", stdout=out)

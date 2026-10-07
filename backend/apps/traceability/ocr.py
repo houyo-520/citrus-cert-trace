@@ -25,6 +25,24 @@ import shutil
 import subprocess
 import tempfile
 
+from django.conf import settings
+
+# ★ 资源上限（M13 修复）：OCR 是「上传即触发」的同步入口，必须设上限，
+#   否则一张精心构造的「解压炸弹」图片/超大 MediaBox 的 PDF 就能把 worker 拖死。
+#   （视图层的扩展名/文件大小校验是「上传前」的；这里防的是「解码后」的膨胀。）
+def _limit(name, default):
+    try:
+        return int(getattr(settings, name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+MAX_IMAGE_PIXELS = _limit("OCR_MAX_IMAGE_PIXELS", 40_000_000)   # 约 40MP
+MAX_PDF_PAGES = _limit("OCR_MAX_PDF_PAGES", 3)
+MAX_PDF_DPI = _limit("OCR_MAX_PDF_DPI", 200)
+MAX_PDF_RENDER_PIXELS = _limit("OCR_MAX_PDF_RENDER_PIXELS", 40_000_000)
+OCR_TIMEOUT = _limit("OCR_TIMEOUT_SECONDS", 60)
+
 # 检测报告常见字段的取值模式
 # 说明：中文报告里「合格」是「不合格」的子串，匹配顺序必须让「不合格」优先，
 # 否则「检验结论：不合格」会被误判为「合格」—— 这个错误后果极严重（见模块头注释）。
@@ -137,11 +155,22 @@ def render_pdf_to_images(data: bytes, max_pages: int = 3, dpi: int = 200) -> lis
     except Exception:
         return []
 
+    # ★ 上限（M13）：页数与 dpi 都夹紧；并限制单页渲染像素——
+    #   固定高 dpi 渲染任意 MediaBox 的页面，10MB 的 PDF 也能渲出上亿像素撑爆内存。
+    dpi = min(int(dpi or MAX_PDF_DPI), MAX_PDF_DPI)
+    max_pages = min(int(max_pages or MAX_PDF_PAGES), MAX_PDF_PAGES)
     try:
         for i, page in enumerate(doc):
             if i >= max_pages:
                 break
             try:
+                # 先按 pt 估算渲染后的像素数，超限则按比例下调 dpi
+                rect = page.rect
+                scale = max(dpi, 1) / 72.0
+                px = int(rect.width * scale) * int(rect.height * scale)
+                if px > MAX_PDF_RENDER_PIXELS and px > 0:
+                    factor = (MAX_PDF_RENDER_PIXELS / px) ** 0.5
+                    dpi = max(int(dpi * factor), 72)
                 pix = page.get_pixmap(dpi=dpi)
                 images.append(pix.tobytes("png"))
             except Exception:
@@ -157,18 +186,33 @@ def ocr_image(data: bytes, lang: str = "chi_sim+eng") -> str:
 
     优先用 pytesseract（Python 封装）；不可用时回退到直接调 tesseract 命令行 ——
     这样即使生产环境漏装了 pytesseract 也不会整个功能失效。
+
+    ★ 安全（M13）：PIL 有「解压炸弹」保护（DecompressionBombError）——
+    一张很小的压缩图能解出天量像素。原实现 `except Exception: pass` 会把它吞掉、
+    再降级到命令行 tesseract 对**同一张炸弹**重跑（3 页 ×60s 同步阻塞）。
+    现在显式区分：炸弹类错误直接放弃，不再降级重跑。
     """
+    bomb = False
     # 路线一：pytesseract
     try:
         import pytesseract
         from PIL import Image
+        # 收紧 PIL 全局像素上限（默认 ~89MP，这里用配置值）
+        Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
         img = Image.open(io.BytesIO(data))
         # 灰度化能显著提升中文小字的识别率（去彩色干扰）
         if img.mode != "L":
             img = img.convert("L")
         return pytesseract.image_to_string(img, lang=lang)
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001
+        # DecompressionBombError / DecompressionBombWarning 类：不再降级重跑
+        name = type(exc).__name__
+        if "DecompressionBomb" in name or "bomb" in str(exc).lower():
+            bomb = True
+
+    if bomb:
+        # 炸弹图片：直接返回空，绝不把同一份数据再喂给命令行 tesseract
+        return ""
 
     # 路线二：命令行 tesseract
     exe = shutil.which("tesseract")
@@ -181,13 +225,13 @@ def ocr_image(data: bytes, lang: str = "chi_sim+eng") -> str:
         with open(src, "wb") as f:
             f.write(data)
         subprocess.run([exe, src, out, "-l", lang],
-                       capture_output=True, timeout=60, check=False)
+                       capture_output=True, timeout=OCR_TIMEOUT, check=False)
         txt_path = out + ".txt"
         if os.path.exists(txt_path):
             with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
                 return f.read()
         return ""
-    except Exception:
+    except subprocess.TimeoutExpired:
         return ""
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

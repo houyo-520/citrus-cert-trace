@@ -226,23 +226,31 @@ class EvidenceRecord(BaseModel):
     block_height = models.IntegerField("区块高度(模拟)", default=0)
     chain_status = models.CharField("存证状态", max_length=20, default="success")
     payload = models.TextField("存证原文(规范化字段)", blank=True, default="")
+    # ★ 追加式版本（B3）：同一业务对象的存证可有多条历史版本，
+    #   version 递增、is_current 标记哪条是「当前生效版本」。
+    #   重存证/换盐迁移时追加新版本、归档旧版本，而非覆盖 ——
+    #   既保留篡改可检出（当前版本与链上/重算比对），又不堵死合法迁移。
+    version = models.IntegerField("版本号", default=1)
+    is_current = models.BooleanField("是否当前版本", default=True)
 
     class Meta:
         db_table = "chain_evidence_record"
         verbose_name = "存证记录"
         verbose_name_plural = "存证记录"
         ordering = ["-id"]
-        # ★ (biz_type, biz_id) 唯一（原 M3）：同一业务对象只应有一条当前存证。
-        #   加约束后，并发重签发不会再插出重复行（update_or_create 的
-        #   check-then-act 竞态会退化为 IntegrityError，由上层重试）。
+        # ★ 条件唯一：同一 (biz_type, biz_id) 只能有**一条** is_current=True 的记录；
+        #   历史版本（is_current=False）可以有任意多条。这是追加式版本的核心约束。
         constraints = [
-            models.UniqueConstraint(fields=["biz_type", "biz_id"],
-                                    name="uniq_evidence_biz"),
+            models.UniqueConstraint(
+                fields=["biz_type", "biz_id"],
+                condition=models.Q(is_current=True),
+                name="uniq_evidence_current"),
         ]
         # ★ 索引（原 M10）：热点查询 filter(biz_type=…, biz_id=…) 走索引不扫全表。
         indexes = [
             models.Index(fields=["biz_type", "biz_id"]),
             models.Index(fields=["biz_no"]),
+            models.Index(fields=["biz_type", "biz_id", "is_current"]),
         ]
 
     def __str__(self):

@@ -70,3 +70,48 @@ request.interceptors.response.use(
 )
 
 export default request
+
+/**
+ * ★ 鉴权下载（B2 修复）
+ *
+ * 背景：`/media/` 已改为需登录（ProtectedMediaView）。前端若还用
+ * `<a href="/media/...">` / `el-link :href` 直接导航，浏览器**不会带上
+ * Authorization 头**（token 只加在 axios 拦截器里），必然 401。
+ *
+ * 这里用 axios 以 blob 方式请求（经拦截器带上 token），拿到二进制后
+ * 用 createObjectURL 触发浏览器下载。url 可是 `/media/...` 绝对路径，
+ * 也可是后端给的相对地址。
+ *
+ * @param {string} url      文件地址（如 row.file_url）
+ * @param {string} filename 另存为的文件名（可选）
+ */
+export async function downloadFile(url, filename = '') {
+  if (!url) {
+    ElMessage.warning('文件地址为空')
+    return
+  }
+  // 后端返回的是 /media/... 相对路径；axios 实例 baseURL='/api'，故这里
+  // 用原生 axios 发同源绝对路径请求，仅手动补 Authorization。
+  const token = localStorage.getItem('token')
+  const resp = await axios.get(url, {
+    responseType: 'blob',
+    headers: token ? { Authorization: 'Bearer ' + token } : {}
+  })
+  const blob = new Blob([resp.data], {
+    type: resp.headers['content-type'] || 'application/octet-stream'
+  })
+  const objectUrl = window.URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = objectUrl
+  // 优先用调用方给的名字；否则从 Content-Disposition 或 url 末段推断
+  let name = filename
+  const cd = resp.headers['content-disposition'] || ''
+  const m = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(cd)
+  if (!name && m) name = decodeURIComponent(m[1])
+  if (!name) name = url.split('/').pop() || 'download'
+  a.download = name
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  window.URL.revokeObjectURL(objectUrl)
+}

@@ -27,8 +27,10 @@
       <el-table-column prop="pesticide_residue" label="农药残留" min-width="150" />
       <el-table-column label="报告附件" width="120">
         <template #default="{ row }">
-          <el-link v-if="row.file_url" type="primary" :href="row.file_url"
-                   target="_blank" :underline="false">
+          <!-- ★ 用按钮 + blob 下载（B2）：/media/ 已改鉴权，直接 href 导航不带
+               Authorization 头会 401，必须走带 token 的请求 -->
+          <el-link v-if="row.file_url" type="primary" @click="openFile(row)"
+                   :underline="false">
             查看附件
           </el-link>
           <el-tag v-else type="info" size="small" effect="plain">未上传</el-tag>
@@ -173,8 +175,8 @@
         <el-descriptions-item label="报告编号">{{ uploadRow.report_no }}</el-descriptions-item>
         <el-descriptions-item label="所属批次">{{ uploadRow.batch_no }}</el-descriptions-item>
         <el-descriptions-item label="当前附件">
-          <el-link v-if="uploadRow.file_url" type="primary" :href="uploadRow.file_url"
-                   target="_blank" :underline="false">已上传，点击查看</el-link>
+          <el-link v-if="uploadRow.file_url" type="primary" @click="openFile(uploadRow)"
+                   :underline="false">已上传，点击查看</el-link>
           <span v-else class="muted">暂无</span>
         </el-descriptions-item>
       </el-descriptions>
@@ -212,6 +214,7 @@ import {
   listReport, createReport, deleteReport, listBatch, uploadReportFile, ocrReport
 } from '@/api'
 import { useUserStore } from '@/store/user'
+import { downloadFile } from '@/utils/request'
 
 const userStore = useUserStore()
 
@@ -370,6 +373,20 @@ const openUpload = (row) => {
   uploadVisible.value = true
   // ref 在弹窗刚打开时可能还没挂载，延后一拍清空内部文件列表
   requestAnimationFrame(() => uploadRef.value?.clearFiles?.())
+}
+
+/**
+ * 打开/下载报告附件（B2 修复）
+ * /media/ 已改为需登录，直接用 href 导航不带 Authorization 头会 401，
+ * 因此走带 token 的 blob 下载。
+ */
+const openFile = async (row) => {
+  if (!row?.file_url) return
+  try {
+    await downloadFile(row.file_url, row.file_name || '')
+  } catch (e) {
+    ElMessage.error('附件下载失败，可能无权限或文件已删除')
+  }
 }
 
 const onUploadFileChange = (file) => {

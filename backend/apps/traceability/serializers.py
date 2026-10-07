@@ -290,7 +290,11 @@ class MatchIntentSerializer(serializers.ModelSerializer):
     class Meta:
         model = MatchIntent
         fields = "__all__"
-        read_only_fields = ["initiator", "match_score", "score_detail"]
+        # ★ supply/counterpart 只读（D 残留修复）：意向单的创建走专用 action
+        #   （supply/{id}/intent/，由后端按登录用户与打分逻辑写入），
+        #   不允许直接 POST/PATCH 指定关联单，避免跨租户伪造对接。
+        read_only_fields = ["initiator", "match_score", "score_detail",
+                            "supply", "counterpart"]
 
 
 class OperationLogSerializer(serializers.ModelSerializer):

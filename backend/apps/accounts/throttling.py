@@ -45,22 +45,13 @@ def _client_ip(request):
     """
     取真实来源 IP。
 
-    ★ 安全修复（原 M6）：原实现无条件取 X-Forwarded-For 第一段 —— 那是
-    客户端可伪造的请求头。攻击者每请求换一个 XFF，限流阈值就被拆散绕过。
-    正确顺序：可信 nginx 覆写的 X-Real-IP → XFF 最后一段 → REMOTE_ADDR。
-    （与 traceability/audit.get_client_ip 保持一致。）
+    ★ B4 修复：统一改走 netutil.get_client_ip —— 只有 REMOTE_ADDR 属于可信代理
+    （默认 127.0.0.1/::1）时才采信 X-Real-IP / XFF；直连时一律用 REMOTE_ADDR，
+    避免「绕过 nginx 直连 8000 端口 + 伪造 X-Real-IP」绕过 IP 限流。
+    同时与审计日志共用同一函数，跳数规则不再两处各写一份。
     """
-    real_ip = request.META.get("HTTP_X_REAL_IP", "").strip()
-    if real_ip:
-        return real_ip
-    xff = request.META.get("HTTP_X_FORWARDED_FOR", "")
-    if xff:
-        parts = [p.strip() for p in xff.split(",") if p.strip()]
-        if parts:
-            hops = int(os.environ.get("TRUSTED_PROXY_HOPS", "1") or 1)
-            idx = max(0, len(parts) - hops)
-            return parts[idx]
-    return request.META.get("REMOTE_ADDR", "unknown")
+    from .netutil import get_client_ip
+    return get_client_ip(request) or "unknown"
 
 
 def _cutoff():

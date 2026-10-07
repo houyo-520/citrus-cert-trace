@@ -250,3 +250,22 @@ VERIFY_RATE_LIMIT = int(os.environ.get("VERIFY_RATE_LIMIT", "30"))
 #   因此默认 1 —— 优先用 X-Real-IP，退化到 XFF 时从右往左数第 1 跳。
 #   若将来前面加了 CDN / 多层代理，需相应增大此值，否则取到的会是对端代理 IP。
 TRUSTED_PROXY_HOPS = int(os.environ.get("TRUSTED_PROXY_HOPS", "1"))
+
+# ★ 可信代理 IP 白名单（B4 修复）：只有 REMOTE_ADDR 属于此列表时，
+#   才采信 X-Real-IP / X-Forwarded-For。默认本机（nginx 与 gunicorn 同机）。
+#   若 gunicorn 意外对外监听，攻击者直连时伪造的转发头会因 REMOTE_ADDR 不在
+#   白名单而被忽略 —— 这是抵御「伪造来源 IP 绕限流」的最后一道闸。
+TRUSTED_PROXY_IPS = [
+    ip.strip()
+    for ip in os.environ.get("TRUSTED_PROXY_IPS", "127.0.0.1,::1").split(",")
+    if ip.strip()
+]
+
+# ★ OCR 资源上限（M13 修复）：OCR 是「上传即触发」的同步入口，
+#   没有上限时一张解压炸弹图/超大 MediaBox 的 PDF 就能把 worker 拖死。
+OCR_MAX_IMAGE_PIXELS = int(os.environ.get("OCR_MAX_IMAGE_PIXELS", "40000000"))
+OCR_MAX_PDF_PAGES = int(os.environ.get("OCR_MAX_PDF_PAGES", "3"))
+OCR_MAX_PDF_DPI = int(os.environ.get("OCR_MAX_PDF_DPI", "200"))
+OCR_MAX_PDF_RENDER_PIXELS = int(os.environ.get("OCR_MAX_PDF_RENDER_PIXELS",
+                                               "40000000"))
+OCR_TIMEOUT_SECONDS = int(os.environ.get("OCR_TIMEOUT_SECONDS", "60"))

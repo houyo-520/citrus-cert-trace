@@ -16,7 +16,9 @@
      捕获 IntegrityError 后重新取号。这是并发安全的关键。
 """
 import re
-from datetime import date
+from datetime import date, datetime
+
+from django.conf import settings
 
 from django.db import IntegrityError, transaction
 
@@ -59,18 +61,24 @@ def normalize_region_code(raw: str) -> str:
 
 def _today_local() -> date:
     """
-    取「本地时区」的今天。
+    取「本地时区（settings.TIME_ZONE）」的今天。
 
-    ★ 修复（原 Minor）：原用 date.today()，它按**系统时区**取值。
-    生产服务器若为 UTC，则北京时间 00:00~08:00 期间生成的编号日期会比
-    北京日期**早一天**，与业务/纸质证上的日期对不上。
-    这里优先用 Django 的 timezone.localdate()（按 settings.TIME_ZONE），
-    取不到再退回 date.today()。
+    ★ 修复（E，替代早期空转的实现）：
+    原用 date.today()（按**系统时区**），生产服务器若为 UTC，则北京时间
+    00:00~08:00 间生成的编号日期会比北京日期早一天，与纸质证日期对不上。
+
+    早期曾改用 timezone.localdate()，但本项目 settings.USE_TZ = False，
+    此时 timezone.now() 返回 naive datetime，localdate() 会抛
+    ValueError("localtime() cannot be applied to a naive datetime")，
+    被外层 except 静默兜住 → 修复实际空转（且属于「吞异常掩盖问题」）。
+
+    正确做法：不依赖 USE_TZ，直接用 ZoneInfo(settings.TIME_ZONE) 取当地日期。
     """
+    tz_name = getattr(settings, "TIME_ZONE", None) or "Asia/Shanghai"
     try:
-        from django.utils import timezone
-        return timezone.localdate()
-    except Exception:  # noqa: BLE001
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo(tz_name)).date()
+    except Exception:  # noqa: BLE001 zoneinfo/时区库缺失时才退回系统本地日期
         return date.today()
 
 

@@ -374,15 +374,26 @@ NGINX = """server {
     }
 
     # ★ 用户上传文件（检测报告附件等）。
-    #   必须用 `^~` 而不是普通前缀 —— 否则下面那条按扩展名匹配的正则 location
-    #   优先级更高（nginx 规则：正则 > 普通前缀），会把 .jpg/.png 类附件
-    #   交给 `try_files $uri =404`，而它的基准目录是前端 dist，
-    #   找不到文件直接 404 → 「上传成功但打不开」。
-    #   `^~` 表示命中该前缀后不再尝试正则匹配，从根上消除歧义。
+    #
+    # ★ 安全修复（B1）：原实现用 `alias` 让 nginx **直接发文件**，请求在 nginx
+    #   层就被回答、根本不进 Django —— 于是 /media/ 绕过 ProtectedMediaView 的
+    #   登录与归属校验，匿名可下载，还会被 Cache-Control: public 缓存一天。
+    #   现改为 **proxy_pass 到 Django**，由 ProtectedMediaView 做鉴权后再返回。
+    #
+    # 必须保留 `^~`：否则下面按扩展名匹配的正则 location 优先级更高（正则 > 普通
+    # 前缀），.jpg/.png 类附件会被交给 `try_files $uri =404`（基准目录是前端 dist）
+    # → 「上传成功但打不开」。`^~` 命中前缀后不再尝试正则，消除歧义。
+    #
+    # 性能提示：若将来附件量变大，可改为 nginx `internal` + 后端返回
+    #   X-Accel-Redirect 头（零拷贝），鉴权仍由 Django 做；当前量小，proxy 足够。
     location ^~ /media/ {
-        alias /home/ubuntu/citrus/backend/media/;
-        expires 1d;
-        add_header Cache-Control "public";
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # 附件是私密内容：禁止任何共享缓存
+        add_header Cache-Control "private, no-store" always;
         add_header X-Frame-Options "SAMEORIGIN" always;
         add_header X-Content-Type-Options "nosniff" always;
         add_header Referrer-Policy "strict-origin-when-cross-origin" always;
