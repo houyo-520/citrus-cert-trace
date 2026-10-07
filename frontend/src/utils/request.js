@@ -7,6 +7,34 @@ const request = axios.create({
   timeout: 15000
 })
 
+/**
+ * ★ 静默续期（单飞，B-1 修复）
+ *
+ * 背景：进入后台首页会**并发**触发多个请求（MainLayout 的 alert+notice、
+ * Dashboard 的 Promise.allSettled([getDashboard, getAlerts])），access 过期后
+ * 第一屏就是 4 个并发 401。若每个 401 各自去刷新，因为 ROTATE+BLACKLIST 会把
+ * 旧 refresh 拉黑：A 刷新成功后，B/C/D 拿着**已被拉黑的旧 refresh** 再请求 →
+ * 401 → 落到登出分支 → 用户仍被踢回登录页（只是从「没刷新」变成「刷新打架」）。
+ *
+ * 修法：模块级 refreshing 单飞 —— 同一时刻只发起一次刷新，其余 401 等待它。
+ */
+let refreshing = null
+
+async function renewTokens() {
+  const refresh = localStorage.getItem('refresh')
+  if (!refresh) return false
+  try {
+    // ★ 带 timeout：原生 axios 无实例默认值，服务端挂住时不要让所有重放一起卡死
+    const r = await axios.post('/api/auth/refresh/', { refresh }, { timeout: 10000 })
+    if (!r.data?.access) return false
+    localStorage.setItem('token', r.data.access)
+    if (r.data.refresh) localStorage.setItem('refresh', r.data.refresh)
+    return true
+  } catch (e) {
+    return false
+  }
+}
+
 request.interceptors.request.use((config) => {
   const token = localStorage.getItem('token')
   if (token) {
@@ -57,30 +85,24 @@ request.interceptors.response.use(
     const status = error.response?.status
     const original = error.config || {}
 
-    // ★ R2：access 过期（2h）时先用 refresh 静默续期一次，再重放原请求。
-    //   否则轮换+黑名单虽对，体验却变成「每 2 小时被踢回登录页」。
-    //   注意：必须把响应里的**新 refresh** 写回 localStorage —— 因为
-    //   ROTATE_REFRESH_TOKENS 会把旧 refresh 拉黑，不更新则第二次刷新必挂。
+    // ★ B-1：401 静默续期走**单飞**，避免并发 401 各自刷新的踩踏。
+    //   重放时不用手设 Authorization —— 请求拦截器会从 localStorage 取新 token。
     if (status === 401 && !original._retry && !original.url?.includes('/auth/refresh')) {
-      const refresh = localStorage.getItem('refresh')
-      if (refresh) {
-        original._retry = true
-        try {
-          // 用原生 axios 直调刷新接口，避免再次进入本拦截器造成递归
-          const r = await axios.post('/api/auth/refresh/', { refresh })
-          const d = r.data || {}
-          const newAccess = d.access
-          const newRefresh = d.refresh
-          if (newAccess) {
-            localStorage.setItem('token', newAccess)
-            if (newRefresh) localStorage.setItem('refresh', newRefresh)
-            original.headers = original.headers || {}
-            original.headers.Authorization = 'Bearer ' + newAccess
-            return request(original)   // 重放原请求
-          }
-        } catch (e) {
-          // 刷新失败（refresh 也过期/被拉黑）→ 落到下面登出逻辑
-        }
+      const stale = localStorage.getItem('token')
+      original._retry = true
+      if (!refreshing) {
+        // finally 保证无论成败都释放锁，避免一次失败把后续刷新永久堵死
+        refreshing = renewTokens().finally(() => { refreshing = null })
+      }
+      const ok = await refreshing
+      // 仅当刷新成功、且本次刷新**确实换到了新 token**（token 已变）才重放；
+      // 若 token 没变（别人已换过且自己拿到的就是新的）也要重放。
+      if (ok && localStorage.getItem('token') !== stale) {
+        return request(original)
+      }
+      // 若刷新成功但 token 未变（极端：刷新接口返回同一 token），也允许重放一次
+      if (ok) {
+        return request(original)
       }
     }
 
@@ -122,31 +144,45 @@ export async function downloadFile(url, filename = '') {
   }
   // 后端返回的是 /media/... 相对路径；axios 实例 baseURL='/api'，故这里
   // 用原生 axios 发同源绝对路径请求，仅手动补 Authorization。
-  const token = localStorage.getItem('token')
+  const doGet = (tok) => axios.get(url, {
+    responseType: 'blob',
+    timeout: 60000,   // 附件可能较大，给足超时（原生 axios 无实例默认值）
+    headers: tok ? { Authorization: 'Bearer ' + tok } : {}
+  })
   let resp
   try {
-    resp = await axios.get(url, {
-      responseType: 'blob',
-      headers: token ? { Authorization: 'Bearer ' + token } : {}
-    })
+    resp = await doGet(localStorage.getItem('token'))
   } catch (err) {
-    // ★ R6：原生 axios 不经 request 拦截器，401 需在这里单独识别并登出，
-    //   否则用户会把「token 过期」误当成「无权限」。
+    // ★ R6/B-1：原生 axios 不经 request 拦截器，401 需在这里处理。
+    //   与主拦截器一致：先尝试**单飞静默续期**，成功则重试一次，失败才登出。
     const st = err.response?.status
     if (st === 401) {
-      localStorage.removeItem('token')
-      localStorage.removeItem('refresh')
-      localStorage.removeItem('user')
-      ElMessage.error('登录已过期，请重新登录')
-      if (router.currentRoute.value.path !== '/login') router.push('/login')
-      throw err
-    }
-    if (st === 403) {
+      if (!refreshing) {
+        refreshing = renewTokens().finally(() => { refreshing = null })
+      }
+      const ok = await refreshing
+      if (ok) {
+        try {
+          resp = await doGet(localStorage.getItem('token'))
+        } catch (e2) {
+          resp = null
+        }
+      }
+      if (!resp) {
+        localStorage.removeItem('token')
+        localStorage.removeItem('refresh')
+        localStorage.removeItem('user')
+        ElMessage.error('登录已过期，请重新登录')
+        if (router.currentRoute.value.path !== '/login') router.push('/login')
+        throw err
+      }
+    } else if (st === 403) {
       ElMessage.error('无权访问该附件')
       throw err
+    } else {
+      ElMessage.error('附件下载失败')
+      throw err
     }
-    ElMessage.error('附件下载失败')
-    throw err
   }
   const blob = new Blob([resp.data], {
     type: resp.headers['content-type'] || 'application/octet-stream'

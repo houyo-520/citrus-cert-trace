@@ -37,9 +37,12 @@ export const useUserStore = defineStore('user', {
       localStorage.setItem('user', JSON.stringify(user))
     },
     async logout() {
-      // ★ 先请求后端把 refresh 拉黑（失败不阻断本地清理）
+      // ★ B-2 修复：优先 localStorage —— 静默续期（request.js 的 renewTokens）
+      //   只写 localStorage、从不回填 store，所以 this.refresh 很可能是**已被
+      //   拉黑的旧值**。若拿它去注销，后端会把「已拉黑的行」再拉黑一次（无害但
+      //   假注销），而真正活着的新 refresh 没人拉黑 → 注销后仍能换新 access。
       try {
-        const rt = this.refresh || localStorage.getItem('refresh')
+        const rt = localStorage.getItem('refresh') || this.refresh
         if (rt) await logoutApi(rt)
       } catch (e) {
         // 网络/已过期等都不影响本地登出
