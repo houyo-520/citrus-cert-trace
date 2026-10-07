@@ -59,6 +59,11 @@ Desktop.ini
 # 临时脚本（个人调试用，不入库）
 _*.py
 _srv.py
+_*.mjs
+_shots*/
+
+# 本地联调配置（把 /api 代理到线上真后端，仅个人预览用，不入库）
+frontend/vite.dev-remote.config.js
 
 # 验收脚本产出的截图
 frontend/shot_*.png

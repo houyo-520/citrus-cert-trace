@@ -25,6 +25,7 @@ Django SECRET_KEY、链上账户私钥直接写在源码里，一旦仓库公开
     export CITRUS_SSH_PASSWORD='...'
     export CITRUS_SECRET_KEY='...'
     export CITRUS_CHAIN_PRIVATE_KEY='...'
+    export CITRUS_EVIDENCE_SALT='...'
     python deploy.py upload
 
   方式二：.deploy_env 文件（推荐日常开发，免每次手设）
@@ -32,6 +33,7 @@ Django SECRET_KEY、链上账户私钥直接写在源码里，一旦仓库公开
       CITRUS_SSH_PASSWORD=xxx
       CITRUS_SECRET_KEY=xxx
       CITRUS_CHAIN_PRIVATE_KEY=xxx
+      CITRUS_EVIDENCE_SALT=xxx
     该文件已在 .gitignore 中排除，不会被提交。
 
 凭据实际值见 毕设源/凭据清单_请勿提交.md
@@ -41,6 +43,9 @@ import paramiko
 
 HOST = os.environ.get("CITRUS_SSH_HOST", "<your-server-ip>")
 USER = os.environ.get("CITRUS_SSH_USER", "ubuntu")
+# ★ SSH 已加固（2026-10-01 起）：非标端口（自定义），禁密码登录，仅 ed25519 密钥。
+SSH_PORT = int(os.environ.get("CITRUS_SSH_PORT", "22"))
+SSH_KEY = os.environ.get("CITRUS_SSH_KEY", "<path-to-your-ssh-key>")
 
 REMOTE_ROOT = "/home/ubuntu/citrus"
 REMOTE_BACKEND = REMOTE_ROOT + "/backend"
@@ -96,10 +101,17 @@ SECRET_KEY = os.environ.get("CITRUS_SECRET_KEY", "")
 
 
 def conn():
+    # 优先密钥（ed25519）；密钥不存在时回退密码（向后兼容未加固的机器）
+    if os.path.isfile(SSH_KEY):
+        c = paramiko.SSHClient()
+        c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        c.connect(HOST, port=SSH_PORT, username=USER,
+                  key_filename=SSH_KEY, timeout=25)
+        return c
     pwd = _need("CITRUS_SSH_PASSWORD", "服务器 ubuntu 用户密码")
     c = paramiko.SSHClient()
     c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    c.connect(HOST, port=22, username=USER, password=pwd, timeout=25)
+    c.connect(HOST, port=SSH_PORT, username=USER, password=pwd, timeout=25)
     return c
 
 
@@ -192,9 +204,10 @@ def do_upload(cli):
     else:
         secret = os.environ.get("CITRUS_SECRET_KEY", "")
         chain_key = os.environ.get("CITRUS_CHAIN_PRIVATE_KEY", "")
-        if not secret or not chain_key:
+        salt = os.environ.get("CITRUS_EVIDENCE_SALT", "")
+        if not secret or not chain_key or not salt:
             print("  ⚠️  服务器无 .env 且本地未提供密钥，跳过生成")
-            print("     需设置 CITRUS_SECRET_KEY / CITRUS_CHAIN_PRIVATE_KEY 后重跑")
+            print("     需设置 CITRUS_SECRET_KEY / CITRUS_CHAIN_PRIVATE_KEY / CITRUS_EVIDENCE_SALT 后重跑")
         else:
             env = f"""# 生产环境配置（服务器 <your-server-ip>）
 DJANGO_DEBUG=false
@@ -210,7 +223,11 @@ FISCO_PRIVATE_KEY={chain_key}
 FISCO_GAS_LIMIT=500000
 FISCO_ENABLE_CHAIN=true
 
-FRONTEND_VERIFY_BASE=http://<your-server-ip>:8090/#/verify
+# 存证哈希加盐（Salted Hash）—— 生产必须设置，否则拒绝启动
+EVIDENCE_SALT={salt}
+VERIFY_RATE_LIMIT=30
+
+FRONTEND_VERIFY_BASE=https://trace.example.com/#/verify
 """
             with sftp.open(REMOTE_BACKEND + "/.env", "w") as f:
                 f.write(env)
@@ -401,13 +418,41 @@ NGINX = """server {
 
 def do_nginx(cli):
     print("=== 配置 nginx ===")
+    # ★★★ 安全红线（2026-09-25 踩坑后固化）★★★
+    # 服务器上已生效的是「certbot HTTPS 分域方案」：
+    #   - 主域  example.com / www.example.com  → HTTPS (443, Let's Encrypt)
+    #   - 子域  trace.example.com           → 复用同一证书
+    #   - IP 直连 <your-server-ip>:8090       → 免备案非标端口
+    # 这个方案比本脚本内嵌的 NGINX 模板（下方字符串）先进得多。
+    #
+    # 而本函数早先用 NGINX 模板「无条件覆盖」 sites-available/citrus，
+    # 会把线上的 HTTPS 分域配置打回「只有 80/8080/8090、无 443」的旧版，
+    # 导致 https://example.com 直接 ERR_CONNECTION_RESET。
+    #
+    # 因此：只要服务器上已有站点配置（无论是否 HTTPS），就【跳过覆盖】，
+    # 绝不再用离线模板冲掉线上手工调好的分域 + 证书配置。
+    # 只有当服务器上根本没有站点配置（全新机器首次部署）时才写入模板。
+    code, out, _ = run(cli,
+        "test -f /etc/nginx/sites-available/citrus && echo EXISTS || echo MISSING",
+        quiet=True)
+    if "EXISTS" in out:
+        print("  ✓ 服务器已有 sites-available/citrus（含 HTTPS 分域），"
+              "按红线【跳过覆盖】，仅校验语法并 reload")
+        code, out, err = run(cli, "sudo nginx -t 2>&1")
+        if code == 0:
+            run(cli, "sudo systemctl enable --now nginx && "
+                     "sudo systemctl reload nginx")
+        return code
+
+    print("  ℹ 服务器无站点配置，写入内嵌模板（全新机器首次部署场景）")
     sftp = cli.open_sftp()
     with sftp.open("/tmp/citrus.conf", "w") as f:
         f.write(NGINX)
     sftp.close()
     run(cli, "sudo mv /tmp/citrus.conf /etc/nginx/sites-available/citrus")
     run(cli, "sudo rm -f /etc/nginx/sites-enabled/default")
-    run(cli, "sudo ln -sf /etc/nginx/sites-available/citrus /etc/nginx/sites-enabled/citrus")
+    run(cli, "sudo ln -sf /etc/nginx/sites-available/citrus "
+             "/etc/nginx/sites-enabled/citrus")
     code, out, err = run(cli, "sudo nginx -t 2>&1")
     if code == 0:
         run(cli, "sudo systemctl enable --now nginx && sudo systemctl reload nginx")
@@ -438,7 +483,16 @@ def do_check(cli):
 
 
 if __name__ == "__main__":
-    action = sys.argv[1] if len(sys.argv) > 1 else "all"
+    # ★ 安全红线（2026-09-25 踩坑后固化）：
+    #   本脚本早先「无参数默认跑 all 全流程」—— 一旦误触发，
+    #   do_upload 会用本地代码覆盖服务器、do_nginx 会把线上 HTTPS 分域
+    #   配置打回无 443 的旧版，直接导致 https 访问 ERR_CONNECTION_RESET。
+    #   因此：无参数时只打印用法说明并退出，绝不执行任何带副作用的动作。
+    if len(sys.argv) < 2:
+        print(__doc__)
+        print("！！已阻止无参数误触发全流程（安全红线）。请显式指定 action。")
+        sys.exit(0)
+    action = sys.argv[1]
     cli = conn()
     try:
         if action in ("upload", "all"):
