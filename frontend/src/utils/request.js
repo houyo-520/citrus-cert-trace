@@ -37,6 +37,26 @@ async function renewTokens() {
   }
 }
 
+/**
+ * ★ 统一登出（走 loggingOut 闸门）
+ *
+ * 主拦截器与 downloadFile 共用，避免「多处各写一份登出逻辑」导致有的走闸门、
+ * 有的不走（那就会出现重复弹窗）。闸门用短暂时间窗解锁，允许后续真的再次过期时再提示。
+ */
+function forceLogout() {
+  if (loggingOut) return
+  loggingOut = true
+  localStorage.removeItem('token')
+  localStorage.removeItem('refresh')
+  localStorage.removeItem('user')
+  if (router.currentRoute.value.path !== '/login') {
+    ElMessage.error('登录已过期，请重新登录')
+    router.push('/login')
+  }
+  // 跳转后短暂解锁，允许后续真的再次过期时再提示
+  setTimeout(() => { loggingOut = false }, 1500)
+}
+
 request.interceptors.request.use((config) => {
   const token = localStorage.getItem('token')
   if (token) {
@@ -101,20 +121,9 @@ request.interceptors.response.use(
     }
 
     if (status === 401) {
-      // ★ 并发失败时只提示/跳转一次（4 个并发 401 会同时走到这里；
-      //   router.push 后 currentRoute 不会立刻变，单靠 path 判断拦不住重复弹窗）
-      if (!loggingOut) {
-        loggingOut = true
-        localStorage.removeItem('token')
-        localStorage.removeItem('refresh')
-        localStorage.removeItem('user')
-        if (router.currentRoute.value.path !== '/login') {
-          ElMessage.error('登录已过期，请重新登录')
-          router.push('/login')
-        }
-        // 跳转后短暂解锁，允许后续真的再次过期时再提示
-        setTimeout(() => { loggingOut = false }, 1500)
-      }
+      // ★ 统一走 forceLogout（内部有 loggingOut 闸门）：
+      //   并发 4 个 401 同时失败时只提示/跳转一次。
+      forceLogout()
     } else {
       ElMessage.error(error.response?.data?.message || error.message || '网络错误')
     }
@@ -170,11 +179,7 @@ export async function downloadFile(url, filename = '') {
         }
       }
       if (!resp) {
-        localStorage.removeItem('token')
-        localStorage.removeItem('refresh')
-        localStorage.removeItem('user')
-        ElMessage.error('登录已过期，请重新登录')
-        if (router.currentRoute.value.path !== '/login') router.push('/login')
+        forceLogout()
         throw err
       }
     } else if (st === 403) {

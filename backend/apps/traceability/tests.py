@@ -3047,16 +3047,29 @@ class TodayLocalRobustnessTest(BaseFixture):
     """R5 兜底：ZoneInfo 不可用时应退回 date.today() 并告警（不静默）。"""
 
     def test_today_local_falls_back_with_warning(self):
-        """模拟 ZoneInfo 不可用 → 退回 date.today()，且记录 warning。"""
+        """模拟 ZoneInfo 不可用 → 退回 date.today()，且（首次）记录 warning。"""
         from unittest import mock
         from datetime import date
         from . import certno
+        certno._TZ_WARNED = False   # 重置「只告警一次」标志
         with mock.patch("zoneinfo.ZoneInfo", side_effect=Exception("no tzdata")):
             with self.assertLogs("apps.traceability.certno", level="WARNING") as cm:
                 d = certno.today_local()
         self.assertEqual(d, date.today())
         self.assertTrue(any("tzdata" in m for m in cm.output),
                         "兜底应提示安装 tzdata")
+
+    def test_today_local_warns_only_once(self):
+        """兜底告警只打印一次（避免高频调用刷日志）。"""
+        from unittest import mock
+        from . import certno
+        certno._TZ_WARNED = False
+        with mock.patch("zoneinfo.ZoneInfo", side_effect=Exception("no tzdata")):
+            with self.assertLogs("apps.traceability.certno", level="WARNING") as cm:
+                certno.today_local()
+                certno.today_local()
+                certno.today_local()
+        self.assertEqual(len(cm.output), 1, "只应告警一次")
 
     def test_today_local_ok_when_zoneinfo_available(self):
         """正常情况：按 TIME_ZONE 取日，无告警。"""

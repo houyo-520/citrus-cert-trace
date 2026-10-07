@@ -28,6 +28,9 @@ DATE_LEN = 8
 SEQ_LEN = 5
 TOTAL_LEN = REGION_LEN + DATE_LEN + SEQ_LEN   # 19
 
+# 时区兜底告警「只打一次」标志（today_local 被高频调用，避免刷日志）
+_TZ_WARNED = False
+
 # 流水号上限（5 位）
 MAX_SEQ = 10 ** SEQ_LEN - 1
 
@@ -83,11 +86,16 @@ def today_local() -> date:
     except Exception as exc:  # noqa: BLE001 时区库缺失/名称非法
         # ★ 不再静默退回（否则「按 TIME_ZONE 取日」的保证会悄悄落空、靠机器时区碰巧对）：
         #   记一条 warning 便于发现（如 Windows 未装 tzdata → ZoneInfoNotFoundError）。
-        import logging
-        logging.getLogger(__name__).warning(
-            "ZoneInfo(%s) 不可用（%s），临时退回系统本地日期 date.today()。"
-            "请安装 tzdata（pip install tzdata）以保证按 TIME_ZONE 取日。",
-            tz_name, exc)
+        #   本函数被签发/看板/预警/is_overdue 等高频调用，故**只告警一次**避免刷屏。
+        global _TZ_WARNED
+        if not _TZ_WARNED:
+            _TZ_WARNED = True
+            import logging
+            logging.getLogger(__name__).warning(
+                "ZoneInfo(%s) 不可用（%s），临时退回系统本地日期 date.today()。"
+                "请安装 tzdata（pip install tzdata）以保证按 TIME_ZONE 取日。"
+                "（本提示仅打印一次）",
+                tz_name, exc)
         return date.today()
 
 
