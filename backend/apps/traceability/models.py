@@ -165,10 +165,14 @@ class Certificate(BaseModel):
     cert_hash = models.CharField("合格证哈希(SHA-256)", max_length=64, blank=True, default="")
     is_anchored = models.BooleanField("是否已存证", default=False)
     anchored_at = models.DateTimeField("存证时间", null=True, blank=True)
+    # ★ Merkle 树根哈希：把「批次/报告/证/检查」等多份证据哈希汇聚成单一根，
+    #   一张证只需在链上存这一个根，即可代表整棵证据树（空间效率 + 防篡改定位）。
+    merkle_root = models.CharField("Merkle 根哈希", max_length=64, blank=True, default="")
 
     # ---- 监督检查联动 ----
     # 现场检查判定不合格时置为「暂停使用」，与签发状态区分开：
-    # 暂停不是作废（证还在，只是暂缓流通），复查合格后可恢复。
+    # 暂停不是作废（证还在，只是暂缓流通）。整改复查通过后，
+    # 原证从 suspended 直接转 revoked 终态（不复原），需重新申领新批次。
     suspend_reason = models.CharField("暂停原因", max_length=255, blank=True, default="")
 
     issuer = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
@@ -201,6 +205,7 @@ class EvidenceRecord(BaseModel):
         CERTIFICATE = "certificate", "合格证"
         REVOKE = "revoke", "作废记录"
         INSPECTION = "inspection", "监督检查"
+        MERKLE = "merkle", "Merkle 根"
 
     biz_type = models.CharField("业务类型", max_length=20, choices=BizType.choices)
     biz_id = models.IntegerField("业务ID")

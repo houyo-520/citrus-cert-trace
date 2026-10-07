@@ -147,7 +147,8 @@ def cert_suspended(cert, actor, reason=""):
         _cert_owner(cert),
         category=Notification.Category.CERT_SUSPEND,
         title=f"合格证被暂停使用：{cert.cert_no or ''}",
-        content="该合格证因监督检查不合格被暂停流通。完成整改并通过复查后可自动恢复。"
+        content="该合格证因监督检查不合格被暂停流通。整改复查通过后，"
+                "本批次合格证将作废，需针对新批次重新申领。"
                 + (f"\n原因：{reason}" if reason else ""),
         level=Notification.Level.DANGER,
         link_route="certificate", link_id=cert.id, link_label="查看合格证",

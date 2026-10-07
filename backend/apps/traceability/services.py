@@ -61,8 +61,19 @@ def build_certificate_payload(cert: Certificate) -> str:
     return "|".join(parts)
 
 
+def _salt() -> str:
+    """取存证盐值（加盐哈希用）。缺失时回退空串，保证本地无配置也能跑。"""
+    return getattr(settings, "EVIDENCE_SALT", "") or ""
+
+
 def sha256_hex(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    """加盐 SHA-256 摘要。
+
+    哈希 = sha256(salt + text)。盐由后端私有参数（EVIDENCE_SALT）提供，
+    抵御彩虹表/字典逆向 —— 即使拿到规范化原文与摘要，也无法离线枚举敏感字段。
+    注意：salt 只参与哈希，不写入 payload（payload 仍存明码原文供追溯展示）。
+    """
+    return hashlib.sha256((_salt() + text).encode("utf-8")).hexdigest()
 
 
 def compute_certificate_hash(cert: Certificate) -> str:
@@ -118,6 +129,38 @@ def anchor_certificate(cert: Certificate) -> EvidenceRecord:
                         cert.cert_no, digest, payload, result)
 
 
+def anchor_merkle_root(cert: Certificate) -> EvidenceRecord:
+    """
+    ★ 把一张合格证的「证据树」压缩成单个 Merkle 根上链（新增亮点，不侵入现有验真）。
+
+    时机：在 anchor_certificate 之后调用，因此批/报告/证三者的存证记录都已落库，
+    build_certificate_merkle_root 才能取到它们的 data_hash 参与汇聚。
+
+    做了三件事：
+      1. 计算 Merkle 根（批次->报告->证->检查，顺序固定）；
+      2. 写回 Certificate.merkle_root（证面/详情可直接展示）；
+      3. 以独立 bizType=merkle 上链（bizNo 用 cert_no，与 certificate 记录分属
+         不同 bizType，不互相覆盖），链上能核验「这张证只能压缩成这一个根」。
+
+    ★ 为什么不破坏现有验真：verify_certificate 只按 CERTIFICATE 类型做双层核验，
+    这条 merkle 记录是额外的、平行的证据压缩层，任何一层缺失都不影响另一层结论。
+    """
+    from . import merkle
+
+    root = merkle.build_certificate_merkle_root(cert)
+    if not root:   # 突发情况（如证据哈希全空）不该上链一条空根
+        return None
+
+    cert.merkle_root = root
+    cert.save(update_fields=["merkle_root", "updated_at"])
+
+    payload = "|".join([cert.cert_no or f"证#{cert.id}", "MERKLE", root])
+    result = _anchor(root, payload, EvidenceRecord.BizType.MERKLE,
+                     cert.id, cert.cert_no)
+    return _save_record(EvidenceRecord.BizType.MERKLE, cert.id,
+                        cert.cert_no, root, payload, result)
+
+
 def anchor_batch(batch) -> EvidenceRecord:
     payload = "|".join([
         batch.batch_no, batch.producer.name if batch.producer_id else "",
@@ -146,21 +189,48 @@ def anchor_report(report) -> EvidenceRecord:
 
 def anchor_revoke(cert: Certificate, reason: str = "") -> EvidenceRecord:
     """
-    合格证作废存证。
+    合格证作废存证（作废双向上链）。
 
-    作废必须留痕 —— 否则「已作废的证」与「从未存在过的证」在链上无法区分。
-    存证原文 = cert_no + 作废标记 + 原因 + 时间，单独一条 REVOKE 类型记录。
+    作废必须留痕，且必须是「链上可核验的撤销」，而非仅本地加一条记录：
+      1. 链上：调 revokeEvidence，对原 certificate 记录的 bizNo 打 revoked 标记
+         —— 公众验真时链上能查到「该证已被撤销」，与「被篡改」「不存在」区分；
+      2. 本地：存一条 REVOKE 类型 EvidenceRecord，作为可追溯的审计留痕
+         （记录原因 + 时间，供看板/时间轴展示）。
+
     注意：biz_id 用负数偏移，避免与 CERTIFICATE 类型的同 id 记录冲突。
     """
     from datetime import datetime as _dt
     payload = "|".join([
         cert.cert_no, "REVOKED", reason.strip(), _fmt(_dt.now()),
     ])
+
+    # 1. 链上打撤销标记（对原 certificate bizNo；失败降级不中断业务）
+    revoke_result = _revoke_on_chain(cert.cert_no, reason)
+
+    # 2. 链上写一条 REVOKE 类型的存证记录作为审计留痕（bizType=revoke 与 certificate 不冲突）
     digest = sha256_hex(payload)
     result = _anchor(digest, payload, EvidenceRecord.BizType.REVOKE,
                      cert.id, cert.cert_no)
+    # 若 revokeEvidence 已成功上链，则用其 tx_hash 作为这条审计记录的链上锚点
+    if revoke_result.get("ok") and revoke_result.get("tx_hash"):
+        result = dict(result, tx_hash=revoke_result["tx_hash"],
+                      block_height=revoke_result.get("block_height", 0),
+                      mode=revoke_result.get("mode", "mock"))
+
     return _save_record(EvidenceRecord.BizType.REVOKE, cert.id,
                         cert.cert_no, digest, payload, result)
+
+
+def _revoke_on_chain(biz_no: str, reason: str = "") -> dict:
+    """
+    调链上 revokeEvidence 对原存证记录打撤销标记。
+    链不可用/未启用时降级（返回 mode=mock），绝不抛异常。
+    """
+    if not getattr(settings, "FISCO_BCOS", {}).get("ENABLE_CHAIN", True):
+        return {"ok": False, "tx_hash": chain._mock_tx_hash(), "block_height": 0,
+                "mode": "mock", "message": "链功能已关闭，作废未上链"}
+    return chain.revoke_evidence(biz_type=EvidenceRecord.BizType.CERTIFICATE,
+                                 biz_no=biz_no, reason=reason)
 
 
 def build_inspection_payload(record) -> str:
@@ -251,18 +321,27 @@ def verify_certificate(cert: Certificate, check_chain: bool = False) -> dict:
         "message": message,
         "chain_verified": False,
         "chain_detail": "",
+        "revoked": False,
     }
 
-    # ---- 第二层：链上核验（调用合约 verifyEvidence）----
+    # ---- 第二层：链上核验（调用合约 verifyEvidence / isRevoked）----
     if check_chain and record and record.tx_hash and record.tx_hash.startswith("0x"):
         chain_info = chain.verify_on_chain(
             EvidenceRecord.BizType.CERTIFICATE, cert.cert_no, stored)
         if chain_info.get("ok"):
-            result["chain_verified"] = chain_info["matched"]
-            result["chain_detail"] = chain_info["message"]
-            if chain_info["exists"] and not chain_info["matched"]:
+            # ★ 链上已撤销（作废双向上链）：无论摘要是否一致，都判定为「已作废」
+            if chain_info.get("revoked"):
+                result["chain_verified"] = False
+                result["revoked"] = True
                 result["trusted"] = False
-                result["message"] = "数据不可信：存证记录与链上数据不一致"
+                result["chain_detail"] = chain_info["message"]
+                result["message"] = "该合格证已在链上作废（撤销），不可再用于流通"
+            else:
+                result["chain_verified"] = chain_info["matched"]
+                result["chain_detail"] = chain_info["message"]
+                if chain_info["exists"] and not chain_info["matched"]:
+                    result["trusted"] = False
+                    result["message"] = "数据不可信：存证记录与链上数据不一致"
         else:
             result["chain_detail"] = f"链上查询失败：{chain_info.get('message', '未知原因')}"
 

@@ -56,6 +56,17 @@ CONTRACT_ABI = [
         "inputs": [
             {"internalType": "string", "name": "bizType", "type": "string"},
             {"internalType": "string", "name": "bizNo", "type": "string"},
+            {"internalType": "string", "name": "reason", "type": "string"},
+        ],
+        "name": "revokeEvidence",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"internalType": "string", "name": "bizType", "type": "string"},
+            {"internalType": "string", "name": "bizNo", "type": "string"},
         ],
         "name": "getEvidence",
         "outputs": [
@@ -64,6 +75,9 @@ CONTRACT_ABI = [
             {"internalType": "address", "name": "operator", "type": "address"},
             {"internalType": "uint256", "name": "blockNum", "type": "uint256"},
             {"internalType": "bool", "name": "exists", "type": "bool"},
+            {"internalType": "bool", "name": "revoked", "type": "bool"},
+            {"internalType": "uint256", "name": "revokedAt", "type": "uint256"},
+            {"internalType": "string", "name": "revokeReason", "type": "string"},
         ],
         "stateMutability": "view",
         "type": "function",
@@ -78,6 +92,19 @@ CONTRACT_ABI = [
         "outputs": [
             {"internalType": "bool", "name": "matched", "type": "bool"},
             {"internalType": "bool", "name": "exists", "type": "bool"},
+        ],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"internalType": "string", "name": "bizType", "type": "string"},
+            {"internalType": "string", "name": "bizNo", "type": "string"},
+        ],
+        "name": "isRevoked",
+        "outputs": [
+            {"internalType": "bool", "name": "found", "type": "bool"},
+            {"internalType": "bool", "name": "revoked", "type": "bool"},
         ],
         "stateMutability": "view",
         "type": "function",
@@ -106,6 +133,18 @@ CONTRACT_ABI = [
             {"indexed": False, "internalType": "uint256", "name": "timestamp", "type": "uint256"},
         ],
         "name": "EvidenceAdded",
+        "type": "event",
+    },
+    {
+        "anonymous": False,
+        "inputs": [
+            {"indexed": True, "internalType": "string", "name": "bizType", "type": "string"},
+            {"indexed": True, "internalType": "string", "name": "bizNo", "type": "string"},
+            {"indexed": False, "internalType": "string", "name": "reason", "type": "string"},
+            {"indexed": False, "internalType": "address", "name": "operator", "type": "address"},
+            {"indexed": False, "internalType": "uint256", "name": "timestamp", "type": "uint256"},
+        ],
+        "name": "EvidenceRevoked",
         "type": "event",
     },
 ]
@@ -269,10 +308,56 @@ def send_evidence(data_hash: str, biz_no: str = "", biz_type: str = "") -> dict:
 # ------------------------------------------------------------------
 # 链上查询（验真辅助）
 # ------------------------------------------------------------------
+def revoke_evidence(biz_type: str, biz_no: str, reason: str = "") -> dict:
+    """
+    在链上撤销一条存证（作废双向上链）。
+
+    对应合约 revokeEvidence：不删原记录，而是把 revoked 置 true 并记录撤销原因。
+    这样验真时能查到「该证已被撤销」，与「从未存在」和「被篡改」区分开。
+
+    返回与 send_evidence 同构：{"ok", "tx_hash", "block_height", "mode", "message"}
+    """
+    w3 = _get_w3()
+    if w3 is None or not PRIVATE_KEY or not CONTRACT_ADDRESS:
+        if w3 is None:
+            reason_msg = "链节点不可达"
+        elif not PRIVATE_KEY:
+            reason_msg = "未配置存证私钥 FISCO_PRIVATE_KEY"
+        else:
+            reason_msg = "未配置存证合约地址 FISCO_CONTRACT_ADDRESS"
+        logger.info("作废降级为模拟模式（%s）: %s", reason_msg, biz_no)
+        return {
+            "ok": False, "tx_hash": _mock_tx_hash(), "block_height": 0,
+            "mode": "mock", "message": f"{reason_msg}，作废未上链",
+        }
+
+    try:
+        contract = _get_contract(w3)
+        fn = contract.functions.revokeEvidence(biz_type or "certificate",
+                                               biz_no or "-", reason or "")
+        result = _send(w3, fn, PRIVATE_KEY)
+        ok = result["status"] == 1
+        logger.info("作废上链%s: %s block=%s",
+                    "成功" if ok else "失败", result["tx_hash"], result["block_height"])
+        return {
+            "ok": ok,
+            "tx_hash": result["tx_hash"],
+            "block_height": result["block_height"],
+            "mode": "chain",
+            "message": "已上链作废" if ok else "交易执行失败（status != 1）",
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("作废上链异常: %s", exc)
+        return {
+            "ok": False, "tx_hash": _mock_tx_hash(), "block_height": 0,
+            "mode": "mock", "message": f"作废上链异常：{exc}",
+        }
+
+
 def query_evidence(biz_type: str, biz_no: str) -> dict:
     """
     从链上读取存证记录（调用 getEvidence）。
-    返回 {ok, exists, data_hash, timestamp, operator, block_number}
+    返回 {ok, exists, data_hash, timestamp, operator, block_number, revoked, revoked_at, revoke_reason}
     """
     w3 = _get_w3()
     if w3 is None:
@@ -281,8 +366,8 @@ def query_evidence(biz_type: str, biz_no: str) -> dict:
         return {"ok": False, "message": "未配置存证合约地址"}
     try:
         contract = _get_contract(w3)
-        data_hash, ts, operator, block_num, exists = contract.functions.getEvidence(
-            biz_type, biz_no).call()
+        data_hash, ts, operator, block_num, exists, revoked, revoked_at, revoke_reason = \
+            contract.functions.getEvidence(biz_type, biz_no).call()
         return {
             "ok": True,
             "exists": bool(exists),
@@ -290,6 +375,9 @@ def query_evidence(biz_type: str, biz_no: str) -> dict:
             "timestamp": int(ts),
             "operator": operator,
             "block_number": int(block_num),
+            "revoked": bool(revoked),
+            "revoked_at": int(revoked_at),
+            "revoke_reason": revoke_reason,
         }
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "message": str(exc)}
@@ -298,17 +386,26 @@ def query_evidence(biz_type: str, biz_no: str) -> dict:
 def verify_on_chain(biz_type: str, biz_no: str, data_hash: str) -> dict:
     """
     链上验真（调用 verifyEvidence）：判断给定摘要是否与链上记录一致。
-    返回 {ok, matched, exists, message}
+    返回 {ok, matched, exists, revoked, message}
+    说明：若该记录在链上已被撤销，matched 恒为 False 且 revoked=True（作废≠篡改）。
     """
     w3 = _get_w3()
     if w3 is None:
-        return {"ok": False, "matched": False, "exists": False,
+        return {"ok": False, "matched": False, "exists": False, "revoked": False,
                 "message": "链节点不可达"}
     if not CONTRACT_ADDRESS:
-        return {"ok": False, "matched": False, "exists": False,
+        return {"ok": False, "matched": False, "exists": False, "revoked": False,
                 "message": "未配置存证合约地址"}
     try:
         contract = _get_contract(w3)
+        # 先查是否已被撤销，再校验摘要
+        found, revoked = contract.functions.isRevoked(biz_type, biz_no).call()
+        if not found:
+            return {"ok": True, "matched": False, "exists": False, "revoked": False,
+                    "message": "链上无该存证记录"}
+        if revoked:
+            return {"ok": True, "matched": False, "exists": True, "revoked": True,
+                    "message": "该存证已在链上被撤销（作废）"}
         matched, exists = contract.functions.verifyEvidence(
             biz_type, biz_no, data_hash).call()
         if not exists:
@@ -318,6 +415,7 @@ def verify_on_chain(biz_type: str, biz_no: str, data_hash: str) -> dict:
         else:
             msg = "链上摘要不一致，数据可能被篡改"
         return {"ok": True, "matched": bool(matched), "exists": bool(exists),
-                "message": msg}
+                "revoked": False, "message": msg}
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "matched": False, "exists": False, "message": str(exc)}
+        return {"ok": False, "matched": False, "exists": False, "revoked": False,
+                "message": str(exc)}

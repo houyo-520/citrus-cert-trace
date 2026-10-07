@@ -382,6 +382,18 @@ def extract_from_file(filename: str, data: bytes) -> dict:
         confidence = "low"
         warnings.append("未能识别出关键字段（报告编号/结论/日期），请手工录入")
 
+    # ★ 数值置信度（0~100）：供前端做「<70% 需人工重点核对」的显式标记。
+    #   评分规则：三个关键字段每命中一个计 28 分，识别方式给基础分
+    #   （pdf 文本层 16 分、图像 OCR 6 分），上限 100。
+    #   这样 pdf-text 命中 2 个字段 ≈ 72 分（临界上方），
+    #   图像 OCR 命中 2 个字段 ≈ 62 分（落到 <70 警示区间）。
+    _method_base = 16 if method == "pdf-text" else 6
+    _score = _method_base + key_hit * 28
+    confidence_score = min(100, _score)
+    if confidence == "low":
+        # 低置信度封顶 55，避免「低」却显示高分造成误导
+        confidence_score = min(confidence_score, 55)
+
     # 结论没带标签时命中，提示可能是正文里蹭到的，需重点核对
     if fields.get("conclusion") and not conclusion_labelled:
         warnings.append("「检测结论」未在结论字段位置找到，取自全文关键词，务必人工确认")
@@ -395,6 +407,7 @@ def extract_from_file(filename: str, data: bytes) -> dict:
         "fields": fields,
         "filled": filled,
         "confidence": confidence,
+        "confidence_score": confidence_score,
         "warnings": warnings,
         "text_excerpt": text[:1200],
     }

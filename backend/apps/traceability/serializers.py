@@ -7,6 +7,7 @@ from .models import (Producer, ProductBatch, TestReport, Certificate,
                      EvidenceRecord, PublicQueryRecord, SupplyDemand,
                      MatchIntent, OperationLog, InspectionRecord,
                      Notification)
+from apps.accounts.models import LoginRecord
 
 # 检测报告附件允许的扩展名与大小上限（10 MB）
 REPORT_FILE_EXTS = {".pdf", ".jpg", ".jpeg", ".png", ".doc", ".docx"}
@@ -17,11 +18,29 @@ class ProducerSerializer(serializers.ModelSerializer):
     audit_status_display = serializers.CharField(source="get_audit_status_display",
                                                  read_only=True)
     owner_name = serializers.CharField(source="owner.username", read_only=True)
+    # ★ 主体信用分与等级（监管看列表时快速识别高风险主体；纯计算不落库）
+    credit_score = serializers.SerializerMethodField()
+    credit_grade = serializers.SerializerMethodField()
 
     class Meta:
         model = Producer
         fields = "__all__"
         read_only_fields = ["owner"]
+
+    def _credit(self, obj):
+        # 每次序列化只算一次，score 与 grade 复用同一结果（避免二次查询）
+        cached = getattr(obj, "_credit_cache", None)
+        if cached is None:
+            from . import credit
+            cached = credit.score_producer(obj)
+            obj._credit_cache = cached
+        return cached
+
+    def get_credit_score(self, obj):
+        return self._credit(obj)["score"]
+
+    def get_credit_grade(self, obj):
+        return self._credit(obj)["grade"]
 
 
 class ProductBatchSerializer(serializers.ModelSerializer):
@@ -120,7 +139,9 @@ class CertificateSerializer(serializers.ModelSerializer):
         model = Certificate
         fields = "__all__"
         # 编号由后端按「区域码+日期+流水」在签发时分配，前端不可填
-        read_only_fields = ["cert_no", "cert_hash", "is_anchored", "anchored_at", "issuer"]
+        # merkle_root 由后端在签发存证时汇聚证据树计算，前端不可填
+        read_only_fields = ["cert_no", "cert_hash", "is_anchored", "anchored_at",
+                            "merkle_root", "issuer"]
 
     def get_producer_name_display(self, obj):
         """主体名称：优先取存证时固化的快照，其次实时取批次关联的主体。"""
@@ -213,6 +234,22 @@ class OperationLogSerializer(serializers.ModelSerializer):
     class Meta:
         model = OperationLog
         fields = "__all__"
+
+
+class LoginRecordSerializer(serializers.ModelSerializer):
+    """登录历史序列化器（登录监控用，含地理位置）。"""
+    role_display = serializers.SerializerMethodField()
+
+    class Meta:
+        model = LoginRecord
+        fields = "__all__"
+
+    def get_role_display(self, obj):
+        role_map = {
+            "admin": "系统管理员", "regulator": "监管人员",
+            "producer": "种植主体", "buyer": "收购商",
+        }
+        return role_map.get(obj.role, obj.role or "")
 
 
 class NotificationSerializer(serializers.ModelSerializer):

@@ -8,6 +8,7 @@
   - 关键动作（审核/签发/作废/存证/对接/登录）全部落 OperationLog
 """
 import io
+from datetime import timedelta
 
 import qrcode
 from django.conf import settings
@@ -21,17 +22,18 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from apps.accounts.models import Role
+from apps.accounts.models import LoginRecord, Role
 
-from . import audit, certno, chain, matching, notify, ocr, services, timeline
+from . import audit, certno, chain, credit, matching, merkle, notify, ocr, services, timeline
 from .models import (Certificate, EvidenceRecord, InspectionRecord,
                      MatchIntent, Notification, OperationLog, Producer,
                      ProductBatch, PublicQueryRecord, SupplyDemand, TestReport)
-from .permissions import (CanTrade, IsRegulator,
+from .permissions import (CanTrade, IsAdmin, IsRegulator,
                           ReadOnlyOrProducerOrRegulator, ReadOnlyOrRegulator,
                           RoleScopedQuerySetMixin)
 from .serializers import (CertificateSerializer, EvidenceRecordSerializer,
-                          InspectionRecordSerializer, MatchIntentSerializer,
+                          InspectionRecordSerializer, LoginRecordSerializer,
+                          MatchIntentSerializer,
                           NotificationSerializer, OperationLogSerializer,
                           ProducerSerializer, ProductBatchSerializer,
                           SupplyDemandSerializer, TestReportSerializer)
@@ -117,6 +119,23 @@ class ProducerViewSet(RoleScopedQuerySetMixin, BaseViewSet):
         notify.producer_audited(obj, request.user, new_status)
         return Response({"code": 200, "message": "审核完成",
                          "data": ProducerSerializer(obj).data})
+
+    @action(detail=True, methods=["get"])
+    def credit(self, request, pk=None):
+        """
+        ★ 主体信用评分。
+
+        把一个生产主体的历史行为（检查不合格、整改逾期、作废证、不合格报告）
+        收敛成一个可解释的 0-100 信用分 + 四级等级，并附逐条扣分明细，
+        让监管人员能快速定位「哪个主体风险最高、为什么」。
+
+        返回 {score, grade, deductions[], stats}，与 credit.score_producer 同构。
+        """
+        obj = self.get_object()
+        result = credit.score_producer(obj)
+        result["producer_id"] = obj.id
+        result["producer_name"] = obj.name
+        return Response({"code": 200, "message": "ok", "data": result})
 
 
 # ===============================================================
@@ -462,6 +481,7 @@ class CertificateViewSet(RoleScopedQuerySetMixin, BaseViewSet):
                 obj.save(update_fields=update_fields)
 
                 services.anchor_certificate(obj)
+                services.anchor_merkle_root(obj)
                 audit.log_operation(request, OperationLog.Action.ISSUE,
                                     target_type="合格证", target_id=obj.id,
                                     target_no=obj.cert_no,
@@ -582,6 +602,7 @@ class CertificateViewSet(RoleScopedQuerySetMixin, BaseViewSet):
         obj.save(update_fields=update_fields)
 
         services.anchor_certificate(obj)
+        services.anchor_merkle_root(obj)
         audit.log_operation(request, OperationLog.Action.ISSUE,
                             target_type="合格证", target_id=obj.id,
                             target_no=obj.cert_no,
@@ -691,6 +712,7 @@ class CertificateViewSet(RoleScopedQuerySetMixin, BaseViewSet):
             if obj.issuer_id else "",
             # 可信存证
             "cert_hash": obj.cert_hash,
+            "merkle_root": obj.merkle_root,
             "is_anchored": obj.is_anchored,
             "anchored_at": obj.anchored_at,
             "tx_hash": record.tx_hash if record else "",
@@ -901,9 +923,15 @@ class InspectionRecordViewSet(RoleScopedQuerySetMixin, BaseViewSet):
             update_fields.append("rectify_time")
         obj.save(update_fields=update_fields)
 
-        # 复查合格 -> 恢复合格证为「已签发」；复查仍不合格 -> 维持暂停
+        # 复查合格 -> 原证作废（终态），果农需重新申领新批次；
+        # 复查仍不合格 -> 维持暂停
+        # ★ 合规闭环：农产品一经判定不合格，原批次的柑橘可能已下架/销毁，
+        #   「整改合格」≠「原证复活」。原证只能 suspended -> revoked 终态，
+        #   与新批次重新申领体系解耦，符合《食品安全法》追责闭环。
         if result == InspectionRecord.RectifyStatus.DONE:
-            self._restore_certificate(obj)
+            self._revoke_certificate_on_rectify(obj)
+            notify.cert_revoked(obj.certificate, request.user,
+                                reason=obj.certificate.suspend_reason)
         elif result == InspectionRecord.RectifyStatus.RECHECK_FAILED:
             self._suspend_certificate(obj, reason=f"整改复查仍不合格（检查#{obj.id}）")
 
@@ -931,7 +959,7 @@ class InspectionRecordViewSet(RoleScopedQuerySetMixin, BaseViewSet):
     # ---- 内部：检查结论与合格证状态联动 ----
     @staticmethod
     def _suspend_certificate(record, reason: str):
-        """检查不合格 -> 合格证暂停使用（不是作废，复查合格可恢复）。"""
+        """检查不合格 -> 合格证暂停使用（不是作废，整改复查通过后转作废终态）。"""
         cert = record.certificate
         if cert.status == Certificate.Status.REVOKED:
             return
@@ -940,32 +968,39 @@ class InspectionRecordViewSet(RoleScopedQuerySetMixin, BaseViewSet):
         cert.save(update_fields=["status", "suspend_reason", "updated_at"])
 
     @staticmethod
-    def _restore_certificate(record):
-        """复查合格 -> 恢复为已签发（仅当当前是被暂停状态）。"""
+    def _revoke_certificate_on_rectify(record):
+        """
+        复查合格 -> 原合格证作废（终态），不恢复签发。
+
+        ★ 合规闭环（区别于「复查合格即恢复」的旧逻辑）：
+        被判定不合格的批次，其柑橘可能已下架/召回/销毁，复查合格只说明
+        「整改到位」，不代表「原批次的证还能再用」。因此：
+          suspended -> revoked（终态，不可逆），并在链上追加一条作废存证，
+        果农需针对【新批次】重新申请合格证，原证永久失效。
+        这样公众扫历史二维码时，本地显示「已作废」、链上也能查到「作废记录」，
+        不会出现「本地已作废、链上验真却显示当年上链数据合法」的信任悖论。
+        """
         cert = record.certificate
         if cert.status != Certificate.Status.SUSPENDED:
             return
-        # 还有其他未闭环的不合格检查时不恢复
-        pending = cert.inspections.filter(
-            check_result=InspectionRecord.CheckResult.UNQUALIFIED
-        ).exclude(
-            rectify_status__in=[InspectionRecord.RectifyStatus.DONE,
-                                InspectionRecord.RectifyStatus.NOT_REQUIRED]
-        ).exists()
-        if pending:
-            return
-        cert.status = Certificate.Status.ISSUED
-        cert.suspend_reason = ""
+        cert.status = Certificate.Status.REVOKED
+        cert.suspend_reason = (f"整改复查通过，原批次作废（检查#{record.id}）；"
+                               f"需重新申领新批次合格证")[:255]
         cert.save(update_fields=["status", "suspend_reason", "updated_at"])
+        # 链上追加作废留痕：让「已作废」这件事本身可被链上核验到
+        try:
+            services.anchor_revoke(cert, reason=cert.suspend_reason)
+        except Exception:  # noqa: BLE001
+            # 作废存证失败不能回滚状态变更（本地状态已是事实）
+            pass
 
     def _apply_certificate_status(self, record):
-        """根据检查结论联动合格证状态。"""
+        """根据检查结论联动合格证状态（仅检查录入时）。"""
         if record.check_result == InspectionRecord.CheckResult.UNQUALIFIED:
             self._suspend_certificate(
                 record, reason=f"现场监督检查不合格（检查#{record.id}）："
                                f"{(record.problem_description or '')[:80]}")
-        elif record.check_result == InspectionRecord.CheckResult.QUALIFIED:
-            self._restore_certificate(record)
+        # 检查「合格」本身不改变证状态（合格不暂停，无需回写）
 
 
 # ===============================================================
@@ -1226,6 +1261,100 @@ class OperationLogViewSet(RoleScopedQuerySetMixin, viewsets.ReadOnlyModelViewSet
 
 
 # ===============================================================
+# ★ 登录监控（系统管理员专属：登录 IP / 地点 / 设备 审计）
+# ===============================================================
+class LoginMonitorViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    登录监控。
+
+    ★ 仅系统管理员可访问（IsAdmin），其他角色一律 403 ——
+      登录历史属于账号安全敏感数据，涉及所有用户的活动轨迹，
+      不能像普通业务数据那样对监管/种植主体/收购商做数据级隔离后开放。
+
+    提供：
+      - 标准 list / retrieve：按条件筛登录历史（用户/IP/地点/成败/时段）
+      - extra action `summary`：登录安全统计（总登录数、成功/失败、
+        活跃用户数、最近登录、异地登录告警、IP 分布）
+    """
+    permission_classes = [IsAdmin]
+    serializer_class = LoginRecordSerializer
+    queryset = LoginRecord.objects.select_related("user").all()
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        p = self.request.query_params
+        if p.get("username"):
+            qs = qs.filter(username__icontains=p["username"])
+        if p.get("ip"):
+            qs = qs.filter(ip__icontains=p["ip"])
+        if p.get("location"):
+            qs = qs.filter(location__icontains=p["location"])
+        if p.get("success") in ("1", "true", "True"):
+            qs = qs.filter(success=True)
+        elif p.get("success") in ("0", "false", "False"):
+            qs = qs.filter(success=False)
+        if p.get("role"):
+            qs = qs.filter(role=p["role"])
+        return qs
+
+    @action(detail=False, methods=["get"])
+    def summary(self, request):
+        """
+        登录安全汇总统计。
+        异地登录判定：同一用户出现 ≥2 个不同「省+市」的登录地点，即视为
+        存在异地登录行为，列出来供管理员人工研判。
+        """
+        qs = LoginRecord.objects.all()
+        total = qs.count()
+        success_cnt = qs.filter(success=True).count()
+        fail_cnt = total - success_cnt
+        active_users = qs.values("username").distinct().count()
+
+        latest = qs.order_by("-id").first()
+        latest_info = LoginRecordSerializer(latest).data if latest else None
+
+        # 异地登录：按用户聚合去重地点数
+        anomaly = []
+        for row in (qs.filter(success=True)
+                      .values("username")
+                      .annotate(places=Count("location", distinct=True))):
+            if row["places"] and row["places"] >= 2:
+                anomaly.append({
+                    "username": row["username"],
+                    "place_count": row["places"],
+                })
+
+        # IP 分布 TOP（取访问最多的 IP）
+        ip_dist = list(
+            qs.values("ip", "location")
+              .annotate(c=Count("id"))
+              .order_by("-c")[:10]
+        )
+
+        # 失败登录 TOP（潜在爆破目标）
+        fail_targets = list(
+            qs.filter(success=False)
+              .values("username", "ip")
+              .annotate(c=Count("id"))
+              .order_by("-c")[:10]
+        )
+
+        return Response({
+            "code": 200,
+            "data": {
+                "total": total,
+                "success_count": success_cnt,
+                "fail_count": fail_cnt,
+                "active_users": active_users,
+                "latest": latest_info,
+                "anomaly": anomaly,
+                "ip_distribution": ip_dist,
+                "fail_targets": fail_targets,
+            },
+        })
+
+
+# ===============================================================
 # ★ 站内消息（流程闭环的最后一环）
 # ===============================================================
 class NotificationViewSet(viewsets.ModelViewSet):
@@ -1310,18 +1439,28 @@ class PublicVerifyView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request, cert_no):
+        # ★ 防刷限流：按来源 IP 做滑动窗口计数（默认每分钟 30 次）。
+        #   公众扫码验真是匿名接口，不设限会被脚本拖库/放大查询，占用链上核验资源。
+        ip = self._ip(request)
+        if not self._allow_query(ip):
+            return Response(
+                {"code": 429, "message": "查询过于频繁，请稍后再试",
+                 "data": None},
+                status=status.HTTP_429_TOO_MANY_REQUESTS)
+
         cert = Certificate.objects.select_related(
             "batch", "batch__producer", "report").filter(cert_no=cert_no).first()
         if not cert:
             PublicQueryRecord.objects.create(cert_no=cert_no, result="not_found",
-                                             ip=self._ip(request))
+                                             ip=ip)
             return Response({"code": 404, "message": "未查询到该合格证",
                              "data": None}, status=status.HTTP_404_NOT_FOUND)
 
         verify = services.verify_certificate(cert, check_chain=True)
+        query_result = "revoked" if verify.get("revoked") else (
+            "trusted" if verify["trusted"] else "untrusted")
         PublicQueryRecord.objects.create(
-            cert_no=cert_no, result="trusted" if verify["trusted"] else "untrusted",
-            ip=self._ip(request))
+            cert_no=cert_no, result=query_result, ip=ip)
 
         # ★ 监督检查公示：让消费者扫码就能看到「这张证是否被查出过问题」
         inspections = cert.inspections.order_by("-check_time", "-id")
@@ -1346,6 +1485,9 @@ class PublicVerifyView(APIView):
             "status": cert.status,
             "status_display": cert.get_status_display(),
             "suspend_reason": cert.suspend_reason,
+            # ★ 动态防伪水印标识：本次查询生成的「查询人指纹 + 时间」，
+            #   前端渲染成半透明水印铺在验真页上。截图泄露后可据此溯源。
+            "watermark": self._watermark(ip, cert.cert_no),
             "producer_name": cert.producer_name,
             "product_name": cert.product_name,
             "quantity_kg": str(cert.quantity_kg),
@@ -1364,6 +1506,8 @@ class PublicVerifyView(APIView):
             "current_hash": verify["current_hash"],
             "chain_verified": verify.get("chain_verified", False),
             "chain_detail": verify.get("chain_detail", ""),
+            # ★ 链上作废标记：作废双向上链后，验真页据此显示「该证已在链上作废」
+            "revoked": verify.get("revoked", False),
             # ★ 编号解析（让公众看到「区域/日期/序号」的构成）
             "cert_no_parsed": certno.parse_cert_no(cert.cert_no),
             # ★ 监督检查公示
@@ -1386,6 +1530,41 @@ class PublicVerifyView(APIView):
     @staticmethod
     def _ip(request):
         return audit.get_client_ip(request)
+
+    @staticmethod
+    def _watermark(ip: str, cert_no: str) -> str:
+        """
+        动态防伪水印内容：不暴露完整 IP（隐私），只留可溯源的指纹。
+        格式：验真查询 · {ip后段/掩码} · {时间} · {证号}
+        截图泄露时，配合服务端 PublicQueryRecord（含完整 ip + 时间戳）
+        可精确定位是哪一次查询、来自哪个地址。
+        """
+        ts = timezone.now().strftime("%Y-%m-%d %H:%M:%S")
+        # IP 掩码：仅保留前两段 + 末段，中间用 * 打码，避免水印本身泄露敏感信息
+        masked_ip = audit.mask_ip(ip) if hasattr(audit, "mask_ip") else ip
+        return f"验真查询 | 来源 {masked_ip} | {ts} | {cert_no}"
+
+    @staticmethod
+    def _allow_query(ip: str) -> bool:
+        """
+        限流：按来源 IP 统计「近 60 秒内」的验真查询次数，超过阈值则拒绝。
+
+        ★ 为什么用数据库计数而非进程内缓存：
+          gunicorn 以 `--workers 3` 多进程运行，每个 worker 持有独立的 LocMem 缓存，
+          进程内 cache.incr 计数互不共享 —— 单 IP 实际能冲到 3×阈值才被拦，甚至因
+          负载均衡永远命中不了同一 worker。故改为读 PublicQueryRecord（已随每次查询
+          落库）做时间窗口 count，跨进程天然共享、无需引入 Redis 依赖。
+
+        注：验真接口本身就会写 PublicQueryRecord，这里只多一次 count 查询，开销可接受。
+        """
+        limit = getattr(settings, "VERIFY_RATE_LIMIT", 30)
+        if limit <= 0:
+            return True
+        window_start = timezone.now() - timedelta(seconds=60)
+        recent = PublicQueryRecord.objects.filter(
+            ip=ip, created_at__gte=window_start
+        ).count()
+        return recent < limit
 
 
 # ===============================================================
@@ -1469,6 +1648,8 @@ class DashboardView(APIView):
             base["scope_label"] = "全量数据（监管视角）"
             base["pending_audit_count"] = Producer.objects.filter(
                 audit_status=Producer.AuditStatus.PENDING).count()
+            # ★ 主体信用评分排行（仅监管视角计算，低分=高风险，升序）
+            base["credit_ranking"] = self._credit_ranking()
             return base
 
         if user.role == Role.PRODUCER:
@@ -1605,6 +1786,30 @@ class DashboardView(APIView):
             a=Avg("match_score"))["a"]
         return round(float(v), 1) if v is not None else 0
 
+    @staticmethod
+    def _credit_ranking(limit: int = 10):
+        """
+        ★ 主体信用评分排行（监管看板：一眼看穿哪些主体风险最高）。
+
+        用 credit.score_producer 给每个主体算信用分，按分升序排列（低分=高风险
+        排前面），附等级与扣分项数，前端据此渲染「信用红黑榜」。
+        上限默认 10，避免主体多时全量计算拖慢看板。
+        """
+        rows = []
+        for p in Producer.objects.all()[:200]:  # 防御上限，避免极端数据量拖垮看板
+            score = credit.score_producer(p)
+            rows.append({
+                "id": p.id,
+                "name": p.name,
+                "score": score["score"],
+                "grade": score["grade"],
+                "deduction_count": len(score["deductions"]),
+                "revoked_count": score["stats"]["revoked_certificates"],
+                "unqualified_count": score["stats"]["unqualified_inspections"],
+            })
+        rows.sort(key=lambda r: r["score"])  # 低分在前 = 风险优先
+        return rows[:limit]
+
 
 # ===============================================================
 # ★ 风险预警汇总（首页红点 + 预警清单）
@@ -1687,7 +1892,7 @@ class AlertView(APIView):
         suspended = Certificate.objects.filter(status=Certificate.Status.SUSPENDED)
         alerts.append(self._pack(
             "cert_suspended", "warning", "合格证暂停使用",
-            "因检查不合格被暂停流通，复查合格可恢复",
+            "因检查不合格被暂停流通，整改复查通过后原证作废",
             suspended, "certificate", "去查看",
             [{"label": c.cert_no or f"#{c.id}", "extra": c.producer_name or "",
               "desc": c.suspend_reason} for c in suspended[:20]]))
@@ -1754,7 +1959,7 @@ class AlertView(APIView):
         suspended = my_certs.filter(status=Certificate.Status.SUSPENDED)
         alerts.append(self._pack(
             "cert_suspended", "warning", "我的合格证被暂停",
-            "该证当前不可用于流通交易，完成整改并通过复查后可恢复",
+            "该证当前不可用于流通交易，整改复查通过后原证作废，需对新批次重新申领",
             suspended, "certificate", "去查看",
             [{"label": c.cert_no or f"#{c.id}", "extra": c.product_name,
               "desc": c.suspend_reason} for c in suspended[:20]]))
@@ -1907,7 +2112,7 @@ class RoleMatrixView(APIView):
                     {"key": "pending", "label": "待审核", "desc": "已提交，仍不占号"},
                     {"key": "issued", "label": "已签发", "desc": "已分配编号 + 已上链"},
                     {"key": "suspended", "label": "暂停使用",
-                     "desc": "监督检查不合格，暂缓流通，复查合格可恢复"},
+                     "desc": "监督检查不合格，暂缓流通；整改复查通过后原证转为作废终态"},
                     {"key": "revoked", "label": "已作废", "desc": "永久失效 + 作废存证"},
                 ],
             },

@@ -20,6 +20,22 @@ def get_client_ip(request) -> str:
     return request.META.get("REMOTE_ADDR", "")
 
 
+def mask_ip(ip: str) -> str:
+    """IP 掩码：仅保留前两段 + 末段，中间打码，避免水印本身泄露完整地址。
+
+    例：203.0.113.5 -> 203.0.*.5 ；IPv6 过长则整体截断打码。
+    """
+    if not ip:
+        return "未知"
+    if ":" in ip:  # IPv6
+        return ip[:6] + "…"
+    parts = ip.split(".")
+    if len(parts) == 4:
+        return f"{parts[0]}.{parts[1]}.*.{parts[3]}"
+    # 非法/非标准 IP：直接打码前段，避免原样输出
+    return ip[:3] + ".***"
+
+
 def log_operation(request, action: str, target_type: str = "", target_id=None,
                   target_no: str = "", detail: str = "", success: bool = True,
                   operator=None) -> OperationLog:

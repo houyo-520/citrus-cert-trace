@@ -208,3 +208,32 @@ FISCO_BCOS = {
     # 是否启用真实上链（False 则一律走模拟存证，便于离线开发）
     "ENABLE_CHAIN": os.environ.get("FISCO_ENABLE_CHAIN", "true").lower() == "true",
 }
+
+# ---------------------------------------------------------------
+# 可信存证哈希加盐（Salted Hash）
+# ---------------------------------------------------------------
+# 存证摘要采用「加盐 SHA-256」：hash = sha256(salt + payload)。
+# 加盐的价值：抵御彩虹表/字典逆向 —— 即便某方拿到公开的规范化原文与摘要，
+# 也无法用常见字典反向碰撞出原始字段（例如试图离线枚举果农手机号等敏感值）。
+# 盐值属于「私密参数」，必须通过环境变量注入，绝不写进 Git/前端。
+# 生产环境未设置时给默认值（仅本地开发），生产会在 DEBUG=false + 弱盐时拒绝启动。
+EVIDENCE_SALT = os.environ.get("EVIDENCE_SALT", "")
+if not EVIDENCE_SALT and not DEBUG:
+    raise RuntimeError(
+        "生产环境未设置 EVIDENCE_SALT，拒绝启动。"
+        "请在 .env 中设置随机盐值（如 `python -c "
+        "\"import secrets; print(secrets.token_urlsafe(32))\"` 生成）。"
+    )
+
+# ---------------------------------------------------------------
+# 缓存：验真接口限流等用途（生产建议换 Redis，单机用 LocMem 即可）
+# ---------------------------------------------------------------
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        "LOCATION": "citrus-local-cache",
+    }
+}
+
+# 验真接口限流：每个来源 IP 每分钟允许的查询次数（防刷/防拖库）
+VERIFY_RATE_LIMIT = int(os.environ.get("VERIFY_RATE_LIMIT", "30"))

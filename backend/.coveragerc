@@ -1,0 +1,30 @@
+# coverage.py 配置 —— 后端测试覆盖率统计口径
+# 用法（在 backend/ 目录下）：
+#   python -m coverage run --source=apps manage.py test   # 跑测试并采集
+#   python -m coverage report                              # 命令行报告
+#   python -m coverage html                                # 生成 htmlcov/ 可视化报告
+[run]
+# 只统计业务代码（apps 下的应用），排除 Django 框架与第三方库
+source = apps
+
+[report]
+# 排除无业务含义的文件，让「业务代码覆盖率」更准确：
+#   migrations/*     Django 自动生成的迁移脚本（100% 但无测试价值）
+#   tests.py          测试代码本身（不参与覆盖率统计）
+#   admin.py          Django 后台注册（已下线 /admin，不纳入业务口径）
+#   apps.py           应用配置声明
+#   management/commands/*  运维管理命令（init_data 演示数据初始化 / rehash_all 加盐迁移，
+#                          属一次性运维脚本，通过手动执行验证，非系统运行时功能）
+omit =
+    */migrations/*
+    */tests.py
+    */admin.py
+    */apps.py
+    */management/commands/*
+
+# 常见的「不应计入覆盖」的代码行
+exclude_lines =
+    pragma: no cover
+    def __repr__
+    raise NotImplementedError
+    if TYPE_CHECKING:
