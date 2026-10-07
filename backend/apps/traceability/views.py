@@ -754,6 +754,9 @@ class CertificateViewSet(RoleScopedQuerySetMixin, BaseViewSet):
             # 可信存证
             "cert_hash": obj.cert_hash,
             "merkle_root": obj.merkle_root,
+            # ★ Merkle 根漂移说明（原报告 Minor）：告知「存储根 vs 当前重算根」，
+            #   避免签发后新增检查存证被误读为篡改。
+            "merkle_check": merkle.check_merkle_drift(obj),
             "is_anchored": obj.is_anchored,
             "anchored_at": obj.anchored_at,
             "tx_hash": record.tx_hash if record else "",

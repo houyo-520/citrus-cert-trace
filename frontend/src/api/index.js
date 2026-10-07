@@ -2,6 +2,8 @@ import request from '@/utils/request'
 
 // ---- 认证 ----
 export const login = (data) => request.post('/auth/login/', data)
+// ★ 注销：把 refresh token 交给后端拉黑（JWT 加固）
+export const logout = (refresh) => request.post('/auth/logout/', { refresh })
 export const getProfile = () => request.get('/auth/profile/')
 
 // ---- 生产主体 ----

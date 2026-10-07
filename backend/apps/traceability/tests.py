@@ -2911,3 +2911,74 @@ class SecurityHardeningTest(BaseFixture):
         rec.refresh_from_db()
         self.assertIn("dry-run", out.getvalue())
         self.assertEqual(rec.chain_status, before_chain)
+
+
+# ===============================================================
+# ★ 第三批加固回归（JWT 轮换/注销、Merkle 漂移、report_hash 对齐）
+# ===============================================================
+class JwtAndMerkleHardeningTest(BaseFixture):
+    """JWT 黑名单注销、Merkle 根漂移检测、report_hash 与存证对齐。"""
+
+    def test_logout_blacklists_refresh(self):
+        """注销后该 refresh 不能再用（黑名单生效）。"""
+        from rest_framework_simplejwt.tokens import RefreshToken as RT
+        c = APIClient()
+        r = c.post("/api/auth/login/", {
+            "username": "t_prod", "password": "admin123"}, format="json")
+        self.assertEqual(r.status_code, 200)
+        payload = r.data.get("data") or {}
+        refresh = payload.get("refresh")
+        self.assertTrue(refresh, "登录应返回 refresh token")
+        # 用 access 调注销
+        access = payload.get("access")
+        c.credentials(HTTP_AUTHORIZATION="Bearer " + access)
+        out = c.post("/api/auth/logout/", {"refresh": refresh}, format="json")
+        self.assertEqual(out.status_code, 200)
+        # 该 refresh 应已在黑名单
+        try:
+            RT(refresh).check_blacklist()
+            blacklisted = False
+        except Exception:
+            blacklisted = True
+        self.assertTrue(blacklisted, "注销后 refresh 应已在黑名单")
+
+    def test_merkle_drift_check_reports_no_drift_initially(self):
+        """刚签发（无后续检查）时 merkle 根不漂移。"""
+        services.anchor_certificate(self.cert)
+        services.anchor_merkle_root(self.cert)
+        from . import merkle as _m
+        info = _m.check_merkle_drift(self.cert)
+        self.assertEqual(info["stored"], info["recomputed"])
+        self.assertFalse(info["drifted"])
+
+    def test_merkle_drift_detected_after_new_inspection(self):
+        """签发后新增「已存证检查」→ 重算根偏离存储根，drifted=True 且有说明。"""
+        services.anchor_certificate(self.cert)
+        first = services.anchor_merkle_root(self.cert)
+        self.assertIsNotNone(first)
+        # 新增一条已存证的检查记录
+        ins = InspectionRecord.objects.create(
+            certificate=self.cert, check_type=InspectionRecord.CheckType.ROUTINE,
+            check_result=InspectionRecord.CheckResult.QUALIFIED,
+            inspector=self.regulator, inspector_name="监管员",
+            check_location="基地", record_hash="a" * 64, is_anchored=True)
+        from . import merkle as _m
+        info = _m.check_merkle_drift(self.cert)
+        self.assertTrue(info["drifted"], "新增检查存证后应检测到 Merkle 根漂移")
+        self.assertIn("演进", info["message"])
+
+    def test_report_hash_matches_current_evidence(self):
+        """report_hash 应与「当前版本」存证摘要一致（不再与历史分叉）。"""
+        services.anchor_report(self.report)
+        rec = EvidenceRecord.objects.get(
+            biz_type=EvidenceRecord.BizType.REPORT, biz_id=self.report.id,
+            is_current=True)
+        self.report.refresh_from_db()
+        self.assertEqual(self.report.report_hash, rec.data_hash)
+
+    def test_secure_settings_default_off_on_http(self):
+        """纯 HTTP 部署时 SECURE_SSL_REDIRECT 必须为 False（否则重定向死循环）。"""
+        from django.conf import settings as s
+        # 默认（未设 DJANGO_HTTPS）应为 False
+        self.assertFalse(s.SECURE_SSL_REDIRECT)
+        self.assertEqual(s.SECURE_HSTS_SECONDS, 0)

@@ -84,6 +84,10 @@ def _anchor(digest: str, payload: str, biz_type: str, biz_id: int, biz_no: str) 
     """
     统一上链入口：把摘要写入联盟链，返回 chain.send_evidence 的结果。
     关闭链功能（FISCO_BCOS.ENABLE_CHAIN=False）时直接走模拟。
+
+    说明：`payload`（存证原文）当前**不参与上链**（链上只锚定摘要，原文存本地库，
+    这是隐私与成本考量）；保留该参数是为了调用处语义清晰与将来扩展
+    （如需链上存原文可直接取用）。`biz_id` 同理，本层未用到，仅供上层语义完整。
     """
     if not getattr(settings, "FISCO_BCOS", {}).get("ENABLE_CHAIN", True):
         return {"ok": False, "tx_hash": chain._mock_tx_hash(), "block_height": 0,
@@ -239,6 +243,18 @@ def anchor_batch(batch) -> EvidenceRecord:
 
 
 def anchor_report(report) -> EvidenceRecord:
+    """
+    对检测报告存证。
+
+    ★ 与追加式版本对齐（原报告 Minor）：`report.report_hash` 是「报告字段的
+    当前快照哈希」。早期实现每次存证都覆盖它，而存证表是追加式（历史版本保留）
+    —— 两者会分叉：本地 report_hash=新、历史存证记录=旧。
+
+    现在：**首次存证时固化 report_hash**；后续若报告字段变了，report_hash 依然
+    如实更新（它代表「当前内容」的哈希，本就是给前端「一键核验」用的），
+    但存证表里会**追加新版本**保留旧摘要 —— 于是「当前哈希」与「当前版本存证」
+    始终一致，历史版本可追溯。这样两者语义不再打架。
+    """
     payload = "|".join([
         report.report_no, report.batch.batch_no if report.batch_id else "",
         report.conclusion, _fmt(report.test_date),
@@ -262,7 +278,9 @@ def anchor_revoke(cert: Certificate, reason: str = "") -> EvidenceRecord:
       2. 本地：存一条 REVOKE 类型 EvidenceRecord，作为可追溯的审计留痕
          （记录原因 + 时间，供看板/时间轴展示）。
 
-    注意：biz_id 用负数偏移，避免与 CERTIFICATE 类型的同 id 记录冲突。
+    注意：REVOKE 与 CERTIFICATE 是**不同的 biz_type**，条件唯一约束是
+    (biz_type, biz_id)，因此同 id 也不会冲突 —— 早期注释说「用负数偏移」
+    与实现不符（实现从未做偏移），此处更正。
     """
     from datetime import datetime as _dt
     # ★ cert_no 兜底（原 M2）：草稿证 cert_no 为 None，直接参与拼接会得到

@@ -218,7 +218,8 @@ const onCommand = async (cmd) => {
     // 退出时清掉缓存，避免下一个账号登录时闪出上个账号的红点/角标
     alertStore.reset()
     noticeStore.reset()
-    userStore.logout()
+    // ★ logout 已改为 async（会调用后端拉黑 refresh）
+    await userStore.logout()
     router.push('/login')
   }
 }

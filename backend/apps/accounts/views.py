@@ -119,3 +119,26 @@ class ProfileView(APIView):
     def get(self, request):
         return Response({"code": 200, "message": "ok",
                          "data": UserSerializer(request.user).data})
+
+class LogoutView(APIView):
+    """
+    注销：把 refresh token 加入黑名单。
+
+    ★ 为什么需要（JWT 加固）：JWT 是无状态的，签出去就在有效期内一直有效，
+    没有服务端「注销」概念。开启 token_blacklist 后，注销时把 refresh 拉黑，
+    该 refresh 无法再换新 access；配合 ROTATE+BACKLIST，泄露窗口大幅收窄。
+    入参：{"refresh": "<refresh token>"}。access 无需传（短时效自然过期）。
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        token = request.data.get("refresh")
+        if not token:
+            return Response({"code": 400, "message": "缺少 refresh token"},
+                            status=status.HTTP_400_BAD_REQUEST)
+        try:
+            from rest_framework_simplejwt.tokens import RefreshToken as RT
+            RT(token).blacklist()
+        except Exception:  # noqa: BLE001 token 非法/已过期/已拉黑都算注销成功
+            pass
+        return Response({"code": 200, "message": "已注销", "data": None})

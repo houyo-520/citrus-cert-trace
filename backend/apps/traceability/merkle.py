@@ -85,6 +85,38 @@ def build_certificate_merkle_root(cert) -> str:
     return merkle_root(leaves)
 
 
+def check_merkle_drift(cert) -> dict:
+    """
+    检测「Merkle 根漂移」。
+
+    ★ 漂移成因（原报告 Minor）：签发时写入 cert.merkle_root（当时证据树快照）。
+    之后若该证新增了**检查记录存证**，重算的根会与存储值不同 —— 因为检查哈希
+    是在签发后才加入证据树的。这不是 bug（根本就是「签发那一刻」的快照），
+    但**若不显式告知**，会被误认为「数据被篡改」。
+
+    返回：
+      {"stored": 存储根, "recomputed": 当前重算根, "drifted": bool,
+       "message": 人类可读说明}
+    drifted=True 表示签发后证据树有新增（正常业务演进，非篡改）。
+    """
+    stored = getattr(cert, "merkle_root", "") or ""
+    recomputed = build_certificate_merkle_root(cert)
+    drifted = bool(stored) and stored != recomputed
+    if not stored:
+        msg = "该证未生成 Merkle 根（可能为早期数据或未签发）"
+    elif drifted:
+        msg = ("Merkle 根已演进：签发后又新增了证据（如监督检查存证），"
+               "存储根为签发时快照，重算根反映当前全量证据 —— 属正常演进，非篡改")
+    else:
+        msg = "Merkle 根一致：发起签发至今证据树未变"
+    return {
+        "stored": stored,
+        "recomputed": recomputed,
+        "drifted": drifted,
+        "message": msg,
+    }
+
+
 def merkle_proof(leaves: list, index: int) -> list:
     """
     生成第 index 个叶子的 Merkle 证明（从叶到根路径上的兄弟哈希 + 方向）。

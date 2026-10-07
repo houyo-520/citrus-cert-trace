@@ -73,6 +73,9 @@ INSTALLED_APPS = [
     # 第三方
     "rest_framework",
     "corsheaders",
+    # ★ JWT 黑名单（支持 refresh 轮换 + 注销）：
+    #   开启后旧 refresh token 在轮换/注销时被拉黑，无法再换新 access。
+    "rest_framework_simplejwt.token_blacklist",
     # 业务应用
     "apps.accounts",
     "apps.traceability",
@@ -165,8 +168,16 @@ REST_FRAMEWORK = {
 }
 
 SIMPLE_JWT = {
-    "ACCESS_TOKEN_LIFETIME": timedelta(hours=12),
+    # ★ 缩短 access 时效（原 12h 过长）：access 一旦泄露，12 小时内都有效。
+    #   改为 2h，配合 refresh 轮换，泄露窗口大幅收窄。
+    "ACCESS_TOKEN_LIFETIME": timedelta(hours=2),
     "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
+    # ★ 轮换 + 黑名单：每次刷新签发新 refresh，旧的立即拉黑。
+    #   这样即使 refresh 被窃取，一旦真正用户刷新过一次，旧 token 即失效。
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_AFTER_ROTATION": True,
+    # ★ 不再使用「滑动续期」隐式延长会话有效期
+    "UPDATE_LAST_LOGIN": False,
     "AUTH_HEADER_TYPES": ("Bearer",),
     "USER_ID_FIELD": "id",
     "USER_ID_CLAIM": "user_id",
@@ -190,6 +201,34 @@ CORS_ALLOWED_ORIGINS = [
     ).split(",")
     if o.strip()
 ]
+
+# ---------------------------------------------------------------
+# ★ 传输层安全（JWT/Cookie 加固）
+#
+# ⚠️ 默认全部**关闭**，因为当前线上是 IP 直连 HTTP:8090（ICP 已注销、HTTPS 域名失效）。
+#   若在纯 HTTP 环境启用 SECURE_SSL_REDIRECT，会把所有请求 301 到 https →
+#   而 https 又不可用 → 站点直接不可访问（重定向死循环）。
+#   因此改为**环境变量开关**：将来恢复 HTTPS 域名后，在 .env 里打开即可。
+#     DJANGO_HTTPS=1        → 启用 SSL 重定向 + HSTS + Secure Cookie
+# ---------------------------------------------------------------
+_HTTPS = os.environ.get("DJANGO_HTTPS", "false").lower() == "true"
+
+# 未启用 HTTPS 时，HSTS 等无意义（甚至有害），仅在 _HTTPS 时生效
+SECURE_SSL_REDIRECT = _HTTPS
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https") if _HTTPS else None
+# HSTS：启用 HTTPS 后强制浏览器走 HTTPS，1 年；含子域 + preload 需谨慎，这里先不加 preload
+SECURE_HSTS_SECONDS = 31536000 if _HTTPS else 0
+SECURE_HSTS_INCLUDE_SUBDOMAINS = _HTTPS
+SECURE_HSTS_PRELOAD = False
+# Cookie 安全标志（部署在 HTTPS 下必须开启）
+SESSION_COOKIE_SECURE = _HTTPS
+CSRF_COOKIE_SECURE = _HTTPS
+SESSION_COOKIE_HTTPONLY = True
+CSRF_COOKIE_HTTPONLY = False   # 前端需读 CSRF cookie（DRF session 场景）
+# 其他安全头（Django 3.0+ 自带，显式声明便于审阅）
+SECURE_CONTENT_TYPE_NOSNIFF = True
+SECURE_REFERRER_POLICY = "strict-origin-when-cross-origin"
+X_FRAME_OPTIONS = "SAMEORIGIN"
 
 # 前端验真页地址（二维码指向）
 FRONTEND_VERIFY_BASE = os.environ.get(
