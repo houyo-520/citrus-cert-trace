@@ -2982,3 +2982,62 @@ class JwtAndMerkleHardeningTest(BaseFixture):
         # 默认（未设 DJANGO_HTTPS）应为 False
         self.assertFalse(s.SECURE_SSL_REDIRECT)
         self.assertEqual(s.SECURE_HSTS_SECONDS, 0)
+
+
+# ===============================================================
+# ★ 第四批加固回归（R5 时区口径一致、R1 版本切换原子性）
+# ===============================================================
+class TimezoneAndAtomicityTest(BaseFixture):
+    """today_local 口径统一、追加版本切换的原子/一致性。"""
+
+    def test_today_local_matches_timezone(self):
+        """certno.today_local() 应等于 settings.TIME_ZONE 下的当天（与机器时区无关）。"""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from django.conf import settings as s
+        from . import certno
+        expect = datetime.now(ZoneInfo(s.TIME_ZONE)).date()
+        self.assertEqual(certno.today_local(), expect)
+
+    def test_issue_date_uses_same_source_as_cert_no(self):
+        """签发时 issue_date 与编号日期段应为同一天（R5：不再差一天）。"""
+        from . import certno
+        reg = self.login(self.regulator)
+        cert = Certificate.objects.create(
+            batch=self.batch, report=self.report, quantity_kg=Decimal("10"),
+            status=Certificate.Status.PENDING)
+        r = reg.post(f"/api/certificate/{cert.id}/issue/", {}, format="json")
+        self.assertEqual(r.status_code, 200)
+        cert.refresh_from_db()
+        self.assertTrue(cert.cert_no, "签发应分配编号")
+        self.assertIsNotNone(cert.issue_date)
+        # 编号第 7~14 位是日期段
+        no_date = cert.cert_no[6:14]
+        self.assertEqual(no_date, cert.issue_date.strftime("%Y%m%d"),
+                         "编号日期段与 issue_date 必须一致")
+
+    def test_reanchor_keeps_exactly_one_current(self):
+        """重存证后必须恰好一条 is_current 版本（R1：无中间态）。"""
+        services.anchor_certificate(self.cert)
+        Certificate.objects.filter(id=self.cert.id).update(
+            quantity_kg=Decimal("1.00"))
+        self.cert.refresh_from_db()
+        services.anchor_certificate(self.cert)
+        rows = EvidenceRecord.objects.filter(
+            biz_type=EvidenceRecord.BizType.CERTIFICATE, biz_id=self.cert.id)
+        self.assertEqual(rows.filter(is_current=True).count(), 1,
+                         "任何时刻都应有且仅有一条 current 版本")
+        self.assertGreaterEqual(rows.count(), 2, "历史版本应保留")
+
+    def test_certificate_data_uses_current_version(self):
+        """证面接口的 tx_hash 取 is_current 版本，而非「id 最大」的巧合。"""
+        services.anchor_certificate(self.cert)
+        services.anchor_merkle_root(self.cert)
+        reg = self.login(self.regulator)
+        r = reg.get(f"/api/certificate/{self.cert.id}/certificate-data/")
+        self.assertEqual(r.status_code, 200)
+        data = r.data.get("data", r.data)
+        cur = EvidenceRecord.objects.get(
+            biz_type=EvidenceRecord.BizType.CERTIFICATE, biz_id=self.cert.id,
+            is_current=True)
+        self.assertEqual(data.get("tx_hash"), cur.tx_hash)

@@ -187,10 +187,11 @@ def ocr_image(data: bytes, lang: str = "chi_sim+eng") -> str:
     优先用 pytesseract（Python 封装）；不可用时回退到直接调 tesseract 命令行 ——
     这样即使生产环境漏装了 pytesseract 也不会整个功能失效。
 
-    ★ 安全（M13）：PIL 有「解压炸弹」保护（DecompressionBombError）——
-    一张很小的压缩图能解出天量像素。原实现 `except Exception: pass` 会把它吞掉、
-    再降级到命令行 tesseract 对**同一张炸弹**重跑（3 页 ×60s 同步阻塞）。
-    现在显式区分：炸弹类错误直接放弃，不再降级重跑。
+    ★ 安全（M13）：
+      - PIL 只在超过 MAX_IMAGE_PIXELS **2 倍**时才 raise DecompressionBombError，
+        介于 1~2 倍之间仅 warn（不抛）。因此**不能只靠异常**判断，
+        必须在 open 后显式检查像素数（R3 修复）。
+      - 炸弹图片直接返回空，绝不把同一份数据再喂给命令行 tesseract 重跑。
     """
     bomb = False
     # 路线一：pytesseract
@@ -200,12 +201,15 @@ def ocr_image(data: bytes, lang: str = "chi_sim+eng") -> str:
         # 收紧 PIL 全局像素上限（默认 ~89MP，这里用配置值）
         Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
         img = Image.open(io.BytesIO(data))
+        # ★ R3：显式判像素上限（不依赖异常）——覆盖 PIL 只 warn 不抛的中间地带
+        if img.width * img.height > MAX_IMAGE_PIXELS:
+            return ""
         # 灰度化能显著提升中文小字的识别率（去彩色干扰）
         if img.mode != "L":
             img = img.convert("L")
         return pytesseract.image_to_string(img, lang=lang)
     except Exception as exc:  # noqa: BLE001
-        # DecompressionBombError / DecompressionBombWarning 类：不再降级重跑
+        # DecompressionBombError 类：不再降级重跑
         name = type(exc).__name__
         if "DecompressionBomb" in name or "bomb" in str(exc).lower():
             bomb = True

@@ -385,7 +385,8 @@ const openFile = async (row) => {
   try {
     await downloadFile(row.file_url, row.file_name || '')
   } catch (e) {
-    ElMessage.error('附件下载失败，可能无权限或文件已删除')
+    // downloadFile 内部已按状态码给出准确提示（401 过期 / 403 无权 / 其他），
+    // 这里不再重复弹通用文案，避免「过期」被误说成「无权限」。
   }
 }
 

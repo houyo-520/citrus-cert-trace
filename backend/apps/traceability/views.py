@@ -322,7 +322,16 @@ class TestReportViewSet(RoleScopedQuerySetMixin, BaseViewSet):
             return Response({"code": 500, "message": f"读取文件失败：{exc}"},
                             status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-        result = ocr.extract_from_file(f.name, data)
+        # ★ R3：包一层 try —— 原实现会让 OSError 等直接冒成 500，
+        #   而正确行为是「未识别，请手工录入」（识别是增强功能，失败不该打断录入）。
+        try:
+            result = ocr.extract_from_file(f.name, data)
+        except Exception:  # noqa: BLE001
+            import logging
+            logging.getLogger(__name__).exception("OCR 识别异常：%s", f.name[:60])
+            result = {"ok": False, "method": "failed", "confidence": "low",
+                      "filled": {}, "text": "",
+                      "message": "识别服务异常，请手工录入"}
         audit.log_operation(request, OperationLog.Action.VERIFY,
                             target_type="检测报告", target_id=None,
                             target_no=f.name[:60],
@@ -490,7 +499,7 @@ class CertificateViewSet(RoleScopedQuerySetMixin, BaseViewSet):
                 obj.status = Certificate.Status.ISSUED
                 obj.suspend_reason = ""
                 if not obj.issue_date:
-                    obj.issue_date = _date.today()
+                    obj.issue_date = certno.today_local()
                     update_fields.append("issue_date")
                 if not obj.producer_name and producer is not None:
                     obj.producer_name = producer.name
@@ -620,8 +629,7 @@ class CertificateViewSet(RoleScopedQuerySetMixin, BaseViewSet):
         obj.status = Certificate.Status.ISSUED
         obj.suspend_reason = ""
         if not obj.issue_date:
-            from datetime import date as _date
-            obj.issue_date = _date.today()
+            obj.issue_date = certno.today_local()
             update_fields.append("issue_date")
         if not obj.producer_name and producer is not None:
             obj.producer_name = producer.name
@@ -709,10 +717,11 @@ class CertificateViewSet(RoleScopedQuerySetMixin, BaseViewSet):
         producer = batch.producer if batch and batch.producer_id else None
         report = obj.report
 
-        # 存证记录（取该合格证最新一条证书类存证）
+        # 存证记录（★ R1：取 is_current 当前版本，不靠「id 最大即当前」的巧合）
         record = EvidenceRecord.objects.filter(
-            biz_type=EvidenceRecord.BizType.CERTIFICATE, biz_id=obj.id
-        ).order_by("-id").first()
+            biz_type=EvidenceRecord.BizType.CERTIFICATE, biz_id=obj.id,
+            is_current=True
+        ).order_by("-version").first()
 
         # ★ FRONTEND_VERIFY_BASE 本身已含路由（默认 "http://host/#/verify"），
         # 这里只能追加证号。曾经写成 BASE + "/#/verify/" + cert_no，
@@ -1615,9 +1624,10 @@ class PublicVerifyView(APIView):
         tl = timeline.build_timeline(cert)
         data["timeline"] = tl["nodes"]
         data["timeline_summary"] = tl["summary"]
-        # 附带存证记录
+        # 附带存证记录（★ R1：只取 is_current 当前版本）
         record = EvidenceRecord.objects.filter(
-            biz_type=EvidenceRecord.BizType.CERTIFICATE, biz_id=cert.id).first()
+            biz_type=EvidenceRecord.BizType.CERTIFICATE, biz_id=cert.id,
+            is_current=True).order_by("-version").first()
         if record:
             data["tx_hash"] = record.tx_hash
             data["block_height"] = record.block_height
@@ -1820,10 +1830,9 @@ class DashboardView(APIView):
         注意补零：没有任何签发的月份数据库不会返回行，
         折线图会出现「断点」而不是「0」，所以必须自己把月份轴补全。
         """
-        from datetime import date as _date
         from django.db.models.functions import TruncMonth
 
-        today = _date.today()
+        today = certno.today_local()
         # 构造连续 N 个月的 (year, month) 轴，从 N-1 个月前到本月
         axis = []
         y, m = today.year, today.month
@@ -1836,6 +1845,7 @@ class DashboardView(APIView):
         axis.reverse()
 
         start = axis[0]
+        from datetime import date as _date
         start_date = _date(start[0], start[1], 1)
         rows = (Certificate.objects
                 .filter(status=Certificate.Status.ISSUED,
@@ -1965,8 +1975,7 @@ class AlertView(APIView):
     # ---- 各角色的预警构造 ----
 
     def _regulator_alerts(self):
-        from datetime import date as _date
-        today = _date.today()
+        today = certno.today_local()
         alerts = []
 
         # ① 逾期未整改（最严重：执法时限已过）
@@ -2035,8 +2044,7 @@ class AlertView(APIView):
 
     def _producer_alerts(self, user):
         """种植主体：只看自己被查出的问题 + 自己待办的证。"""
-        from datetime import date as _date
-        today = _date.today()
+        today = certno.today_local()
         alerts = []
 
         my_ins = InspectionRecord.objects.filter(

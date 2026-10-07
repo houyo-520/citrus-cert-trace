@@ -14,6 +14,7 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
 from django.conf import settings
+from django.db import transaction
 
 from . import chain
 from .models import Certificate, EvidenceRecord
@@ -118,48 +119,55 @@ def _save_record(biz_type: str, biz_id: int, biz_no: str, digest: str,
     """
     chain_ok = "success" if result.get("ok") else result.get("mode", "mock")
 
-    current = EvidenceRecord.objects.filter(
-        biz_type=biz_type, biz_id=biz_id, is_current=True).first()
+    # ★ R1：三个分支各自的本地写全部包在 transaction.atomic() 中。
+    #   原因：分支 3「归档旧行 + 新建新行」若两步之间进程被杀/超时，
+    #   会留下「无任何 is_current 版本」的半态 → 验真查不到记录、链上却锚着摘要。
+    #   注意：事务**只含本地写，不含 RPC**（RPC 已在外层调用完毕），
+    #   避免重犯 M4 的「事务里按住 40s 网络 IO」。
+    with transaction.atomic():
+        current = EvidenceRecord.objects.filter(
+            biz_type=biz_type, biz_id=biz_id, is_current=True).first()
 
-    # 1) 首次存证
-    if current is None:
-        # 兼容历史数据：若存在但都被标为非 current，取最大版本续号
-        last_ver = (EvidenceRecord.objects
-                    .filter(biz_type=biz_type, biz_id=biz_id)
-                    .order_by("-version")
-                    .values_list("version", flat=True)
-                    .first()) or 0
+        # 1) 首次存证
+        if current is None:
+            # 兼容历史数据：若存在但都被标为非 current，取最大版本续号
+            last_ver = (EvidenceRecord.objects
+                        .filter(biz_type=biz_type, biz_id=biz_id)
+                        .order_by("-version")
+                        .values_list("version", flat=True)
+                        .first()) or 0
+            return EvidenceRecord.objects.create(
+                biz_type=biz_type, biz_id=biz_id, biz_no=biz_no,
+                data_hash=digest, payload=payload,
+                version=last_ver + 1, is_current=True,
+                tx_hash=result.get("tx_hash", ""),
+                block_height=result.get("block_height", 0),
+                chain_status=chain_ok,
+            )
+
+        # 2) 摘要一致：在原行补齐链上信息即可（不新增版本）
+        if current.data_hash == digest:
+            current.biz_no = biz_no or current.biz_no
+            current.payload = payload
+            if result.get("ok"):
+                current.tx_hash = result.get("tx_hash", current.tx_hash)
+                current.block_height = result.get("block_height",
+                                                  current.block_height)
+                current.chain_status = chain_ok
+            current.save()
+            return current
+
+        # 3) 摘要不同：归档旧版本 + 追加新版本（同事务，不存在「无 current」中间态）
+        current.is_current = False
+        current.save(update_fields=["is_current", "updated_at"])
         return EvidenceRecord.objects.create(
             biz_type=biz_type, biz_id=biz_id, biz_no=biz_no,
             data_hash=digest, payload=payload,
-            version=last_ver + 1, is_current=True,
+            version=current.version + 1, is_current=True,
             tx_hash=result.get("tx_hash", ""),
             block_height=result.get("block_height", 0),
             chain_status=chain_ok,
         )
-
-    # 2) 摘要一致：在原行补齐链上信息即可（不新增版本）
-    if current.data_hash == digest:
-        current.biz_no = biz_no or current.biz_no
-        current.payload = payload
-        if result.get("ok"):
-            current.tx_hash = result.get("tx_hash", current.tx_hash)
-            current.block_height = result.get("block_height", current.block_height)
-            current.chain_status = chain_ok
-        current.save()
-        return current
-
-    # 3) 摘要不同：归档旧版本，追加新版本
-    current.is_current = False
-    current.save(update_fields=["is_current", "updated_at"])
-    return EvidenceRecord.objects.create(
-        biz_type=biz_type, biz_id=biz_id, biz_no=biz_no,
-        data_hash=digest, payload=payload,
-        version=current.version + 1, is_current=True,
-        tx_hash=result.get("tx_hash", ""),
-        block_height=result.get("block_height", 0),
-        chain_status=chain_ok,
-    )
 
 
 def anchor_certificate(cert: Certificate) -> EvidenceRecord:
@@ -246,14 +254,12 @@ def anchor_report(report) -> EvidenceRecord:
     """
     对检测报告存证。
 
-    ★ 与追加式版本对齐（原报告 Minor）：`report.report_hash` 是「报告字段的
-    当前快照哈希」。早期实现每次存证都覆盖它，而存证表是追加式（历史版本保留）
-    —— 两者会分叉：本地 report_hash=新、历史存证记录=旧。
-
-    现在：**首次存证时固化 report_hash**；后续若报告字段变了，report_hash 依然
-    如实更新（它代表「当前内容」的哈希，本就是给前端「一键核验」用的），
-    但存证表里会**追加新版本**保留旧摘要 —— 于是「当前哈希」与「当前版本存证」
-    始终一致，历史版本可追溯。这样两者语义不再打架。
+    ★ R4 更正：`report.report_hash` 每次存证**无条件覆盖**为「当前字段的哈希」
+    （它代表「现在这份报告内容是什么」的快照，供前端一键核验用）。
+    真正的**防篡改锚点**在存证表：摘要若变化，会追加一条新的 is_current 版本、
+    旧版本归档保留（见 _save_record）。二者语义不同、并不冲突：
+      - report_hash          = 当前内容哈希（可变，随内容更新）
+      - EvidenceRecord 历史版本 = 各时点的锚定摘要（不可变，可回溯）
     """
     payload = "|".join([
         report.report_no, report.batch.batch_no if report.batch_id else "",

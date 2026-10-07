@@ -59,20 +59,22 @@ def normalize_region_code(raw: str) -> str:
     return code[:REGION_LEN]
 
 
-def _today_local() -> date:
+def today_local() -> date:
     """
-    取「本地时区（settings.TIME_ZONE）」的今天。
+    ★ 全项目「今天」的唯一来源（R5 修复）：按 settings.TIME_ZONE 取当地日期。
 
-    ★ 修复（E，替代早期空转的实现）：
-    原用 date.today()（按**系统时区**），生产服务器若为 UTC，则北京时间
-    00:00~08:00 间生成的编号日期会比北京日期早一天，与纸质证日期对不上。
+    为什么必须集中到这里：
+      编号前缀（build_prefix）、签发日期（Certificate.issue_date）、预警/到期
+      判断、is_overdue 都要用「同一天」的概念。若各处直接用 date.today()
+      （按**系统时区**），当服务器/开发机时区不是东八区时：
+        北京时间 00:00~08:00 期间 → 编号里嵌 20261007，而 issue_date 存 20261006，
+        两个日期在证面同屏直接打架。
+      故全项目统一调用本函数，不依赖机器时区。
 
-    早期曾改用 timezone.localdate()，但本项目 settings.USE_TZ = False，
-    此时 timezone.now() 返回 naive datetime，localdate() 会抛
-    ValueError("localtime() cannot be applied to a naive datetime")，
-    被外层 except 静默兜住 → 修复实际空转（且属于「吞异常掩盖问题」）。
-
-    正确做法：不依赖 USE_TZ，直接用 ZoneInfo(settings.TIME_ZONE) 取当地日期。
+    实现说明：
+      曾用 Django 的 timezone.localdate()，但本项目 USE_TZ=False 时 timezone.now()
+      返回 naive datetime，localdate() 会抛 ValueError 被静默兜住（等于空转）。
+      这里直接用 ZoneInfo(settings.TIME_ZONE)，与 USE_TZ 无关。
     """
     tz_name = getattr(settings, "TIME_ZONE", None) or "Asia/Shanghai"
     try:
@@ -82,9 +84,13 @@ def _today_local() -> date:
         return date.today()
 
 
+# 兼容旧内部调用名
+_today_local = today_local
+
+
 def build_prefix(region_code: str, on_date: date = None) -> str:
     """拼出编号前缀 = 区域码 + 日期。"""
-    d = on_date or _today_local()
+    d = on_date or today_local()
     return f"{normalize_region_code(region_code)}{d.strftime('%Y%m%d')}"
 
 

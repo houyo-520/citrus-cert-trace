@@ -53,8 +53,37 @@ request.interceptors.response.use(
     }
     return normalize(res)
   },
-  (error) => {
+  async (error) => {
     const status = error.response?.status
+    const original = error.config || {}
+
+    // ★ R2：access 过期（2h）时先用 refresh 静默续期一次，再重放原请求。
+    //   否则轮换+黑名单虽对，体验却变成「每 2 小时被踢回登录页」。
+    //   注意：必须把响应里的**新 refresh** 写回 localStorage —— 因为
+    //   ROTATE_REFRESH_TOKENS 会把旧 refresh 拉黑，不更新则第二次刷新必挂。
+    if (status === 401 && !original._retry && !original.url?.includes('/auth/refresh')) {
+      const refresh = localStorage.getItem('refresh')
+      if (refresh) {
+        original._retry = true
+        try {
+          // 用原生 axios 直调刷新接口，避免再次进入本拦截器造成递归
+          const r = await axios.post('/api/auth/refresh/', { refresh })
+          const d = r.data || {}
+          const newAccess = d.access
+          const newRefresh = d.refresh
+          if (newAccess) {
+            localStorage.setItem('token', newAccess)
+            if (newRefresh) localStorage.setItem('refresh', newRefresh)
+            original.headers = original.headers || {}
+            original.headers.Authorization = 'Bearer ' + newAccess
+            return request(original)   // 重放原请求
+          }
+        } catch (e) {
+          // 刷新失败（refresh 也过期/被拉黑）→ 落到下面登出逻辑
+        }
+      }
+    }
+
     if (status === 401) {
       localStorage.removeItem('token')
       localStorage.removeItem('refresh')
@@ -94,10 +123,31 @@ export async function downloadFile(url, filename = '') {
   // 后端返回的是 /media/... 相对路径；axios 实例 baseURL='/api'，故这里
   // 用原生 axios 发同源绝对路径请求，仅手动补 Authorization。
   const token = localStorage.getItem('token')
-  const resp = await axios.get(url, {
-    responseType: 'blob',
-    headers: token ? { Authorization: 'Bearer ' + token } : {}
-  })
+  let resp
+  try {
+    resp = await axios.get(url, {
+      responseType: 'blob',
+      headers: token ? { Authorization: 'Bearer ' + token } : {}
+    })
+  } catch (err) {
+    // ★ R6：原生 axios 不经 request 拦截器，401 需在这里单独识别并登出，
+    //   否则用户会把「token 过期」误当成「无权限」。
+    const st = err.response?.status
+    if (st === 401) {
+      localStorage.removeItem('token')
+      localStorage.removeItem('refresh')
+      localStorage.removeItem('user')
+      ElMessage.error('登录已过期，请重新登录')
+      if (router.currentRoute.value.path !== '/login') router.push('/login')
+      throw err
+    }
+    if (st === 403) {
+      ElMessage.error('无权访问该附件')
+      throw err
+    }
+    ElMessage.error('附件下载失败')
+    throw err
+  }
   const blob = new Blob([resp.data], {
     type: resp.headers['content-type'] || 'application/octet-stream'
   })
@@ -114,5 +164,7 @@ export async function downloadFile(url, filename = '') {
   document.body.appendChild(a)
   a.click()
   document.body.removeChild(a)
-  window.URL.revokeObjectURL(objectUrl)
+  // ★ R6：延后回收 —— 紧跟 a.click() 同步 revoke 在 Safari / 大文件下有
+  //   被截断的先例，惯例放到下一帧再释放。
+  setTimeout(() => window.URL.revokeObjectURL(objectUrl), 1000)
 }

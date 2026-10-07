@@ -483,14 +483,15 @@ class InspectionRecord(BaseModel):
     @property
     def is_overdue(self) -> bool:
         """是否已逾期：有期限、未整改完、且当前日期已超过期限。"""
-        from datetime import date as _date
+        from . import certno
         if not self.rectify_deadline:
             return False
         if self.rectify_status in (self.RectifyStatus.DONE,
                                    self.RectifyStatus.NOT_REQUIRED,
                                    self.RectifyStatus.RECHECK_FAILED):
             return False
-        return _date.today() > self.rectify_deadline
+        # ★ R5：用 certno.today_local() 而非 date.today()，与编号/签发日期同一时区口径
+        return certno.today_local() > self.rectify_deadline
 
     def refresh_overdue(self, save: bool = True) -> bool:
         """
