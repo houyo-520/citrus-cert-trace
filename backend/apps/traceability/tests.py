@@ -3041,3 +3041,32 @@ class TimezoneAndAtomicityTest(BaseFixture):
             biz_type=EvidenceRecord.BizType.CERTIFICATE, biz_id=self.cert.id,
             is_current=True)
         self.assertEqual(data.get("tx_hash"), cur.tx_hash)
+
+
+class TodayLocalRobustnessTest(BaseFixture):
+    """R5 兜底：ZoneInfo 不可用时应退回 date.today() 并告警（不静默）。"""
+
+    def test_today_local_falls_back_with_warning(self):
+        """模拟 ZoneInfo 不可用 → 退回 date.today()，且记录 warning。"""
+        from unittest import mock
+        from datetime import date
+        from . import certno
+        with mock.patch("zoneinfo.ZoneInfo", side_effect=Exception("no tzdata")):
+            with self.assertLogs("apps.traceability.certno", level="WARNING") as cm:
+                d = certno.today_local()
+        self.assertEqual(d, date.today())
+        self.assertTrue(any("tzdata" in m for m in cm.output),
+                        "兜底应提示安装 tzdata")
+
+    def test_today_local_ok_when_zoneinfo_available(self):
+        """正常情况：按 TIME_ZONE 取日，无告警。"""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from django.conf import settings as s
+        from . import certno
+        try:
+            ZoneInfo(s.TIME_ZONE)
+        except Exception:
+            self.skipTest("本环境无 tzdata，跳过")
+        self.assertEqual(certno.today_local(),
+                         datetime.now(ZoneInfo(s.TIME_ZONE)).date())

@@ -80,7 +80,14 @@ def today_local() -> date:
     try:
         from zoneinfo import ZoneInfo
         return datetime.now(ZoneInfo(tz_name)).date()
-    except Exception:  # noqa: BLE001 zoneinfo/时区库缺失时才退回系统本地日期
+    except Exception as exc:  # noqa: BLE001 时区库缺失/名称非法
+        # ★ 不再静默退回（否则「按 TIME_ZONE 取日」的保证会悄悄落空、靠机器时区碰巧对）：
+        #   记一条 warning 便于发现（如 Windows 未装 tzdata → ZoneInfoNotFoundError）。
+        import logging
+        logging.getLogger(__name__).warning(
+            "ZoneInfo(%s) 不可用（%s），临时退回系统本地日期 date.today()。"
+            "请安装 tzdata（pip install tzdata）以保证按 TIME_ZONE 取日。",
+            tz_name, exc)
         return date.today()
 
 

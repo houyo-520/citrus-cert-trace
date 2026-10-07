@@ -19,6 +19,8 @@ const request = axios.create({
  * 修法：模块级 refreshing 单飞 —— 同一时刻只发起一次刷新，其余 401 等待它。
  */
 let refreshing = null
+// ★ 登出闸门：并发 401 失败时避免弹多次「登录已过期」/重复跳转
+let loggingOut = false
 
 async function renewTokens() {
   const refresh = localStorage.getItem('refresh')
@@ -88,31 +90,30 @@ request.interceptors.response.use(
     // ★ B-1：401 静默续期走**单飞**，避免并发 401 各自刷新的踩踏。
     //   重放时不用手设 Authorization —— 请求拦截器会从 localStorage 取新 token。
     if (status === 401 && !original._retry && !original.url?.includes('/auth/refresh')) {
-      const stale = localStorage.getItem('token')
       original._retry = true
       if (!refreshing) {
         // finally 保证无论成败都释放锁，避免一次失败把后续刷新永久堵死
         refreshing = renewTokens().finally(() => { refreshing = null })
       }
-      const ok = await refreshing
-      // 仅当刷新成功、且本次刷新**确实换到了新 token**（token 已变）才重放；
-      // 若 token 没变（别人已换过且自己拿到的就是新的）也要重放。
-      if (ok && localStorage.getItem('token') !== stale) {
-        return request(original)
-      }
-      // 若刷新成功但 token 未变（极端：刷新接口返回同一 token），也允许重放一次
-      if (ok) {
+      if (await refreshing) {
         return request(original)
       }
     }
 
     if (status === 401) {
-      localStorage.removeItem('token')
-      localStorage.removeItem('refresh')
-      localStorage.removeItem('user')
-      if (router.currentRoute.value.path !== '/login') {
-        ElMessage.error('登录已过期，请重新登录')
-        router.push('/login')
+      // ★ 并发失败时只提示/跳转一次（4 个并发 401 会同时走到这里；
+      //   router.push 后 currentRoute 不会立刻变，单靠 path 判断拦不住重复弹窗）
+      if (!loggingOut) {
+        loggingOut = true
+        localStorage.removeItem('token')
+        localStorage.removeItem('refresh')
+        localStorage.removeItem('user')
+        if (router.currentRoute.value.path !== '/login') {
+          ElMessage.error('登录已过期，请重新登录')
+          router.push('/login')
+        }
+        // 跳转后短暂解锁，允许后续真的再次过期时再提示
+        setTimeout(() => { loggingOut = false }, 1500)
       }
     } else {
       ElMessage.error(error.response?.data?.message || error.message || '网络错误')

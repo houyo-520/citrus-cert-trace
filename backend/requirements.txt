@@ -18,3 +18,10 @@ web3>=6.15
 pymupdf>=1.24
 pdfminer.six>=20231228
 pytesseract>=0.3.10
+# 时区数据（R5 兜底依赖）
+#   certno.today_local() 用 zoneinfo.ZoneInfo(settings.TIME_ZONE) 取当地日期。
+#   Linux 一般有系统 tzdata；但 **Windows 上的 Python 没有系统时区库**，
+#   不装 tzdata 会抛 ZoneInfoNotFoundError → 静默退回 date.today()（按机器时区），
+#   于是「开发机也按 TIME_ZONE 取日」的保证落空（靠机器时区碰巧对）。
+#   显式声明，保证任何平台都按配置时区取日。
+tzdata>=2024.1

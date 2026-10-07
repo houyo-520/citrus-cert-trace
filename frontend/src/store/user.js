@@ -2,6 +2,10 @@ import { defineStore } from 'pinia'
 import { login as loginApi, logout as logoutApi } from '@/api'
 
 export const useUserStore = defineStore('user', {
+  // ★ token 说明：store.token/refresh 只在**登录**时写入，用作「已登录」标志与
+  //   初始渲染；静默续期（request.js 的 renewTokens）只更新 localStorage，
+  //   **不会**回填 store。因此发给后端的 token 事实源是 **localStorage**，
+  //   发请求一律经 request 拦截器读它（切勿用 store.token 拼 Authorization）。
   state: () => ({
     token: localStorage.getItem('token') || '',
     refresh: localStorage.getItem('refresh') || '',
