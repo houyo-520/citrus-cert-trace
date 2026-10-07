@@ -3,8 +3,8 @@ URL 路由总入口
 """
 from django.contrib import admin
 from django.urls import path, re_path, include
-from django.conf import settings
-from django.views.static import serve
+
+from apps.traceability.media_view import ProtectedMediaView
 
 urlpatterns = [
     # ---------------------------------------------------------------
@@ -19,12 +19,15 @@ urlpatterns = [
     path("api/", include("apps.traceability.urls")),
     # ---------------------------------------------------------------
     # 检测报告附件等用户上传文件的访问入口。
-    # 不用 `if settings.DEBUG` 包住 —— 生产环境（DEBUG=false）下 gunicorn
-    # 不会自动托管 media，包住会导致「上传成功但下载 404」。
-    # 生产更优解是由 nginx 直接托管 /media/ 目录（见部署文档），
-    # 这里保留 Django 兜底，保证任何环境下附件都可达。
-    # 安全由「文件访问需登录」的权限层保证，附件本身非敏感数据（检测报告）。
+    #
+    # ★ 安全修复（原 C3）：早期用 django.views.static.serve 直挂 /media/，
+    #   它是纯 Django 视图、不经过 DRF 权限层 —— 任何人拿到路径即可匿名
+    #   下载检测报告原件（含检测机构名，扫描件可能含个人信息），已实测确认。
+    #   现改为 ProtectedMediaView（IsAuthenticated + 数据级归属校验）。
+    #
+    # 生产更优解：由 nginx 托管 /media/ 并用 X-Accel-Redirect（零拷贝）。
+    # 当前附件量小、Django 与 nginx 同机，先在应用层做对鉴权更重要。
     # ---------------------------------------------------------------
-    re_path(r"^media/(?P<path>.*)$", serve,
-            {"document_root": settings.MEDIA_ROOT}),
+    re_path(r"^media/(?P<path>.*)$", ProtectedMediaView.as_view(),
+            name="protected-media"),
 ]

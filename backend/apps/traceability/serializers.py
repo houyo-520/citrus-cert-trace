@@ -25,7 +25,12 @@ class ProducerSerializer(serializers.ModelSerializer):
     class Meta:
         model = Producer
         fields = "__all__"
-        read_only_fields = ["owner"]
+        # ★ 安全红线：audit_status 是「监管行为」的产物，绝不能让主体自改
+        #   —— 否则生产者 PATCH 一条 {"audit_status":"approved"} 就绕过监管审核
+        #   （写权限是 ReadOnlyOrProducerOrRegulator，比 audit 动作宽松）。
+        #   审核只能走 POST /producer/{id}/audit/（仅 IsRegulator）。
+        # owner 由后端按登录用户写入，前端不可指定（防冒领/跨租户）。
+        read_only_fields = ["owner", "audit_status"]
 
     def _credit(self, obj):
         # 每次序列化只算一次，score 与 grade 复用同一结果（避免二次查询）
@@ -50,6 +55,23 @@ class ProductBatchSerializer(serializers.ModelSerializer):
         model = ProductBatch
         fields = "__all__"
 
+    def validate_producer(self, value):
+        """
+        ★ 防跨租户挂靠（M1）：主体只能把批次挂到**自己名下**的主体上。
+
+        原本 fields="__all__" 让 producer 完全可写，主体 A 可把批次挂到主体 B
+        的 id 上（跨租户注入）。这里在序列化层校验归属：
+          - 监管/管理员：可为任意主体建档（监管代录场景）；
+          - 种植主体：只能选 owner 是自己的主体。
+        """
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        from apps.accounts.models import Role
+        if user and getattr(user, "role", None) == Role.PRODUCER:
+            if value.owner_id != user.id:
+                raise serializers.ValidationError("只能关联属于自己的生产主体")
+        return value
+
 
 class TestReportSerializer(serializers.ModelSerializer):
     batch_no = serializers.CharField(source="batch.batch_no", read_only=True)
@@ -66,6 +88,16 @@ class TestReportSerializer(serializers.ModelSerializer):
         model = TestReport
         fields = "__all__"
         read_only_fields = ["ocr_method", "ocr_confidence", "ocr_text"]
+
+    def validate_batch(self, value):
+        """★ 防跨租户挂靠（M1）：报告只能挂到自己名下的批次上。"""
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        from apps.accounts.models import Role
+        if user and getattr(user, "role", None) == Role.PRODUCER:
+            if value.producer_id and value.producer.owner_id != user.id:
+                raise serializers.ValidationError("只能关联属于自己的生产批次")
+        return value
 
     def get_ocr_method_display(self, obj):
         return {
@@ -140,8 +172,34 @@ class CertificateSerializer(serializers.ModelSerializer):
         fields = "__all__"
         # 编号由后端按「区域码+日期+流水」在签发时分配，前端不可填
         # merkle_root 由后端在签发存证时汇聚证据树计算，前端不可填
+        # ★ status 必须只读：否则 PATCH {"status":"issued"} 就绕过了 issue 的
+        #   监管校验、取号与上链，造出一张「无编号却已签发」的不自洽证（C2）。
+        #   状态流转只能走 submit/issue/reject/revoke 等专用动作。
         read_only_fields = ["cert_no", "cert_hash", "is_anchored", "anchored_at",
-                            "merkle_root", "issuer"]
+                            "merkle_root", "issuer", "status", "suspend_reason"]
+
+    def validate_batch(self, value):
+        """★ 防跨租户挂靠（M1）：合格证只能挂到自己名下的批次上。"""
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        from apps.accounts.models import Role
+        if user and getattr(user, "role", None) == Role.PRODUCER:
+            if value.producer_id and value.producer.owner_id != user.id:
+                raise serializers.ValidationError("只能关联属于自己的生产批次")
+        return value
+
+    def validate_report(self, value):
+        """★ 防跨租户挂靠（M1）：检测报告须属于自己名下的主体。"""
+        if value is None:
+            return value
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        from apps.accounts.models import Role
+        if user and getattr(user, "role", None) == Role.PRODUCER:
+            if value.batch_id and value.batch.producer_id and \
+                    value.batch.producer.owner_id != user.id:
+                raise serializers.ValidationError("只能关联属于自己的检测报告")
+        return value
 
     def get_producer_name_display(self, obj):
         """主体名称：优先取存证时固化的快照，其次实时取批次关联的主体。"""
@@ -152,13 +210,17 @@ class CertificateSerializer(serializers.ModelSerializer):
         return ""
 
     def get_inspection_count(self, obj):
-        return obj.inspections.count()
+        # ★ 用预取缓存避免 N+1（原 M12）：视图 queryset 已 prefetch_related("inspections")
+        #   （见 CertificateViewSet.queryset），此处读缓存不再各打一条 COUNT。
+        return len(obj.inspections.all())
 
     def get_latest_inspection_result(self, obj):
         """最近一次监督检查结论 —— 列表页据此显示「检查不合格」标签。"""
-        latest = obj.inspections.order_by("-check_time", "-id").first()
-        if not latest:
+        # ★ 复用预取缓存：按 check_time/id 排序取最新（避免每条再查一次库）
+        items = list(obj.inspections.all())
+        if not items:
             return ""
+        latest = max(items, key=lambda r: (r.check_time or r.created_at, r.id))
         return latest.get_check_result_display()
 
     def get_cert_no_parsed(self, obj):
@@ -221,6 +283,9 @@ class MatchIntentSerializer(serializers.ModelSerializer):
     initiator_name = serializers.CharField(source="initiator.username", read_only=True)
     supply_title = serializers.CharField(source="supply.title", read_only=True)
     supply_kind = serializers.CharField(source="supply.kind", read_only=True)
+    # ★ 对手方供需单标题（原 Minor 修复：意向单现在能还原双向关系）
+    counterpart_title = serializers.CharField(source="counterpart.title",
+                                              read_only=True, default="")
 
     class Meta:
         model = MatchIntent

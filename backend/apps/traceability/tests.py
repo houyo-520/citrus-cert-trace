@@ -2730,3 +2730,136 @@ class MerkleIssueIntegrationTest(BaseFixture):
         from . import merkle as _m
         if _m.build_certificate_merkle_root(bare) == "":
             self.assertIsNone(services.anchor_merkle_root(bare))
+
+
+# ===============================================================
+# ★ 安全加固回归测试（2026-10-07 审计修复）
+# ===============================================================
+class SecurityHardeningTest(BaseFixture):
+    """针对审计发现的高危项做回归：越权写入 / 状态守卫 / 存证不可变 / IP 取信。"""
+
+    # ---- C1：主体不能自改审核状态 ----
+    def test_producer_cannot_self_approve_audit_status(self):
+        """生产者 PATCH 自己主体的 audit_status 应被忽略（只读），状态保持 pending。"""
+        c = self.login(self.producer)   # producer1 owner = producer_obj(approved)
+        # 用 other_producer_obj（pending），它属于 other_producer，不是当前用户
+        # 这里换成当前用户拥有的一个 pending 主体更贴切：直接用 own 主体验证只读
+        r = c.patch(f"/api/producer/{self.producer_obj.id}/",
+                    {"audit_status": "rejected"}, format="json")
+        # 请求可能 200（只读字段被忽略）或 400；关键是状态没被改
+        self.producer_obj.refresh_from_db()
+        self.assertEqual(self.producer_obj.audit_status,
+                         Producer.AuditStatus.APPROVED,
+                         "audit_status 必须只读：不能由主体自行修改")
+
+    # ---- C2：不能前端直接置证为 issued ----
+    def test_certificate_status_is_read_only(self):
+        """PATCH status=issued 必须无效（防止绕过签发流程自行签发）。"""
+        reg = self.login(self.regulator)
+        draft = Certificate.objects.create(
+            batch=self.batch, report=self.report,
+            producer_name=self.producer_obj.name, quantity_kg=Decimal("10"),
+            status=Certificate.Status.DRAFT)
+        reg.patch(f"/api/certificate/{draft.id}/",
+                  {"status": "issued"}, format="json")
+        draft.refresh_from_db()
+        self.assertEqual(draft.status, Certificate.Status.DRAFT,
+                         "status 必须只读：不能通过 PATCH 直接置为已签发")
+        self.assertFalse(draft.cert_no, "未经签发不应有编号")
+
+    # ---- M2：草稿证不可作废 + 不炸 500 ----
+    def test_revoke_draft_certificate_rejected(self):
+        """草稿证（无编号）作废应被状态守卫拦为 400，而不是 500。"""
+        reg = self.login(self.regulator)
+        draft = Certificate.objects.create(
+            batch=self.batch, report=self.report, quantity_kg=Decimal("5"),
+            status=Certificate.Status.DRAFT)
+        r = reg.post(f"/api/certificate/{draft.id}/revoke/",
+                     {"reason": "测试"}, format="json")
+        self.assertEqual(r.status_code, 400,
+                         "草稿证作废应被守卫拦为 400（原会 500）")
+        draft.refresh_from_db()
+        self.assertNotEqual(draft.status, Certificate.Status.REVOKED)
+
+    # ---- M3：存证摘要不可被覆盖（防「改数据后重新 anchor」洗白）----
+    def test_evidence_hash_not_overwritten_on_reanchor(self):
+        """篡改数据后重新存证，原始 data_hash 必须保持不变（防篡改锚点）。"""
+        services.anchor_certificate(self.cert)
+        original = EvidenceRecord.objects.get(
+            biz_type=EvidenceRecord.BizType.CERTIFICATE, biz_id=self.cert.id).data_hash
+        # 篡改业务数据后重新存证
+        Certificate.objects.filter(id=self.cert.id).update(
+            quantity_kg=Decimal("1.00"))
+        self.cert.refresh_from_db()
+        services.anchor_certificate(self.cert)
+        after = EvidenceRecord.objects.get(
+            biz_type=EvidenceRecord.BizType.CERTIFICATE, biz_id=self.cert.id).data_hash
+        self.assertEqual(original, after,
+                         "重新存证不得覆盖原始存证摘要（否则防篡改失效）")
+        # 且此时验真应仍判不可信
+        result = services.verify_certificate(self.cert)
+        self.assertFalse(result["trusted"], "篡改后验真必须判不可信")
+
+    # ---- M5：降级（mock）存证不做链上核验 ----
+    def test_mock_evidence_skips_chain_check(self):
+        """mock 存证不应触发链上核验（chain_status != success）。"""
+        services.anchor_certificate(self.cert)
+        rec = EvidenceRecord.objects.get(
+            biz_type=EvidenceRecord.BizType.CERTIFICATE, biz_id=self.cert.id)
+        if rec.chain_status != "success":
+            result = services.verify_certificate(self.cert, check_chain=True)
+            self.assertFalse(result["chain_verified"])
+            self.assertIn("降级", result["chain_detail"])
+
+    # ---- M10：C3 /media 需登录 ----
+    def test_media_requires_authentication(self):
+        """/media/ 匿名访问必须 401（原来匿名可下载）。"""
+        c = APIClient()  # 未登录
+        r = c.get("/media/reports/nonexistent.pdf")
+        self.assertEqual(r.status_code, 401,
+                         "匿名访问 /media/ 必须被拒（原为匿名可下载）")
+
+    # ---- M6：IP 取信不应无条件取 XFF 第一段 ----
+    def test_client_ip_prefers_real_ip(self):
+        """get_client_ip 应优先 X-Real-IP，忽略可伪造的 XFF 第一段。"""
+        from .audit import get_client_ip
+        from django.test import RequestFactory
+        rf = RequestFactory()
+        req = rf.get("/", HTTP_X_FORWARDED_FOR="1.2.3.4, 10.0.0.1",
+                     HTTP_X_REAL_IP="203.0.113.9")
+        self.assertEqual(get_client_ip(req), "203.0.113.9")
+
+    def test_client_ip_falls_back_to_last_xff(self):
+        """无 X-Real-IP 时取 XFF 最后一段（可信代理追加的那跳），而非第一段。"""
+        from .audit import get_client_ip
+        from django.test import RequestFactory
+        rf = RequestFactory()
+        req = rf.get("/", HTTP_X_FORWARDED_FOR="1.2.3.4, 10.0.0.1")
+        self.assertEqual(get_client_ip(req), "10.0.0.1")
+
+    # ---- M1：跨租户挂靠被拒 ----
+    def test_producer_cannot_attach_batch_to_others_producer(self):
+        """主体 A 不能把批次挂到主体 B 名下。"""
+        c = self.login(self.producer)   # owner = producer_obj
+        r = c.post("/api/batch/", {
+            "batch_no": "B-XTENANT-001",
+            "producer": self.other_producer_obj.id,   # 属于 other_producer
+            "product_name": "柑橘", "weight_kg": "100.00",
+        }, format="json")
+        self.assertEqual(r.status_code, 400,
+                         "跨租户挂靠应被序列化校验拒绝")
+
+    # ---- rehash_all 默认 dry-run ----
+    def test_rehash_all_defaults_to_dry_run(self):
+        """rehash_all 默认 dry-run，不修改数据。"""
+        from django.core.management import call_command
+        from io import StringIO
+        services.anchor_certificate(self.cert)
+        rec = EvidenceRecord.objects.get(
+            biz_type=EvidenceRecord.BizType.CERTIFICATE, biz_id=self.cert.id)
+        before_hash, before_chain = rec.data_hash, rec.chain_status
+        out = StringIO()
+        call_command("rehash_all", stdout=out)
+        rec.refresh_from_db()
+        self.assertIn("dry-run", out.getvalue())
+        self.assertEqual(rec.chain_status, before_chain)

@@ -34,8 +34,12 @@ SECRET_KEY = os.environ.get(
     "DJANGO_SECRET_KEY",
     "django-insecure-citrus-cert-trace-2026-change-me-in-production",
 )
-# 生产环境务必在 .env 里设 DJANGO_DEBUG=false
-DEBUG = os.environ.get("DJANGO_DEBUG", "true").lower() == "true"
+# ★ 安全默认（原 C4 修复）：DEBUG 默认 **false**，而不是 true。
+#   原实现默认 "true" —— 一旦忘设 DJANGO_DEBUG，DEBUG 就是 True，
+#   于是下面的「生产密钥断言」整块被跳过、ALLOWED_HOSTS 落到 *、
+#   错误页还会回显堆栈。安全配置不能靠「你记得设」，必须默认最严。
+#   本地开发请在 .env 里显式写 DJANGO_DEBUG=true。
+DEBUG = os.environ.get("DJANGO_DEBUG", "false").lower() == "true"
 
 # ★ 生产安全断言：DEBUG=false 时若仍用默认/明显弱密钥，直接拒绝启动。
 #   防止「代码能跑、功能正常」但密钥是模板值的假上线 —— 攻击者拿到 SECRET_KEY
@@ -50,9 +54,12 @@ if not DEBUG and SECRET_KEY in _DEFAULT_INSECURE_KEYS:
         "\"import secrets; print(secrets.token_urlsafe(64))\"` 生成）。"
     )
 
+# ★ ALLOWED_HOSTS 默认收紧（原 C4 修复）：不再默认 "*"。
+#   未显式配置时只允许本机/回环，避免「忘设 → 任意 Host 头被接受」。
+_ALLOWED_HOSTS_DEFAULT = "localhost,127.0.0.1"
 ALLOWED_HOSTS = [
     h.strip()
-    for h in os.environ.get("DJANGO_ALLOWED_HOSTS", "*").split(",")
+    for h in os.environ.get("DJANGO_ALLOWED_HOSTS", _ALLOWED_HOSTS_DEFAULT).split(",")
     if h.strip()
 ]
 
@@ -237,3 +244,9 @@ CACHES = {
 
 # 验真接口限流：每个来源 IP 每分钟允许的查询次数（防刷/防拖库）
 VERIFY_RATE_LIMIT = int(os.environ.get("VERIFY_RATE_LIMIT", "30"))
+
+# ★ 可信代理层数（原 M6 修复配套）：用于从 X-Forwarded-For 中取出真实客户端 IP。
+#   本项目 Django 前面只有一层自建 nginx（且在 nginx 里覆写了 X-Real-IP），
+#   因此默认 1 —— 优先用 X-Real-IP，退化到 XFF 时从右往左数第 1 跳。
+#   若将来前面加了 CDN / 多层代理，需相应增大此值，否则取到的会是对端代理 IP。
+TRUSTED_PROXY_HOPS = int(os.environ.get("TRUSTED_PROXY_HOPS", "1"))

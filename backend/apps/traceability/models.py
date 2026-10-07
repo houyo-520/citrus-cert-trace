@@ -120,6 +120,11 @@ class TestReport(BaseModel):
         verbose_name = "检测报告"
         verbose_name_plural = "检测报告"
         ordering = ["-id"]
+        # ★ 索引（原 M10）：按批次反查报告是热点（存证、时间轴、看板）。
+        indexes = [
+            models.Index(fields=["batch"]),
+            models.Index(fields=["conclusion"]),
+        ]
 
     def __str__(self):
         return self.report_no
@@ -185,6 +190,12 @@ class Certificate(BaseModel):
         verbose_name = "合格证"
         verbose_name_plural = "合格证"
         ordering = ["-id"]
+        # ★ 索引（原 M10）：状态过滤（看板/验真/预警）与批次反查都走索引。
+        indexes = [
+            models.Index(fields=["status"]),
+            models.Index(fields=["batch"]),
+            models.Index(fields=["issue_date"]),
+        ]
 
     def __str__(self):
         return self.cert_no or f"草稿#{self.pk}"
@@ -221,6 +232,18 @@ class EvidenceRecord(BaseModel):
         verbose_name = "存证记录"
         verbose_name_plural = "存证记录"
         ordering = ["-id"]
+        # ★ (biz_type, biz_id) 唯一（原 M3）：同一业务对象只应有一条当前存证。
+        #   加约束后，并发重签发不会再插出重复行（update_or_create 的
+        #   check-then-act 竞态会退化为 IntegrityError，由上层重试）。
+        constraints = [
+            models.UniqueConstraint(fields=["biz_type", "biz_id"],
+                                    name="uniq_evidence_biz"),
+        ]
+        # ★ 索引（原 M10）：热点查询 filter(biz_type=…, biz_id=…) 走索引不扫全表。
+        indexes = [
+            models.Index(fields=["biz_type", "biz_id"]),
+            models.Index(fields=["biz_no"]),
+        ]
 
     def __str__(self):
         return f"{self.get_biz_type_display()}#{self.biz_id}"
@@ -239,6 +262,11 @@ class PublicQueryRecord(BaseModel):
         verbose_name = "公众查询记录"
         verbose_name_plural = "公众查询记录"
         ordering = ["-id"]
+        # ★ 索引（原 M10）：限流按 (ip, created_at) 查询，而该表每次扫码都在长，
+        #   无索引就是全表扫 → 越刷越慢。
+        indexes = [
+            models.Index(fields=["ip", "created_at"]),
+        ]
 
 
 # ---------------------------------------------------------------
@@ -310,6 +338,12 @@ class MatchIntent(BaseModel):
 
     supply = models.ForeignKey(SupplyDemand, on_delete=models.CASCADE,
                                verbose_name="关联供需单", related_name="intents")
+    # ★ 对手方供需单（原 Minor 修复）：原实现只在打匹配度时用到 counterpart_id，
+    #   未落库 —— 「一次对接留痕」实际丢掉了「跟谁对接」。这里显式建模，
+    #   让意向单能还原「我方单 ←→ 对方单」的双向关系。
+    counterpart = models.ForeignKey(SupplyDemand, on_delete=models.SET_NULL,
+                                    null=True, blank=True, verbose_name="对手方供需单",
+                                    related_name="counterpart_intents")
     initiator = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
                                   null=True, blank=True, verbose_name="发起人",
                                   related_name="match_intents")

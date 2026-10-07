@@ -10,9 +10,14 @@
 幂等：可重复执行；对未上链（is_anchored=False / 无 tx_hash）的对象也能补齐存证。
 安全：不删任何历史记录，只覆盖 data_hash / payload / tx_hash / block_height。
 
+★ 安全默认（原 M8 修复）：默认**只统计（dry-run）**，必须显式加 `--apply`
+  才真正改写数据。原实现「默认即写」—— 一次误触就会全量重写历史存证
+  （配合 _save_record 的覆盖语义，风险更高）。破坏性操作必须显式确认。
+
 用法：
-  python manage.py rehash_all          # 全量重算（默认）
-  python manage.py rehash_all --dry-run  # 只统计不动数据
+  python manage.py rehash_all             # 默认：只统计，不改数据（dry-run）
+  python manage.py rehash_all --apply     # 真正执行重算 + 重新上链
+  python manage.py rehash_all --dry-run   # 与默认同义（保留兼容）
 """
 from django.core.management.base import BaseCommand
 
@@ -22,16 +27,28 @@ from apps.traceability.models import (Certificate, EvidenceRecord,
 
 
 class Command(BaseCommand):
-    help = "全量重算存证哈希并重新上链（用于加盐哈希迁移）"
+    help = "全量重算存证哈希并重新上链（默认为 dry-run，需 --apply 才写入）"
 
     def add_arguments(self, parser):
         parser.add_argument("--dry-run", action="store_true",
-                            help="只统计，不修改/不上链")
+                            help="只统计，不修改/不上链（默认行为）")
+        parser.add_argument("--apply", action="store_true",
+                            help="★ 真正执行重算并重新上链（破坏性，需显式指定）")
 
     def handle(self, *args, **options):
-        dry_run = options["dry_run"]
+        # ★ 默认 dry-run：只有显式 --apply 才写。--dry-run 优先于 --apply。
+        dry_run = not options["apply"]
+        if options["dry_run"]:
+            dry_run = True
+
         salt = services._salt() or "(空盐)"
         self.stdout.write(f"存证盐值：{salt}")
+        if dry_run:
+            self.stdout.write(self.style.WARNING(
+                "模式：dry-run（只统计，不改数据）。要真正执行请加 --apply"))
+        else:
+            self.stdout.write(self.style.ERROR(
+                "模式：APPLY（将全量重写存证哈希并重新上链！）"))
 
         stats = {"certificate": 0, "batch": 0, "report": 0, "inspection": 0}
 

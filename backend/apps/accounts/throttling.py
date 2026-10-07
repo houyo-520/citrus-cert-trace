@@ -42,10 +42,24 @@ class LoginAttempt(models.Model):
 
 
 def _client_ip(request):
-    """取真实来源 IP。nginx 反代下优先 X-Forwarded-For 第一段。"""
+    """
+    取真实来源 IP。
+
+    ★ 安全修复（原 M6）：原实现无条件取 X-Forwarded-For 第一段 —— 那是
+    客户端可伪造的请求头。攻击者每请求换一个 XFF，限流阈值就被拆散绕过。
+    正确顺序：可信 nginx 覆写的 X-Real-IP → XFF 最后一段 → REMOTE_ADDR。
+    （与 traceability/audit.get_client_ip 保持一致。）
+    """
+    real_ip = request.META.get("HTTP_X_REAL_IP", "").strip()
+    if real_ip:
+        return real_ip
     xff = request.META.get("HTTP_X_FORWARDED_FOR", "")
     if xff:
-        return xff.split(",")[0].strip()
+        parts = [p.strip() for p in xff.split(",") if p.strip()]
+        if parts:
+            hops = int(os.environ.get("TRUSTED_PROXY_HOPS", "1") or 1)
+            idx = max(0, len(parts) - hops)
+            return parts[idx]
     return request.META.get("REMOTE_ADDR", "unknown")
 
 
@@ -70,10 +84,21 @@ def record_failure(ip, username):
 
 
 def clear_failures(ip=None, username=None):
-    """登录成功清除对应失败记录，避免正常用户被误锁。"""
-    qs = LoginAttempt.objects.all()
+    """
+    登录成功清除对应失败记录，避免正常用户被误锁。
+
+    ★ 修复（原 Minor）：原实现 ip 与 username 是 **AND** —— 只删「同 IP 且同用户名」
+    的行。但 is_blocked 是「IP 或用户名」任一超限即拦，清空也必须按 **OR** 语义：
+    只要匹配该 IP 或该用户名，就一并清掉，否则用户在 A 网络输错几次、
+    换到 B 网络登录成功后，A 网络留下的用户名维度失败记录仍会累积把账号锁死。
+    """
+    from django.db.models import Q
+
+    cond = Q()
     if ip:
-        qs = qs.filter(ip=ip)
+        cond |= Q(ip=ip)
     if username:
-        qs = qs.filter(username=username)
-    qs.delete()
+        cond |= Q(username=username)
+    if not cond:
+        return
+    LoginAttempt.objects.filter(cond).delete()

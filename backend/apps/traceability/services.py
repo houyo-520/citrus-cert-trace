@@ -93,20 +93,52 @@ def _anchor(digest: str, payload: str, biz_type: str, biz_id: int, biz_no: str) 
 
 def _save_record(biz_type: str, biz_id: int, biz_no: str, digest: str,
                  payload: str, result: dict) -> EvidenceRecord:
-    """把上链结果写入存证记录（含链上交易哈希与区块高度）。"""
-    record, _ = EvidenceRecord.objects.update_or_create(
-        biz_type=biz_type,
-        biz_id=biz_id,
-        defaults={
-            "biz_no": biz_no,
-            "data_hash": digest,
-            "payload": payload,
-            "tx_hash": result.get("tx_hash", ""),
-            "block_height": result.get("block_height", 0),
-            "chain_status": "success" if result.get("ok") else result.get("mode", "mock"),
-        },
-    )
-    return record
+    """
+    把上链结果写入存证记录（含链上交易哈希与区块高度）。
+
+    ★ 存证不可变性（原 M3 修复）：
+      原实现用 update_or_create 无条件覆盖旧记录，导致「改数据 → 重新 anchor」
+      就能把 data_hash/tx_hash 刷成新值，双层校验重新自洽 —— 防篡改窗口被压缩到
+      「篡改后、重存证前」。这违背存证的初衷。
+      现在改为：
+        - 首次存证：正常创建；
+        - 已存在且摘要**一致**：只补齐链上信息（如之前是 mock，这次真上链了）；
+        - 已存在但摘要**不一致**：**保留原始 data_hash 不动**（存证一经写下即固化），
+          只更新链上交易信息（代表「对该对象又发生了一次上链动作」），
+          使本地比对能持续如实反映「当前数据 ≠ 最初存证摘要」。
+    """
+    existing = EvidenceRecord.objects.filter(
+        biz_type=biz_type, biz_id=biz_id).first()
+
+    chain_ok = "success" if result.get("ok") else result.get("mode", "mock")
+    if existing is None:
+        return EvidenceRecord.objects.create(
+            biz_type=biz_type, biz_id=biz_id, biz_no=biz_no,
+            data_hash=digest, payload=payload,
+            tx_hash=result.get("tx_hash", ""),
+            block_height=result.get("block_height", 0),
+            chain_status=chain_ok,
+        )
+
+    # 已存在：摘要不变才允许「补齐链上信息」；摘要变了则冻结原摘要
+    if existing.data_hash == digest:
+        existing.biz_no = biz_no or existing.biz_no
+        existing.payload = payload
+        if result.get("ok"):
+            existing.tx_hash = result.get("tx_hash", existing.tx_hash)
+            existing.block_height = result.get("block_height", existing.block_height)
+            existing.chain_status = chain_ok
+        existing.save()
+    else:
+        # ★ 摘要分歧：原存证摘要必须保留（这是防篡改的锚点）。
+        #   仅当本次真上链成功时，刷新链上锚点信息，供链上核验比对。
+        if result.get("ok"):
+            existing.tx_hash = result.get("tx_hash", existing.tx_hash)
+            existing.block_height = result.get("block_height", existing.block_height)
+            existing.chain_status = chain_ok
+            existing.save(update_fields=["tx_hash", "block_height",
+                                         "chain_status", "updated_at"])
+    return existing
 
 
 def anchor_certificate(cert: Certificate) -> EvidenceRecord:
@@ -115,18 +147,31 @@ def anchor_certificate(cert: Certificate) -> EvidenceRecord:
       1. 计算哈希并写回合格证
       2. 上链（真实链优先，失败降级模拟）
       3. 写入存证记录
+
+    ★ 写入顺序（原 M4 修复）：先只写 cert_hash（本地重算即可得，廉价），
+    待上链 + 落存证记录**之后**，再把 is_anchored/anchored_at 标为已完成。
+    这样中间若上链抛异常，不会留下「is_anchored=True 但无存证记录」的半态
+    —— 半态会让验真页展示「已存证」却查不到记录，自相矛盾。
+    （注意：本函数不做 transaction.atomic —— 40s 的 RPC 会把 DB 事务按住，
+      故采用「先落字段、后标完成」的补偿式顺序，而非包大事务。）
     """
     payload = build_certificate_payload(cert)
     digest = sha256_hex(payload)
+    # 第一步：只固化哈希（不置 is_anchored）
     cert.cert_hash = digest
-    cert.is_anchored = True
-    cert.anchored_at = datetime.now()
-    cert.save(update_fields=["cert_hash", "is_anchored", "anchored_at", "updated_at"])
+    cert.save(update_fields=["cert_hash", "updated_at"])
 
+    # 第二步：上链 + 落存证记录
     result = _anchor(digest, payload, EvidenceRecord.BizType.CERTIFICATE,
                      cert.id, cert.cert_no)
-    return _save_record(EvidenceRecord.BizType.CERTIFICATE, cert.id,
-                        cert.cert_no, digest, payload, result)
+    record = _save_record(EvidenceRecord.BizType.CERTIFICATE, cert.id,
+                          cert.cert_no, digest, payload, result)
+
+    # 第三步：确认有存证记录后，再标记「已存证」
+    cert.is_anchored = True
+    cert.anchored_at = datetime.now()
+    cert.save(update_fields=["is_anchored", "anchored_at", "updated_at"])
+    return record
 
 
 def anchor_merkle_root(cert: Certificate) -> EvidenceRecord:
@@ -154,11 +199,14 @@ def anchor_merkle_root(cert: Certificate) -> EvidenceRecord:
     cert.merkle_root = root
     cert.save(update_fields=["merkle_root", "updated_at"])
 
-    payload = "|".join([cert.cert_no or f"证#{cert.id}", "MERKLE", root])
+    # ★ cert_no 兜底（原 M2）：payload 已兜底但 biz_no 没兜底，会写 None 进
+    #   NOT NULL 列。这里统一用兜底串，payload 与 biz_no 保持一致。
+    cert_no = cert.cert_no or f"UNISSUED-{cert.id}"
+    payload = "|".join([cert_no, "MERKLE", root])
     result = _anchor(root, payload, EvidenceRecord.BizType.MERKLE,
-                     cert.id, cert.cert_no)
+                     cert.id, cert_no)
     return _save_record(EvidenceRecord.BizType.MERKLE, cert.id,
-                        cert.cert_no, root, payload, result)
+                        cert_no, root, payload, result)
 
 
 def anchor_batch(batch) -> EvidenceRecord:
@@ -200,17 +248,20 @@ def anchor_revoke(cert: Certificate, reason: str = "") -> EvidenceRecord:
     注意：biz_id 用负数偏移，避免与 CERTIFICATE 类型的同 id 记录冲突。
     """
     from datetime import datetime as _dt
+    # ★ cert_no 兜底（原 M2）：草稿证 cert_no 为 None，直接参与拼接会得到
+    #   "None"，写进 biz_no（NOT NULL）虽不炸但语义错误；统一转成稳定占位串。
+    cert_no = cert.cert_no or f"UNISSUED-{cert.id}"
     payload = "|".join([
-        cert.cert_no, "REVOKED", reason.strip(), _fmt(_dt.now()),
+        cert_no, "REVOKED", reason.strip(), _fmt(_dt.now()),
     ])
 
     # 1. 链上打撤销标记（对原 certificate bizNo；失败降级不中断业务）
-    revoke_result = _revoke_on_chain(cert.cert_no, reason)
+    revoke_result = _revoke_on_chain(cert_no, reason)
 
     # 2. 链上写一条 REVOKE 类型的存证记录作为审计留痕（bizType=revoke 与 certificate 不冲突）
     digest = sha256_hex(payload)
     result = _anchor(digest, payload, EvidenceRecord.BizType.REVOKE,
-                     cert.id, cert.cert_no)
+                     cert.id, cert_no)
     # 若 revokeEvidence 已成功上链，则用其 tx_hash 作为这条审计记录的链上锚点
     if revoke_result.get("ok") and revoke_result.get("tx_hash"):
         result = dict(result, tx_hash=revoke_result["tx_hash"],
@@ -218,7 +269,7 @@ def anchor_revoke(cert: Certificate, reason: str = "") -> EvidenceRecord:
                       mode=revoke_result.get("mode", "mock"))
 
     return _save_record(EvidenceRecord.BizType.REVOKE, cert.id,
-                        cert.cert_no, digest, payload, result)
+                        cert_no, digest, payload, result)
 
 
 def _revoke_on_chain(biz_no: str, reason: str = "") -> dict:
@@ -325,7 +376,16 @@ def verify_certificate(cert: Certificate, check_chain: bool = False) -> dict:
     }
 
     # ---- 第二层：链上核验（调用合约 verifyEvidence / isRevoked）----
-    if check_chain and record and record.tx_hash and record.tx_hash.startswith("0x"):
+    # ★ 原 M5：只看 tx_hash 是否 0x 开头挡不住降级存证 —— mock 的 tx_hash
+    #   本身就是 0x+64hex。真正的判据是 record.chain_status：
+    #   只有真链上成功（"success"）的记录才值得做链上核验，否则离线/mock
+    #   模式下每次扫码都要打 3 次 RPC（各 10s），公开接口可被拖垮。
+    chain_evidence_ok = (
+        record is not None
+        and record.chain_status == "success"
+        and record.tx_hash.startswith("0x")
+    )
+    if check_chain and chain_evidence_ok:
         chain_info = chain.verify_on_chain(
             EvidenceRecord.BizType.CERTIFICATE, cert.cert_no, stored)
         if chain_info.get("ok"):
@@ -344,5 +404,8 @@ def verify_certificate(cert: Certificate, check_chain: bool = False) -> dict:
                     result["message"] = "数据不可信：存证记录与链上数据不一致"
         else:
             result["chain_detail"] = f"链上查询失败：{chain_info.get('message', '未知原因')}"
+    elif check_chain and record is not None:
+        # 降级存证（mock）或链关闭：不发起 RPC，明确告知只过第一层
+        result["chain_detail"] = "该存证为降级模式（未真实上链），仅完成本地比对"
 
     return result

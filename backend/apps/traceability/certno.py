@@ -57,9 +57,26 @@ def normalize_region_code(raw: str) -> str:
     return code[:REGION_LEN]
 
 
+def _today_local() -> date:
+    """
+    取「本地时区」的今天。
+
+    ★ 修复（原 Minor）：原用 date.today()，它按**系统时区**取值。
+    生产服务器若为 UTC，则北京时间 00:00~08:00 期间生成的编号日期会比
+    北京日期**早一天**，与业务/纸质证上的日期对不上。
+    这里优先用 Django 的 timezone.localdate()（按 settings.TIME_ZONE），
+    取不到再退回 date.today()。
+    """
+    try:
+        from django.utils import timezone
+        return timezone.localdate()
+    except Exception:  # noqa: BLE001
+        return date.today()
+
+
 def build_prefix(region_code: str, on_date: date = None) -> str:
     """拼出编号前缀 = 区域码 + 日期。"""
-    d = on_date or date.today()
+    d = on_date or _today_local()
     return f"{normalize_region_code(region_code)}{d.strftime('%Y%m%d')}"
 
 

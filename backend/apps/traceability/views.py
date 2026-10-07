@@ -9,6 +9,7 @@
 """
 import io
 from datetime import timedelta
+from decimal import Decimal, InvalidOperation
 
 import qrcode
 from django.conf import settings
@@ -217,7 +218,14 @@ class TestReportViewSet(RoleScopedQuerySetMixin, BaseViewSet):
         for k in ("ocr_method", "ocr_confidence", "ocr_text"):
             v = self.request.data.get(k)
             if v:
-                extra[k] = str(v)[:2000 if k == "ocr_text" else 20]
+                # ★ 截断长度对齐模型字段（原 Minor）：ocr_confidence
+                #   max_length=10（只存 high/medium/low），原写 [:20] 无意义。
+                if k == "ocr_text":
+                    extra[k] = str(v)[:2000]
+                elif k == "ocr_confidence":
+                    extra[k] = str(v)[:10]
+                else:                     # ocr_method max_length=20
+                    extra[k] = str(v)[:20]
         report = serializer.save(**extra)
         services.anchor_report(report)
         audit.log_operation(self.request, OperationLog.Action.CREATE,
@@ -240,6 +248,12 @@ class TestReportViewSet(RoleScopedQuerySetMixin, BaseViewSet):
                 old_file.delete(save=False)
             except OSError:
                 pass
+        # ★ 补审计日志（原 Minor）：create/delete 都有，唯独 update 漏了，
+        #   导致「谁改了报告结论」无迹可查。
+        audit.log_operation(self.request, OperationLog.Action.UPDATE,
+                            target_type="检测报告", target_id=report.id,
+                            target_no=report.report_no,
+                            detail=f"修改检测报告 {report.report_no}")
 
     def perform_destroy(self, instance):
         audit.log_operation(self.request, OperationLog.Action.DELETE,
@@ -340,7 +354,12 @@ class CertificateViewSet(RoleScopedQuerySetMixin, BaseViewSet):
       issue   -> 分配 19 位编号 + 置 issued + 存证上链
       这样草稿不会吃掉流水号，废号也不会产生空号段。
     """
-    queryset = Certificate.objects.select_related("batch", "report", "issuer").all()
+    # ★ prefetch_related("inspections")（原 M12）：列表序列化的 inspection_count
+    #   与 latest_inspection_result 复用同一份预取缓存，10 行/页从 20+ 条 SQL
+    #   降到常数级。
+    queryset = (Certificate.objects
+                .select_related("batch", "report", "issuer")
+                .prefetch_related("inspections").all())
     serializer_class = CertificateSerializer
 
     def scope_queryset(self, qs, user):
@@ -496,9 +515,14 @@ class CertificateViewSet(RoleScopedQuerySetMixin, BaseViewSet):
                                 "cert_no": obj.cert_no or "", "message": str(exc)})
                 fail_count += 1
             except Exception as exc:  # noqa: BLE001 单张异常不应中断整批
+                # ★ 不把异常原文回给客户端（原 Minor）：可能泄露内部细节，
+                #   记日志后回通用文案。
+                import logging
+                logging.getLogger(__name__).exception(
+                    "批量签发单张失败 cert#%s", cid)
                 results.append({"id": cid, "label": label, "ok": False,
                                 "cert_no": obj.cert_no or "",
-                                "message": f"处理异常：{exc}"})
+                                "message": "处理异常，请查看服务日志"})
                 fail_count += 1
 
         return Response({
@@ -580,10 +604,15 @@ class CertificateViewSet(RoleScopedQuerySetMixin, BaseViewSet):
             try:
                 certno.save_with_cert_no(obj, producer)
             except ValueError as exc:
+                # ValueError 是业务校验信息（如区域码非法），可安全回显
                 return Response({"code": 400, "message": str(exc)},
                                 status=status.HTTP_400_BAD_REQUEST)
-            except RuntimeError as exc:
-                return Response({"code": 500, "message": str(exc)},
+            except RuntimeError:
+                # ★ 500 不把异常原文回给客户端（原 Minor）：RuntimeError 里
+                #   可能含内部实现细节（编号重试耗尽等），改记日志 + 回通用文案。
+                import logging
+                logging.getLogger(__name__).exception("分配合格证编号失败")
+                return Response({"code": 500, "message": "编号分配失败，请稍后重试"},
                                 status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         # 补齐业务字段（签发日期/主体名称快照）
@@ -615,8 +644,20 @@ class CertificateViewSet(RoleScopedQuerySetMixin, BaseViewSet):
 
     @action(detail=True, methods=["post"])
     def revoke(self, request, pk=None):
-        """作废合格证（同时留一条作废存证）"""
+        """
+        作废合格证（同时留一条作废存证）。
+
+        ★ 状态守卫（原 M2）：草稿/待审核的证**从未签发过**，没有编号，
+        作废它既无业务意义，又会让 anchor_revoke 拼接 None 触发
+        下游 NOT NULL 违例（500）。因此只允许作废已签发/已暂停的证。
+        """
         obj = self.get_object()
+        if obj.status not in (Certificate.Status.ISSUED,
+                              Certificate.Status.SUSPENDED):
+            return Response(
+                {"code": 400, "message": "仅已签发或已暂停的合格证可作废"
+                                         "（草稿/待审核证尚未生效）"},
+                status=status.HTTP_400_BAD_REQUEST)
         obj.status = Certificate.Status.REVOKED
         obj.save(update_fields=["status", "updated_at"])
         reason = request.data.get("reason", "")
@@ -825,11 +866,24 @@ class InspectionRecordViewSet(RoleScopedQuerySetMixin, BaseViewSet):
         return qs
 
     def list(self, request, *args, **kwargs):
-        """列表查询时顺带刷新逾期状态 —— 逾期随时间自然发生，不靠人工维护。"""
-        qs = self.filter_queryset(self.get_queryset())
-        for rec in qs:
-            rec.refresh_overdue()
-        return super().list(request, *args, **kwargs)
+        """
+        列表查询时顺带刷新逾期状态 —— 逾期随时间自然发生，不靠人工维护。
+
+        ★ 修复（原 M7）：原实现对**分页前的全量过滤集**逐条 refresh_overdue()，
+        既在 GET 里产生写副作用，又是 N 次 UPDATE（命中一条就写一条），
+        数据量大时一次列表请求能打出成百上千次写。现在只刷新**本页**对象
+        （默认 10 条），把写放大收敛到可控范围。
+        """
+        response = super().list(request, *args, **kwargs)
+        data = getattr(response, "data", None)
+        rows = data.get("results") if isinstance(data, dict) else None
+        if rows:
+            ids = [r["id"] for r in rows if isinstance(r, dict) and "id" in r]
+            for rec in InspectionRecord.objects.filter(id__in=ids):
+                rec.refresh_overdue()
+            # 刷新后重新序列化本页，保证前端拿到的 is_overdue 是最新值
+            response = super().list(request, *args, **kwargs)
+        return response
 
     def retrieve(self, request, *args, **kwargs):
         obj = self.get_object()
@@ -929,9 +983,11 @@ class InspectionRecordViewSet(RoleScopedQuerySetMixin, BaseViewSet):
         #   「整改合格」≠「原证复活」。原证只能 suspended -> revoked 终态，
         #   与新批次重新申领体系解耦，符合《食品安全法》追责闭环。
         if result == InspectionRecord.RectifyStatus.DONE:
-            self._revoke_certificate_on_rectify(obj)
-            notify.cert_revoked(obj.certificate, request.user,
-                                reason=obj.certificate.suspend_reason)
+            # ★ 仅当真的执行了「原证作废」才发通知（原 Minor 假通知修复）
+            revoked = self._revoke_certificate_on_rectify(obj)
+            if revoked:
+                notify.cert_revoked(obj.certificate, request.user,
+                                    reason=obj.certificate.suspend_reason)
         elif result == InspectionRecord.RectifyStatus.RECHECK_FAILED:
             self._suspend_certificate(obj, reason=f"整改复查仍不合格（检查#{obj.id}）")
 
@@ -979,10 +1035,13 @@ class InspectionRecordViewSet(RoleScopedQuerySetMixin, BaseViewSet):
         果农需针对【新批次】重新申请合格证，原证永久失效。
         这样公众扫历史二维码时，本地显示「已作废」、链上也能查到「作废记录」，
         不会出现「本地已作废、链上验真却显示当年上链数据合法」的信任悖论。
+
+        返回：是否真的执行了作废（True/False）—— 供调用方决定是否发通知，
+        避免「证本来就没暂停，却发了『证已作废』的假通知」（原 Minor）。
         """
         cert = record.certificate
         if cert.status != Certificate.Status.SUSPENDED:
-            return
+            return False
         cert.status = Certificate.Status.REVOKED
         cert.suspend_reason = (f"整改复查通过，原批次作废（检查#{record.id}）；"
                                f"需重新申领新批次合格证")[:255]
@@ -993,6 +1052,7 @@ class InspectionRecordViewSet(RoleScopedQuerySetMixin, BaseViewSet):
         except Exception:  # noqa: BLE001
             # 作废存证失败不能回滚状态变更（本地状态已是事实）
             pass
+        return True
 
     def _apply_certificate_status(self, record):
         """根据检查结论联动合格证状态（仅检查录入时）。"""
@@ -1138,7 +1198,12 @@ class SupplyDemandViewSet(RoleScopedQuerySetMixin, BaseViewSet):
         返回按匹配度降序的候选列表，含各因子得分明细。
         """
         obj = self.get_object()
-        limit = int(request.query_params.get("limit", 5))
+        # ★ 参数健壮性（原 Minor）：非数字 limit 原会 int() 抛 500，这里容错并夹紧范围
+        try:
+            limit = int(request.query_params.get("limit", 5))
+        except (TypeError, ValueError):
+            limit = 5
+        limit = max(1, min(limit, 50))
         return Response({"code": 200, "message": "ok",
                          "data": matching.recommend_for(obj, limit=limit)})
 
@@ -1153,23 +1218,35 @@ class SupplyDemandViewSet(RoleScopedQuerySetMixin, BaseViewSet):
         price = request.data.get("price", 0)
 
         score, detail = 0, ""
+        counterpart = None
         if counterpart_id:
-            cp = SupplyDemand.objects.filter(id=counterpart_id).first()
-            if cp is not None:
+            try:
+                counterpart = SupplyDemand.objects.filter(id=int(counterpart_id)).first()
+            except (TypeError, ValueError):
+                counterpart = None
+            if counterpart is not None:
                 try:
                     if obj.kind == SupplyDemand.Kind.SUPPLY:
-                        r = matching.score_match(obj, cp)
+                        r = matching.score_match(obj, counterpart)
                     else:
-                        r = matching.score_match(cp, obj)
+                        r = matching.score_match(counterpart, obj)
                     score, detail = r["score"], r["detail"]
                 except ValueError:
                     pass
 
+        # ★ 数值字段校验（原 Minor）：非数字 quantity/price 原会 500
+        def _num(v, fallback):
+            try:
+                return Decimal(str(v)) if v not in (None, "") else fallback
+            except (InvalidOperation, ValueError):
+                return fallback
+
         intent = MatchIntent.objects.create(
             supply=obj,
+            counterpart=counterpart,          # ★ 落库对手方（原 Minor 修复）
             initiator=request.user,
-            quantity_kg=quantity or obj.quantity_kg,
-            price=price or obj.price,
+            quantity_kg=_num(quantity, obj.quantity_kg),
+            price=_num(price, obj.price),
             match_score=score,
             score_detail=detail,
             message=request.data.get("message", ""),
@@ -1786,17 +1863,24 @@ class DashboardView(APIView):
             a=Avg("match_score"))["a"]
         return round(float(v), 1) if v is not None else 0
 
-    @staticmethod
-    def _credit_ranking(limit: int = 10):
+    # 信用排行参与计算的主体上限（防止主体多时拖慢看板）
+    _MAX_RANKED = 50
+
+    def _credit_ranking(self, limit: int = 10):
         """
         ★ 主体信用评分排行（监管看板：一眼看穿哪些主体风险最高）。
 
         用 credit.score_producer 给每个主体算信用分，按分升序排列（低分=高风险
         排前面），附等级与扣分项数，前端据此渲染「信用红黑榜」。
-        上限默认 10，避免主体多时全量计算拖慢看板。
+
+        ★ 性能说明（原 M9）：score_producer 每个主体要查 3~4 次
+        （证 / 报告 / 检查），所以这里用 `_MAX_RANKED` 限制参与排行的主体数，
+        避免主体很多时把看板拖成上千条 SQL。排行榜本身只展示前 N 名，
+        只需风险最高的那批，无需全量。
         """
         rows = []
-        for p in Producer.objects.all()[:200]:  # 防御上限，避免极端数据量拖垮看板
+        # 防御上限：只对最近 _MAX_RANKED 个主体算分（排行榜取前 limit 名足矣）
+        for p in Producer.objects.all()[:self._MAX_RANKED]:
             score = credit.score_producer(p)
             rows.append({
                 "id": p.id,
@@ -1876,9 +1960,12 @@ class AlertView(APIView):
             self._inspection_items(overdue)))
 
         # ② 抽查不合格但尚在期限内（预警，别等到逾期）
+        # ★ 修复（原 Minor）：原 `rectify_deadline__gte=today` 会漏掉
+        #   deadline 为 NULL 的未闭环记录（未设期限 ≠ 不用跟踪）。
         pending_bad = InspectionRecord.objects.filter(
             check_result=InspectionRecord.CheckResult.UNQUALIFIED,
-            rectify_deadline__gte=today,
+        ).filter(
+            Q(rectify_deadline__gte=today) | Q(rectify_deadline__isnull=True)
         ).exclude(rectify_status__in=[
             InspectionRecord.RectifyStatus.DONE,
             InspectionRecord.RectifyStatus.NOT_REQUIRED])
@@ -1945,7 +2032,8 @@ class AlertView(APIView):
 
         need_fix = my_ins.filter(
             check_result=InspectionRecord.CheckResult.UNQUALIFIED,
-            rectify_deadline__gte=today,
+        ).filter(
+            Q(rectify_deadline__gte=today) | Q(rectify_deadline__isnull=True)
         ).exclude(rectify_status__in=[
             InspectionRecord.RectifyStatus.DONE,
             InspectionRecord.RectifyStatus.NOT_REQUIRED])
