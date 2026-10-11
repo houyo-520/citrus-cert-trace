@@ -56,7 +56,6 @@ class ContentSecurityPolicyMiddleware:
 """
 import re
 
-from django.conf import settings
 from django.http import JsonResponse
 
 # 待改密用户仍可访问的路径前缀（正则）

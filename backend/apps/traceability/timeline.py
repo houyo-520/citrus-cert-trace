@@ -85,20 +85,24 @@ def _anchor_of(biz_type: str, biz_id: int, cache=None):
                .order_by("-version").first())
     if not rec:
         return None
+    # ★ 第五轮审计修复（TIMELINE-LOSES-FAILED-DISTINCTION，低）：
+    #   describe_anchor 区分 success / failed / mock 三态，但这里原先只回一个布尔，
+    #   导致时间轴把「上链失败」和「从未上链」渲染成完全一样 —— 丢掉了第三轮
+    #   特意加的 failed 语义（「已记录摘要但链上写入失败」）。
+    #   现补齐 anchor_mode / anchor_label，前端可按需区分展示。
+    from . import services as _services
+    _desc = _services.describe_anchor(rec)
     return {
         "data_hash": rec.data_hash,
         "tx_hash": rec.tx_hash,
         "block_height": rec.block_height,
         "chain_status": rec.chain_status,
-        # ★ 第四轮审计修复（TIMELINE-ANCHOR-FAKE，高）：
-        #   原判据 `tx_hash.startswith("0x")` 挡不住降级存证 —— mock 的
-        #   tx_hash 本身就是 0x+64hex（chain.py 的 _mock_tx_hash）。
-        #   后果：同一份数据两处结论互相打脸 ——
-        #     签发接口说「本地存证（未上链）」，验真页时间轴却显示
-        #     「已上链 · 区块 #0 · 0x…」，timeline_summary.anchored_nodes 也虚高。
-        #   真正的判据是 chain_status（只有真链上成功才是 "success"），
+        # ★ 判据是 chain_status（只有真链上成功才是 "success"），
         #   与 services.describe_anchor 保持一致（唯一事实来源）。
-        "anchored": (rec.chain_status == "success"),
+        #   注意：mock 的 tx_hash 也是 0x+64hex，绝不能用前缀判断。
+        "anchored": _desc["anchored"],
+        "anchor_mode": _desc["mode"],       # chain / mock / failed / none
+        "anchor_label": _desc["label"],
     }
 
 

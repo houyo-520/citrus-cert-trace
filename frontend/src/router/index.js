@@ -117,6 +117,35 @@ const router = createRouter({
   routes
 })
 
+/**
+ * ★ 第五轮（STALE-FLAG-LOCKOUT）：向服务端复核「待改密」标记是否仍然有效。
+ * 返回 true 表示服务端也认为需要改密；false 表示标记已过期（应清除并放行）。
+ * 网络异常时保守返回 true（宁可多拦一次，也不要放过真正待改密的账号）。
+ */
+let _rechecking = null
+function recheckMustChange () {
+  if (_rechecking) return _rechecking
+  _rechecking = (async () => {
+    try {
+      // ★ 用动态 import 打破循环依赖：
+      //   utils/request.js 静态 import 了本模块（用于 forceLogout 跳转登录），
+      //   若这里再静态 import request 就会成环（Vite 下表现为初始化顺序不确定）。
+      const { default: request } = await import('@/utils/request')
+      const res = await request.get('/auth/profile/')
+      const u = res?.data ?? res
+      const still = !!u?.must_change_password
+      if (!still) localStorage.removeItem('must_change_password')
+      return still
+    } catch (e) {
+      // 401/网络错误：交给既有拦截器处理；此处保守维持拦截
+      return true
+    } finally {
+      _rechecking = null
+    }
+  })()
+  return _rechecking
+}
+
 router.beforeEach((to, from, next) => {
   document.title = (to.meta.title ? to.meta.title + ' - ' : '') + '柑橘合格证追溯系统'
   const token = localStorage.getItem('token')
@@ -130,8 +159,22 @@ router.beforeEach((to, from, next) => {
   //   待改密账号只能停在改密页 —— 否则进任何业务页都会收到 403，
   //   用户看到一堆报错却不知道要干什么（体验上是「系统坏了」）。
   const mustChange = localStorage.getItem('must_change_password') === '1'
-  if (mustChange && to.name !== 'ChangePassword') {
-    return next({ name: 'ChangePassword', query: { forced: '1' } })
+  if (mustChange) {
+    // ★ 第五轮审计修复（STALE-FLAG-LOCKOUT，低）：
+    //   本地标记可能是**残留**的（改密成功但响应丢失；或管理员在后台清了标记）。
+    //   只信本地会把人反复踹回改密页。这里先向服务端复核一次 ——
+    //   /api/auth/profile/ 在白名单内，待改密时也不会被 403，
+    //   所以它返回的 must_change_password 才是权威值。
+    if (to.name !== 'ChangePassword') {
+      recheckMustChange().then((stillForced) => {
+        if (stillForced) {
+          next({ name: 'ChangePassword', query: { forced: '1' } })
+        } else {
+          next()          // 标记已过期 → 放行
+        }
+      })
+      return
+    }
   }
   if (!mustChange && to.name === 'ChangePassword' && to.query.forced === '1') {
     // 改完密后不要再被 forced 参数拉回改密页

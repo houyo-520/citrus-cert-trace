@@ -118,18 +118,22 @@
           </div>
         </div>
 
+        <!--
+          ★ 第五轮审计修复（REVOKED-VS-CHAIN-VERIFIED-CONTRADICTION）：
+            本地已作废、但链上撤销未生效时，后端仍可能拿到链上「matched=true」。
+            后端已把 chain_verified 置否，但前端这里也要**优先渲染成「已作废」**，
+            否则会出现「顶部已作废 + 第二层通过」的观感矛盾。
+        -->
         <div class="check-item"
-             :class="!result.anchored ? 'skip' : (result.chain_verified ? 'ok' : 'bad')">
+             :class="result.revoked ? 'bad'
+                     : (!result.anchored ? 'skip' : (result.chain_verified ? 'ok' : 'bad'))">
           <div class="check-head">
             <el-icon><Link /></el-icon>
             <span>第二层 · 联盟链上核验</span>
-            <!--
-              ★ 第四轮审计修复：原判据 `!result.tx_hash` 判「未上链」不成立 ——
-                mock 存证的假哈希本身就是 0x+64hex，会被当成"已上链"，
-                于是这一格显示成红色「不通过」而不是中性「未上链」。
-                正确的判据是后端下发的 result.anchored（= chain_status == success）。
-            -->
-            <el-tag v-if="!result.anchored" type="info" size="small" effect="dark">
+            <el-tag v-if="result.revoked" type="danger" size="small" effect="dark">
+              已作废
+            </el-tag>
+            <el-tag v-else-if="!result.anchored" type="info" size="small" effect="dark">
               {{ result.anchor_label || '未上链' }}
             </el-tag>
             <el-tag v-else :type="result.chain_verified ? 'success' : 'danger'"
@@ -279,7 +283,7 @@ const verdictTitle = computed(() => {
   switch (verdictState.value) {
     case 'revoked': return '该合格证已作废 · 不可流通'
     case 'ok': return '验真通过 · 数据可信（已通过链上核验）'
-    case 'local': return '本地摘要一致 · 链上已存证'
+    case 'local': return '验真通过 · 链上已存证（本次未复核）'
     case 'partial': return '本地摘要一致 · 尚未上链核验'
     case 'bad': return '验真失败 · 数据不可信'
     default: return ''
@@ -367,9 +371,13 @@ onUnmounted(() => { mq?.removeEventListener('change', onMq) })
 .verdict.ok { background: linear-gradient(135deg, #3f9d5c, #2d7d46); }
 .verdict.bad { background: linear-gradient(135deg, #e05b5b, #c33c3c); }
 .verdict.revoked { background: linear-gradient(135deg, #8c7a3c, #6b5c28); }
-/* ★ 第四轮新增：本地一致但未上链核验 / 已上链但本次未核验 —— 不给绿色误导 */
+/* ★ 第四轮新增：本地一致但未上链核验 / 已上链但本次未核验 */
+/* ★ 第五轮调整（DEMO-CHAIN-FLAP-DEGRADES-VERDICT）：
+     「已上链存证、本次未复核」本质上仍是可信数据，只是这次没打链上 RPC。
+     用蓝色会在链抖动时把「验真通过」的绿色顶掉，演示现场观感是"证出问题了"。
+     改为绿色系（略浅），文案明确写「本次未复核」，既诚实又不误导。 */
 .verdict.partial { background: linear-gradient(135deg, #c98a2e, #a06f1f); }
-.verdict.local { background: linear-gradient(135deg, #4a7fa5, #35617f); }
+.verdict.local { background: linear-gradient(135deg, #3f9d5c, #2d7d46); }
 .verdict.unknown { background: linear-gradient(135deg, #7a7a7a, #5c5c5c); }
 .verdict-icon { flex: 0 0 auto; display: flex; }
 .verdict-title { font-size: 19px; font-weight: 700; letter-spacing: 0.5px; }

@@ -715,10 +715,29 @@ def verify_certificate(cert: Certificate, check_chain: bool = False) -> dict:
             f"未做链上核验：{anchor['detail']}。"
             "当前结论仅代表「本地摘要一致」，不含链上不可篡改保证")
 
-    # ★ 最终防线（第四轮）：本地作废是终局判定，任何分支都不得翻回 True
+    # ★ 最终防线（第四轮 + 第五轮）：本地作废是终局判定，
+    #   不仅 trusted/revoked 要同步，**所有由它派生的展示结论都必须一起置否**。
+    #
+    #   ★ 第五轮审计修复（REVOKED-VS-CHAIN-VERIFIED-CONTRADICTION）：
+    #     前一版只把 trusted/revoked 置否，漏了 `chain_verified`。当
+    #     「本地已作废、但链上撤销没成功」（anchor_revoke → _revoke_on_chain
+    #     静默降级，不抛异常）时，链上仍是 revoked=False, matched=True，
+    #     于是 chain_verified=True ——
+    #       页面顶部：橄榄色「该合格证已作废 · 不可流通」
+    #       第二层  ：绿色「联盟链上核验 · 通过」   ← 自相矛盾
+    #   项目约定（已固化到 rules.py 模块注释）：
+    #     否定性终态优先于一切外部证据；由否定性终态派生的所有展示字段
+    #     都必须同步置否。
     if local_revoked:
         result["trusted"] = False
         result["revoked"] = True
+        # ★ 派生结论一并置否（本轮修复）
+        result["chain_verified"] = False
+        # ★ 无条件覆盖 chain_detail：本地作废是终局事实，不能让"链上摘要一致"
+        #   这种**局部为真**的表述留在页面上造成观感矛盾。
+        result["chain_detail"] = (
+            "本地已作废，链上撤销未同步生效"
+            + (f"（链上返回：{result['chain_detail']}）" if result.get("chain_detail") else ""))
         if result.get("revoke_source") not in ("local", "chain"):
             result["revoke_source"] = "local"
 

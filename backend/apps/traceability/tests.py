@@ -4040,18 +4040,44 @@ class TimelineAnchorJudgementTest(BaseFixture):
     """★ 第四轮（TIMELINE-ANCHOR-FAKE，高）：时间轴「已上链」判据必须是 chain_status。"""
 
     def test_mock_tx_hash_not_counted_as_anchored(self):
-        """★ mock 的假哈希以 0x 开头，但不得算作已上链"""
+        """★ mock 的假哈希以 0x 开头，但不得算作已上链
+
+        ★ 第五轮审计（测试质量）：原写法把核心断言包在
+        `if rec.chain_status != "success":` 里 —— 若某天测试环境链可达、
+        记录变成真 success，整个断言会被静默跳过，测试"空跑"却显示 ok。
+        现在**显式把 chain_status 置为 "mock"**，再无条件断言。
+        """
         services.anchor_certificate(self.cert)
         rec = services.EvidenceRecord.objects.filter(
             biz_type="certificate", biz_id=self.cert.id, is_current=True).first()
-        # mock 的 tx_hash 形如 0x+64hex（旧判据会被骗）
-        self.assertTrue(rec.tx_hash.startswith("0x"))
+        # 显式构造「降级存证」：假哈希 + mock 状态（不依赖环境链是否可达）
+        rec.chain_status = "mock"
+        rec.tx_hash = "0x" + "c" * 64      # 形如 0x+64hex，旧判据会被骗
+        rec.save(update_fields=["chain_status", "tx_hash"])
+
         from apps.traceability import timeline
         a = timeline._anchor_of("certificate", self.cert.id)
         self.assertIsNotNone(a)
-        if rec.chain_status != "success":
-            self.assertFalse(a["anchored"],
-                             "chain_status != success 时不得标记为已上链")
+        self.assertTrue(a["tx_hash"].startswith("0x"), "前提：假哈希确实以 0x 开头")
+        self.assertFalse(a["anchored"], "chain_status=mock 时不得标记为已上链")
+        self.assertEqual(a["anchor_mode"], "mock")
+
+    def test_failed_status_distinguishable_from_mock(self):
+        """★ 第五轮（TIMELINE-LOSES-FAILED-DISTINCTION）：failed 与 mock 必须可区分"""
+        services.anchor_certificate(self.cert)
+        rec = services.EvidenceRecord.objects.filter(
+            biz_type="certificate", biz_id=self.cert.id, is_current=True).first()
+        from apps.traceability import timeline
+        modes = {}
+        for st in ("failed", "mock"):
+            rec.chain_status = st
+            rec.save(update_fields=["chain_status"])
+            a = timeline._anchor_of("certificate", self.cert.id)
+            modes[st] = (a["anchored"], a["anchor_mode"], a["anchor_label"])
+        self.assertFalse(modes["failed"][0])
+        self.assertFalse(modes["mock"][0])
+        self.assertNotEqual(modes["failed"][2], modes["mock"][2],
+                            "「上链失败」与「未上链」的文案必须不同")
 
     def test_success_status_counts_as_anchored(self):
         services.anchor_certificate(self.cert)
@@ -4134,18 +4160,41 @@ class IntentRespondAtomicTest(BaseFixture):
         self.assertEqual(self.supply.deal_status, "matched")
 
     def test_stale_respond_returns_409(self):
-        """★ 状态已被并发改掉时，回应必须 409（不覆盖）"""
+        """★ 真正覆盖 409 分支：状态机放行后，库中状态已被并发改掉 → 条件更新失败
+
+        ★ 第五轮审计（测试质量）：原写法用 `assertIn(r.status_code, (400, 409))`，
+        但该场景在 check_intent_respond 阶段就被 400 拦下，**409 那条路径从未被覆盖**。
+
+        这里 mock 掉状态机让它放行，并在「读对象 → 条件更新」之间把库中状态改掉，
+        制造真实的竞态窗口，从而走到原子更新的失败分支。
+        """
+        from unittest import mock
+        from apps.traceability import rules
         from apps.traceability.models import MatchIntent
-        # 模拟并发：另一请求已把意向改成 rejected
-        MatchIntent.objects.filter(id=self.intent.id).update(status="rejected")
-        c = self.login(self.producer)
-        r = c.post(f"/api/intent/{self.intent.id}/respond/",
-                   {"status": "accepted"}, format="json")
-        # 状态机在 check 阶段就会拦（rejected 是终态）→ 400；
-        # 若走到原子更新则 409。两者都表示「没被错误覆盖」。
-        self.assertIn(r.status_code, (400, 409))
+
+        # ★ 关键：patch get_object，让它在返回对象前先把库中状态改掉。
+        #   这样视图拿到的 obj.status 仍是 pending，但库已变成 rejected，
+        #   随后 `filter(id=..., status='pending').update(...)` 必然 0 行 → 409。
+        from apps.traceability.views import MatchIntentViewSet
+        real_get_object = MatchIntentViewSet.get_object
+
+        def racy_get_object(self_, *a, **kw):
+            obj = real_get_object(self_, *a, **kw)
+            MatchIntent.objects.filter(id=obj.id).update(
+                status=MatchIntent.Status.REJECTED)
+            return obj     # 返回的对象还带着旧 status
+
+        with mock.patch.object(rules, "check_intent_respond", return_value=None), \
+             mock.patch.object(MatchIntentViewSet, "get_object", racy_get_object):
+            c = self.login(self.producer)
+            r = c.post(f"/api/intent/{self.intent.id}/respond/",
+                       {"status": "accepted"}, format="json")
+
+        self.assertEqual(r.status_code, 409,
+                         "状态校验通过但库中状态已变 → 必须 409 而不是覆盖")
         self.intent.refresh_from_db()
-        self.assertEqual(self.intent.status, "rejected")
+        self.assertEqual(self.intent.status, MatchIntent.Status.REJECTED,
+                         "并发变更的结果不得被覆盖")
 
 
 class MiddlewareWhitelistTest(TestCase):
@@ -4157,3 +4206,76 @@ class MiddlewareWhitelistTest(TestCase):
         self.assertIsNone(mw._PWD_ALLOW_RE.match("/admin/login/"))
         # 改密相关仍应放行
         self.assertIsNotNone(mw._PWD_ALLOW_RE.match("/api/auth/change-password/"))
+
+
+# ===============================================================
+# ★ 第八批：第五轮审计修复回归
+# ===============================================================
+class RevokedChainVerifiedConsistencyTest(BaseFixture):
+    """★ 第五轮（REVOKED-VS-CHAIN-VERIFIED-CONTRADICTION）：
+
+    本地已作废 + 链上撤销未生效（链上仍 matched=True）时，
+    **所有派生结论**（含 chain_verified）都必须同步置否，
+    不能出现「顶部已作废 + 第二层链上核验通过」的矛盾。
+    """
+
+    def _revoked_cert(self):
+        return Certificate.objects.create(
+            batch=self.batch, report=self.report, cert_no="CERT-REV-X",
+            producer_name=self.producer_obj.name, product_name="柑橘",
+            quantity_kg=Decimal("1.00"), status=Certificate.Status.REVOKED)
+
+    def test_chain_verified_forced_false_when_locally_revoked(self):
+        """★ 核心：链上返回 matched=True 也不得让 chain_verified=True"""
+        from unittest import mock
+        cert = self._revoked_cert()
+        services.anchor_certificate(cert)
+        rec = services.EvidenceRecord.objects.filter(
+            biz_type="certificate", biz_id=cert.id, is_current=True).first()
+        rec.chain_status = "success"
+        rec.tx_hash = "0x" + "d" * 64
+        rec.save(update_fields=["chain_status", "tx_hash"])
+        # 模拟「链上撤销未生效」：链上仍是未撤销且摘要一致
+        fake = {"ok": True, "revoked": False, "matched": True, "exists": True,
+                "message": "链上摘要一致，存证可信"}
+        with mock.patch.object(services.chain, "verify_on_chain", return_value=fake):
+            r = services.verify_certificate(cert, check_chain=True)
+        self.assertFalse(r["trusted"])
+        self.assertTrue(r["revoked"])
+        self.assertFalse(r["chain_verified"],
+                         "本地已作废时 chain_verified 必须为 False（派生结论同步置否）")
+
+    def test_chain_detail_explains_when_locally_revoked(self):
+        """chain_detail 应说明「本地已作废、链上未生效」而非空白"""
+        from unittest import mock
+        cert = self._revoked_cert()
+        services.anchor_certificate(cert)
+        rec = services.EvidenceRecord.objects.filter(
+            biz_type="certificate", biz_id=cert.id, is_current=True).first()
+        rec.chain_status = "success"
+        rec.tx_hash = "0x" + "e" * 64
+        rec.save(update_fields=["chain_status", "tx_hash"])
+        fake = {"ok": True, "revoked": False, "matched": True, "exists": True,
+                "message": "链上摘要一致"}
+        with mock.patch.object(services.chain, "verify_on_chain", return_value=fake):
+            r = services.verify_certificate(cert, check_chain=True)
+        self.assertTrue(r["chain_detail"], "chain_detail 不应为空")
+        self.assertIn("作废", r["chain_detail"])
+
+    def test_no_contradiction_in_public_payload(self):
+        """★ 公开验真接口下发的字段不得自相矛盾"""
+        from unittest import mock
+        cert = self._revoked_cert()
+        services.anchor_certificate(cert)
+        rec = services.EvidenceRecord.objects.filter(
+            biz_type="certificate", biz_id=cert.id, is_current=True).first()
+        rec.chain_status = "success"
+        rec.tx_hash = "0x" + "f" * 64
+        rec.save(update_fields=["chain_status", "tx_hash"])
+        fake = {"ok": True, "revoked": False, "matched": True, "exists": True,
+                "message": "链上摘要一致"}
+        with mock.patch.object(services.chain, "verify_on_chain", return_value=fake):
+            r = services.verify_certificate(cert, check_chain=True)
+        # 矛盾组合：revoked=True + chain_verified=True 绝不允许同时出现
+        self.assertFalse(r["revoked"] and r["chain_verified"],
+                         "禁止出现「已作废 + 链上核验通过」的矛盾组合")
