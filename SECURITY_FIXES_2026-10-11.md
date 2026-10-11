@@ -292,3 +292,80 @@ CSP 加在 Django 响应上，但 SPA 的 `index.html` 是 **nginx 直接返回*
 - 模型加字段 + 迁移 `0005_user_must_change_password`
 - 新增 `POST /api/auth/change-password/`（校验旧密码、长度 ≥8、不得同旧）
 - `init_data` 对**已存在**的演示账号也轮换口令并置标记
+
+---
+
+# 第三轮审计修复
+
+> 时间：2026-10-11　　4 项新问题（含 3 项高/中高，直接影响「可信存证」语义）。
+> 测试：277 → **296**，全部通过。
+
+| 指纹 | 问题 | 等级 | 状态 |
+| --- | --- | --- | --- |
+| 上链失败仍显示签发成功 | mock 被表述为「已完成可信存证」| 高/10 | ✅ |
+| 状态机检查存在并发窗口 | 检查-写入非原子，可能覆盖并发状态 | 高/9 | ✅ |
+| 强制改密未真正强制 | 登录照样发 JWT，可跳过改密 | 中/10 | ✅ |
+| OCR 总时限未覆盖 PDF 解析渲染 | 解析/渲染仍在 worker 内同步跑 | 中/9 | ✅ |
+
+## 修复说明
+
+### ① 上链失败不得显示签发成功（高）
+**问题**：链不可用时 `chain.send_evidence` 返回 mock，但业务照常落本地存证、
+证书标 `is_anchored=True`，签发接口一律回 `"签发成功并完成可信存证"`；
+公众验真在本地哈希一致时也显示「可信」——**「可信存证」这个核心卖点被 mock 冒充**。
+
+**修复**：
+- 新增 `services.describe_anchor(record)` —— 统一把存证记录转成
+  `{anchored, mode, label, detail}`；**只有 `chain_status == "success"` 才算 anchored**。
+- 签发接口按真实结果分三种措辞：
+  - 真上链 → 「签发成功并完成链上存证」
+  - 降级 mock → 「签发成功（本地存证，链上未核验）」
+  - **开了链却写失败** → 「签发成功，但链上存证失败…请检查链节点后重新签发」
+  且响应 `data.anchor` 透出真实状态。
+- 验真措辞拆分：本地一致 → 「**本地摘要一致**」（不再说「数据可信」）；
+  仅当**链上核验也通过**才升级为「数据可信：本地摘要一致，且已通过链上核验」。
+- 公开验真接口新增 `anchored` / `anchor_mode` / `anchor_label` / `anchor_detail`。
+- 批量签发的 message 由「签发并存证成功」改为「签发成功」+ 逐张 `anchor` 明细。
+
+### ② 状态机检查并发窗口（高）
+**问题**：`issue` 与检查暂停都是「读对象 → 检查状态 → 保存」，三步无原子性。
+并发时签发可能依据旧状态通过校验，**覆盖另一请求刚写入的 `suspended`**。
+
+**修复**：新增 `rules.atomic_cert_transition(cert, to, extra)` —— **带原状态条件的
+UPDATE**（乐观并发控制）：
+```
+UPDATE certificate SET status=<to>,... WHERE id=? AND status=<from>
+```
+- `rowcount==1` 成功；`rowcount==0` 说明状态已被并发修改 → 放弃（签发返回 **409**）。
+- ⚠️ **不用 `select_for_update`**：项目默认 SQLite，SQLite 会**忽略** FOR UPDATE；
+  条件更新跨数据库可靠。
+- 已接入：`issue` / `batch_issue` / 检查暂停联动。
+
+### ③ 强制改密未真正强制（中）
+**问题**：加了字段与改密接口，但登录照样发 JWT，用户可直接用业务接口跳过改密；
+改密后旧 refresh 也仍然有效。
+
+**修复**：
+- 新增 `ForcePasswordChangeMiddleware`：待改密用户访问**非白名单**接口一律
+  403 + `must_change_password: true`。
+  白名单：改密 / 注销 / 刷新 / profile / 登录 / 公开接口 / 静态资源。
+  （自行解析 Authorization 头，因 DRF 认证在视图层、中间件早于它。）
+- 改密成功后**拉黑该用户全部未过期 refresh**（`OutstandingToken` 遍历 + blacklist），
+  旧会话立即失效。
+- 响应返回 `revoked_sessions` 数量。
+
+### ④ OCR 总时限未覆盖 PDF 解析/渲染（中）
+**问题**：上轮只让 tesseract 可中断；PDF 文本提取与渲染仍在 worker 内同步执行，
+预算只在提取**之后**检查 → 畸形 PDF 仍能卡住 worker。
+
+**修复**：新增 `_run_pdf_subprocess()`，把 `extract_text_from_pdf` 与
+`render_pdf_to_images` 都放进**子进程**并受剩余预算约束。
+- 结果经**临时文件**回传（base64 PNG 可达数 MB，走 stdout 会被截断 → 实测踩坑）。
+- 两个函数均新增 `budget` 参数，由 `extract_from_file` 传剩余秒数。
+- 子进程异常/超时一律降级为「无文本层」，不抛异常、不挂住。
+
+## 本轮踩坑记录
+1. `ocr.py` 缺 `import json` —— 子进程结果解析抛 `NameError`，被 `except Exception`
+   吞成 `bad-output`，表现为**渲染静默返回 0 页**（功能等于不存在）。
+   教训：宽 except 会吞掉「自己忘 import」这类低级错误，调试时要打印真实异常。
+2. 子进程回传大体积结果**不要走 stdout**（管道容量/缓冲），改用临时文件。

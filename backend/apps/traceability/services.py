@@ -222,6 +222,40 @@ def _save_record(biz_type: str, biz_id: int, biz_no: str, digest: str,
         )
 
 
+def describe_anchor(record) -> dict:
+    """
+    把一个存证记录转成**对外可如实描述**的锚定状态。
+
+    ★ 第三轮审计修复（High）：原实现无论真上链还是降级 mock，签发接口
+    一律返回「签发成功并完成可信存证」——把「本地写了摘要」说成了
+    「链上已完成可信存证」，公众验真也会在本地哈希一致时显示「可信」，
+    而实际链上根本没有对应记录。这会让「可信存证」这个核心卖点失真。
+
+    返回值：
+      {
+        "anchored": bool,        # 是否真的上链成功（chain_status == "success"）
+        "mode": str,             # "chain" | "mock" | "failed" | "none"
+        "label": str,            # 简短状态词（前端可直接展示）
+        "detail": str,           # 人类可读说明（含降级原因提示）
+      }
+    """
+    if record is None:
+        return {"anchored": False, "mode": "none", "label": "未存证",
+                "detail": "未找到存证记录"}
+    status = (record.chain_status or "").lower()
+    if status == "success":
+        return {"anchored": True, "mode": "chain", "label": "已上链存证",
+                "detail": f"摘要已写入联盟链（交易 {record.tx_hash[:18]}…）"}
+    if status == "failed":
+        return {"anchored": False, "mode": "failed", "label": "上链失败",
+                "detail": "已记录摘要但**链上写入失败**，当前仅本地存证，"
+                          "不具备链上不可篡改保证"}
+    # mock / 其他降级
+    return {"anchored": False, "mode": "mock", "label": "本地存证（未上链）",
+            "detail": "链节点不可用或未配置，已降级为**本地存证**；"
+                      "摘要已固化在本地库，但**未经链上核验**"}
+
+
 def anchor_certificate(cert: Certificate) -> EvidenceRecord:
     """
     对合格证执行存证：
@@ -585,7 +619,10 @@ def verify_certificate(cert: Certificate, check_chain: bool = False) -> dict:
     if not record:
         message = "未找到存证记录，无法验真"
     elif local_trusted and related_trusted:
-        message = "数据可信：当前数据与存证摘要一致"
+        # ★ 第三轮审计修复（High）：不要把「本地摘要一致」说成「已验证可信」。
+        #   是否真上链由下方 chain_verified 决定，此处用中性且准确的表述，
+        #   并在 detail 里明确「尚未链上核验」。
+        message = "本地摘要一致（当前数据与存证摘要相符）"
     elif not local_trusted:
         message = "数据不可信：当前数据与存证摘要不一致，可能已被篡改"
     else:
@@ -593,6 +630,9 @@ def verify_certificate(cert: Certificate, check_chain: bool = False) -> dict:
                if x["checked"] and not x["trusted"]]
         message = ("数据不可信：关联证据（" + "、".join(bad)
                    + "）与存证摘要不一致，可能已被篡改")
+
+    # ★ 锚定状态（是否真上链）—— 与「本地一致」是两个不同的事实，必须分开表达
+    anchor = describe_anchor(record)
 
     result = {
         "trusted": local_trusted and related_trusted,
@@ -602,6 +642,11 @@ def verify_certificate(cert: Certificate, check_chain: bool = False) -> dict:
         "chain_verified": False,
         "chain_detail": "",
         "revoked": False,
+        # ★ 明确的锚定状态：anchored=True 才代表「链上已完成存证」
+        "anchored": anchor["anchored"],
+        "anchor_mode": anchor["mode"],
+        "anchor_label": anchor["label"],
+        "anchor_detail": anchor["detail"],
         # ★ 关联证据核验明细（公众页可展示「批次 / 报告是否也被改过」）
         "related": related_issues,
     }
@@ -633,10 +678,15 @@ def verify_certificate(cert: Certificate, check_chain: bool = False) -> dict:
                 if chain_info["exists"] and not chain_info["matched"]:
                     result["trusted"] = False
                     result["message"] = "数据不可信：存证记录与链上数据不一致"
+                elif result["trusted"]:
+                    # ★ 链上核验通过且本地一致 → 这时才配得上「可信」的完整表述
+                    result["message"] = ("数据可信：本地摘要一致，且已通过链上核验")
         else:
             result["chain_detail"] = f"链上查询失败：{chain_info.get('message', '未知原因')}"
     elif check_chain and record is not None:
         # 降级存证（mock）或链关闭：不发起 RPC，明确告知只过第一层
-        result["chain_detail"] = "该存证为降级模式（未真实上链），仅完成本地比对"
+        result["chain_detail"] = (
+            f"未做链上核验：{anchor['detail']}。"
+            "当前结论仅代表「本地摘要一致」，不含链上不可篡改保证")
 
     return result

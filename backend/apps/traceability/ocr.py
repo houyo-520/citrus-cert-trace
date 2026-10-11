@@ -19,6 +19,7 @@
   因此本模块只负责「返回识别结果 + 置信度 + 警告」，落库由用户点保存时决定。
 """
 import io
+import json
 import os
 import re
 import shutil
@@ -107,87 +108,176 @@ MIN_TEXT_LEN = 30
 # ---------------------------------------------------------------
 # 一、文本提取层
 # ---------------------------------------------------------------
-def extract_text_from_pdf(data: bytes, max_pages: int = 5) -> tuple:
+# ---------------------------------------------------------------
+# PDF 子进程执行辅助（第三轮审计修复）
+# ---------------------------------------------------------------
+# 背景：PyMuPDF 是 C 扩展，遇到损坏/畸形的 PDF 可能在解析或渲染中长时间不返回，
+#       而这两步原先都在 gunicorn worker 内**同步**执行 —— 总预算只在文本提取
+#       「之后」才检查，等于拦不住正在跑的解析本身。
+# 方案：把 PDF 解析/渲染放进子进程，父进程按剩余预算强制 kill。
+_PDF_TEXT_SCRIPT = r"""
+import sys, json
+try:
+    try:
+        import pymupdf
+    except ImportError:
+        import fitz as pymupdf
+except ImportError:
+    open(sys.argv[3], "w").write(json.dumps({"ok": False, "reason": "no-pymupdf"}))
+    sys.exit(0)
+path, max_pages, outpath = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+try:
+    with open(path, "rb") as f:
+        data = f.read()
+    doc = pymupdf.open(stream=data, filetype="pdf")
+except Exception:
+    open(outpath, "w").write(json.dumps({"ok": False, "reason": "open-failed"}))
+    sys.exit(0)
+try:
+    chunks = []
+    for i, page in enumerate(doc):
+        if i >= max_pages:
+            break
+        chunks.append(page.get_text("text") or "")
+    text = "\n".join(chunks)
+finally:
+    doc.close()
+open(outpath, "w", encoding="utf-8").write(json.dumps({"ok": True, "text": text}))
+"""
+
+_PDF_RENDER_SCRIPT = r"""
+import sys, json, base64
+try:
+    try:
+        import pymupdf
+    except ImportError:
+        import fitz as pymupdf
+except ImportError:
+    open(sys.argv[5], "w").write(json.dumps({"ok": False, "reason": "no-pymupdf"}))
+    sys.exit(0)
+path, max_pages, dpi, max_px, outpath = (sys.argv[1], int(sys.argv[2]),
+                                         int(sys.argv[3]), int(sys.argv[4]),
+                                         sys.argv[5])
+try:
+    with open(path, "rb") as f:
+        data = f.read()
+    doc = pymupdf.open(stream=data, filetype="pdf")
+except Exception:
+    open(outpath, "w").write(json.dumps({"ok": False, "reason": "open-failed"}))
+    sys.exit(0)
+out = []
+try:
+    for i, page in enumerate(doc):
+        if i >= max_pages:
+            break
+        try:
+            rect = page.rect
+            scale = max(dpi, 1) / 72.0
+            px = int(rect.width * scale) * int(rect.height * scale)
+            use_dpi = dpi
+            if px > max_px and px > 0:
+                factor = (max_px / px) ** 0.5
+                use_dpi = max(int(dpi * factor), 72)
+            pix = page.get_pixmap(dpi=use_dpi)
+            out.append(base64.b64encode(pix.tobytes("png")).decode())
+        except Exception:
+            continue
+finally:
+    doc.close()
+open(outpath, "w", encoding="utf-8").write(json.dumps({"ok": True, "images": out}))
+"""
+
+
+def _run_pdf_subprocess(script: str, data: bytes, timeout: float,
+                        extra_args: list) -> dict:
+    """
+    在子进程里执行 PDF 操作，按 timeout 强制中断。
+
+    ★ 结果通过**临时文件**回传，而不是 stdout ——
+    渲染结果是一堆 PNG 的 base64，体量可达数 MB，走 stdout 既可能被缓冲截断、
+    也容易踩到管道容量限制（实测直接导致解析失败）。文件回传稳定且无大小隐患。
+    """
+    tmpdir = tempfile.mkdtemp(prefix="ocrpdf_")
+    try:
+        src = os.path.join(tmpdir, "in.pdf")
+        out = os.path.join(tmpdir, "out.json")
+        with open(src, "wb") as f:
+            f.write(data)
+        p = subprocess.run(
+            [sys.executable, "-c", script, src] + [str(a) for a in extra_args] + [out],
+            capture_output=True, timeout=timeout, check=False)
+        if not os.path.exists(out):
+            return {"ok": False, "reason": "no-output"}
+        try:
+            with open(out, encoding="utf-8") as f:
+                return json.loads(f.read() or "{}")
+        except Exception:  # noqa: BLE001
+            return {"ok": False, "reason": "bad-output"}
+    except subprocess.TimeoutExpired:
+        _log_timeout_once()
+        return {"ok": False, "reason": "timeout"}
+    except Exception:  # noqa: BLE001
+        return {"ok": False, "reason": "spawn-failed"}
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def extract_text_from_pdf(data: bytes, max_pages: int = 5,
+                          budget: float | None = None) -> tuple:
     """
     从 PDF 提取文本层。
 
+    ★ 第三轮审计修复：改为在**子进程**中执行（按 budget 强制超时），
+    避免畸形 PDF 把 gunicorn worker 卡死。
+
     返回 (text, method)：
       method = "pdf-text"    成功拿到文本层（电子版 PDF）
-      method = ""            无文本层（扫描件），调用方应降级 OCR
+      method = ""            无文本层 / 超时 / 解析失败，调用方应降级或提示
     """
-    try:
-        import pymupdf  # PyMuPDF
-    except ImportError:
-        try:
-            import fitz as pymupdf  # 旧包名
-        except ImportError:
-            return "", ""
-
-    try:
-        doc = pymupdf.open(stream=data, filetype="pdf")
-    except Exception:
+    tmo = float(budget) if budget is not None else float(OCR_TIMEOUT)
+    tmo = max(1.0, min(tmo, float(OCR_TIMEOUT)))
+    res = _run_pdf_subprocess(_PDF_TEXT_SCRIPT, data, tmo, [max_pages])
+    if not res.get("ok"):
+        # 超时或无法解析：一律当作「无文本层」，让上层降级/提示
         return "", ""
 
-    try:
-        chunks = []
-        for i, page in enumerate(doc):
-            if i >= max_pages:
-                break
-            chunks.append(page.get_text("text") or "")
-        text = "\n".join(chunks)
-    finally:
-        doc.close()
-
-    text = text.strip()
+    text = (res.get("text") or "").strip()
     if len(text) < MIN_TEXT_LEN:
         # 扫描件：文本层几乎是空的，交给 OCR
         return text, ""
     return text, "pdf-text"
+    return text, "pdf-text"
 
 
-def render_pdf_to_images(data: bytes, max_pages: int = 3, dpi: int = 200) -> list:
+def render_pdf_to_images(data: bytes, max_pages: int = 3, dpi: int = 200,
+                         budget: float | None = None) -> list:
     """
     把 PDF 每页渲染成 PNG 字节（给 OCR 用）。
 
     dpi=200 是权衡：太低小字认不出，太高 OCR 慢且没明显收益。
+
+    ★ 第三轮审计修复：渲染同样放进**子进程**并受 budget 约束 ——
+    原实现渲染在 worker 内同步跑，总预算拦不住它。
     """
-    try:
-        import pymupdf
-    except ImportError:
-        try:
-            import fitz as pymupdf
-        except ImportError:
-            return []
-
-    images = []
-    try:
-        doc = pymupdf.open(stream=data, filetype="pdf")
-    except Exception:
-        return []
-
     # ★ 上限（M13）：页数与 dpi 都夹紧；并限制单页渲染像素——
     #   固定高 dpi 渲染任意 MediaBox 的页面，10MB 的 PDF 也能渲出上亿像素撑爆内存。
     dpi = min(int(dpi or MAX_PDF_DPI), MAX_PDF_DPI)
     max_pages = min(int(max_pages or MAX_PDF_PAGES), MAX_PDF_PAGES)
-    try:
-        for i, page in enumerate(doc):
-            if i >= max_pages:
-                break
-            try:
-                # 先按 pt 估算渲染后的像素数，超限则按比例下调 dpi
-                rect = page.rect
-                scale = max(dpi, 1) / 72.0
-                px = int(rect.width * scale) * int(rect.height * scale)
-                if px > MAX_PDF_RENDER_PIXELS and px > 0:
-                    factor = (MAX_PDF_RENDER_PIXELS / px) ** 0.5
-                    dpi = max(int(dpi * factor), 72)
-                pix = page.get_pixmap(dpi=dpi)
-                images.append(pix.tobytes("png"))
-            except Exception:
-                continue
-    finally:
-        doc.close()
-    return images
+    tmo = float(budget) if budget is not None else float(OCR_TIMEOUT)
+    tmo = max(1.0, min(tmo, float(OCR_TIMEOUT)))
+
+    res = _run_pdf_subprocess(_PDF_RENDER_SCRIPT, data, tmo,
+                              [max_pages, dpi, MAX_PDF_RENDER_PIXELS])
+    if not res.get("ok"):
+        return []
+    import base64 as _b64
+    out = []
+    for b64 in (res.get("images") or []):
+        try:
+            out.append(_b64.b64decode(b64))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
 
 
 def ocr_image(data: bytes, lang: str = "chi_sim+eng", budget: float | None = None) -> str:
@@ -452,11 +542,13 @@ def extract_from_file(filename: str, data: bytes) -> dict:
                 "text_excerpt": ""}
 
     if ext == ".pdf":
-        # 第一层：文本层
-        text, method = extract_text_from_pdf(data)
+        # 第一层：文本层（★ 子进程 + 预算，畸形 PDF 不会卡死 worker）
+        text, method = extract_text_from_pdf(
+            data, budget=max(1.0, deadline - time.monotonic()))
         if not method and not _over_budget():
-            # 第二层：扫描件 → 渲染成图再 OCR
-            images = render_pdf_to_images(data)
+            # 第二层：扫描件 → 渲染成图再 OCR（渲染也在子进程内受预算约束）
+            images = render_pdf_to_images(
+                data, budget=max(1.0, deadline - time.monotonic()))
             if not images:
                 return {"method": "failed", "ok": False, "fields": {}, "filled": [],
                         "confidence": "low",

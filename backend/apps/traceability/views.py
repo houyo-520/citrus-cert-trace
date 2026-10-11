@@ -491,18 +491,15 @@ class CertificateViewSet(RoleScopedQuerySetMixin, BaseViewSet):
                     if producer is None:
                         raise ValueError("未关联生产主体，无法分配编号")
                     certno.save_with_cert_no(obj, producer)  # 逐张原子取号
-                update_fields = ["status", "cert_no", "updated_at"]
-                obj.status = Certificate.Status.ISSUED
-                obj.suspend_reason = ""
+                # ★ 第三轮审计（High）：条件式原子更新（防并发状态错乱）
+                extra = {"suspend_reason": "", "issuer": request.user}
                 if not obj.issue_date:
-                    obj.issue_date = certno.today_local()
-                    update_fields.append("issue_date")
+                    extra["issue_date"] = certno.today_local()
                 if not obj.producer_name and producer is not None:
-                    obj.producer_name = producer.name
-                    update_fields.append("producer_name")
-                obj.issuer = request.user
-                update_fields.append("issuer")
-                obj.save(update_fields=update_fields)
+                    extra["producer_name"] = producer.name
+                if not rules.atomic_cert_transition(
+                        obj, Certificate.Status.ISSUED, extra):
+                    raise ValueError("状态已被其他操作变更，跳过本张")
 
                 services.anchor_certificate(obj)
                 services.anchor_merkle_root(obj)
@@ -513,7 +510,13 @@ class CertificateViewSet(RoleScopedQuerySetMixin, BaseViewSet):
                 # ★ 站内消息：批量签发时逐张通知（各主体只会收到自己那几张）
                 notify.cert_issued(obj, request.user)
                 results.append({"id": obj.id, "label": label, "ok": True,
-                                "cert_no": obj.cert_no, "message": "签发并存证成功"})
+                                "cert_no": obj.cert_no,
+                                # ★ 第三轮：如实回传锚定状态，不再一律说「存证成功」
+                                "anchor": services.describe_anchor(
+                                    services.EvidenceRecord.objects.filter(
+                                        biz_type=services.EvidenceRecord.BizType.CERTIFICATE,
+                                        biz_id=obj.id, is_current=True).first()),
+                                "message": "签发成功"})
                 ok_count += 1
             except (ValueError, RuntimeError) as exc:
                 results.append({"id": cid, "label": label, "ok": False,
@@ -646,31 +649,57 @@ class CertificateViewSet(RoleScopedQuerySetMixin, BaseViewSet):
             return Response({"code": 400, "message": err},
                             status=status.HTTP_400_BAD_REQUEST)
 
-        # 补齐业务字段（签发日期/主体名称快照）
-        update_fields = ["status", "cert_no", "updated_at"]
-        obj.status = Certificate.Status.ISSUED
-        obj.suspend_reason = ""
+        # ★ 第三轮审计（High）：状态写入改为**带原状态条件的原子更新**。
+        #   原实现「检查状态 → 保存」之间有竞态窗口：并发时可能依据旧状态通过校验，
+        #   再覆盖另一请求刚写入的 suspended（出现「暂停的证又被签发」）。
+        #   这里把状态与业务字段一次性用条件 UPDATE 落库（仅当库中仍是我读到的状态）。
+        extra = {"suspend_reason": "", "issuer": request.user}
         if not obj.issue_date:
-            obj.issue_date = certno.today_local()
-            update_fields.append("issue_date")
+            extra["issue_date"] = certno.today_local()
         if not obj.producer_name and producer is not None:
-            obj.producer_name = producer.name
-            update_fields.append("producer_name")
-        obj.issuer = request.user
-        update_fields.append("issuer")
-        obj.save(update_fields=update_fields)
+            extra["producer_name"] = producer.name
+        if not rules.atomic_cert_transition(obj, Certificate.Status.ISSUED, extra):
+            return Response(
+                {"code": 409,
+                 "message": "该合格证状态已被其他操作变更（可能被暂停/作废），"
+                            "请刷新后重试"},
+                status=status.HTTP_409_CONFLICT)
 
-        services.anchor_certificate(obj)
+        record = services.anchor_certificate(obj)
         services.anchor_merkle_root(obj)
+
+        # ★ 第三轮审计修复（High）：不再无条件宣称「完成可信存证」。
+        #   按**真实锚定结果**区分三种语义：
+        #     - 真上链成功 → 「签发成功并完成链上存证」
+        #     - 降级 mock  → 「签发成功（本地存证，链上未核验）」
+        #     - 开启了链却写失败 → 明确提示未上链，并给出补偿方式
+        #   这样「可信存证」这个结论不会被 mock 状态冒充。
+        anchor = services.describe_anchor(record)
+        chain_enabled = bool(getattr(settings, "FISCO_BCOS", {}).get("ENABLE_CHAIN", True))
+
         audit.log_operation(request, OperationLog.Action.ISSUE,
                             target_type="合格证", target_id=obj.id,
                             target_no=obj.cert_no,
                             detail=f"签发合格证 {obj.cert_no}"
-                                   + ("（沿用原编号）" if already else "（新分配编号）"))
+                                   + ("（沿用原编号）" if already else "（新分配编号）")
+                                   + f"｜存证状态：{anchor['label']}")
         # ★ 站内消息：签发结果推给主体
         notify.cert_issued(obj, request.user)
-        return Response({"code": 200, "message": "签发成功并完成可信存证",
-                         "data": CertificateSerializer(obj).data})
+
+        data = CertificateSerializer(obj).data
+        data["anchor"] = anchor                     # 前端可直接展示真实状态
+        data["chain_enabled"] = chain_enabled
+
+        if anchor["anchored"]:
+            message = "签发成功并完成链上存证"
+        elif chain_enabled and anchor["mode"] == "failed":
+            # 生产已开链但真实写入失败：不能报「可信存证已完成」
+            message = ("签发成功，但**链上存证失败**（仅完成本地存证）。"
+                       "请检查链节点后重新签发以补上链。")
+        else:
+            message = "签发成功（本地存证，链上未核验）"
+        return Response({"code": 200, "message": message,
+                         "data": data})
 
     @action(detail=True, methods=["post"])
     def revoke(self, request, pk=None):
@@ -1062,9 +1091,12 @@ class InspectionRecordViewSet(RoleScopedQuerySetMixin, BaseViewSet):
         #   静默跳过而不改状态，避免把未生效的证「暂停」出诡异语义。
         if rules.check_cert_transition(cert, Certificate.Status.SUSPENDED):
             return
-        cert.status = Certificate.Status.SUSPENDED
-        cert.suspend_reason = reason[:255]
-        cert.save(update_fields=["status", "suspend_reason", "updated_at"])
+        # ★ 第三轮审计（High）：用条件更新原子写入 —— 与签发并发时，
+        #   若证已被签发改成 issued，这里仍能正确把它置为 suspended；
+        #   反之若证已不是「我读到的那个状态」，则放弃（不覆盖）。
+        rules.atomic_cert_transition(
+            cert, Certificate.Status.SUSPENDED,
+            {"suspend_reason": reason[:255]})
 
     @staticmethod
     def _revoke_certificate_on_rectify(record):
@@ -1696,6 +1728,12 @@ class PublicVerifyView(APIView):
             "current_hash": verify["current_hash"],
             "chain_verified": verify.get("chain_verified", False),
             "chain_detail": verify.get("chain_detail", ""),
+            # ★ 第三轮审计修复：明确区分「本地摘要一致」与「链上已完成存证/核验」。
+            #   anchored=True 才代表真的上链；前端据此避免把 mock 说成可信存证。
+            "anchored": verify.get("anchored", False),
+            "anchor_mode": verify.get("anchor_mode", ""),
+            "anchor_label": verify.get("anchor_label", ""),
+            "anchor_detail": verify.get("anchor_detail", ""),
             # ★ 关联证据核验明细（安全修复）：公开页可展示「批次/报告是否也被改过」，
             #   让「展示值」与「可信结论」不再脱节。
             "related_evidence": verify.get("related", []),

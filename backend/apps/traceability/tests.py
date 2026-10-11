@@ -3676,3 +3676,263 @@ class ChangePasswordTest(BaseFixture):
         src = inspect.getsource(mod.Command._create_users)
         self.assertIn("rotated", src, "应存在对已存在账号的口令轮换逻辑")
         self.assertIn("else:", src)
+
+
+# ===============================================================
+# ★ 第六批：第三轮审计修复回归
+# ===============================================================
+class AnchorSemanticsTest(BaseFixture):
+    """★ 第三轮（High）：上链失败/降级不得被表述为「已完成可信存证」。"""
+
+    def test_describe_anchor_mock(self):
+        from apps.traceability import services
+        rec = services.anchor_certificate(self.cert)
+        d = services.describe_anchor(rec)
+        # 测试环境链不可用 → 必须是 mock/failed，不能是 anchored
+        self.assertFalse(d["anchored"])
+        self.assertIn(d["mode"], ("mock", "failed"))
+        self.assertIn("未上链", d["label"] + d["detail"])
+
+    def test_describe_anchor_success(self):
+        from apps.traceability import services
+        from apps.traceability.models import EvidenceRecord as ER
+        rec = services.anchor_certificate(self.cert)
+        rec.chain_status = "success"
+        rec.tx_hash = "0x" + "a" * 64
+        rec.save(update_fields=["chain_status", "tx_hash"])
+        d = services.describe_anchor(rec)
+        self.assertTrue(d["anchored"])
+        self.assertEqual(d["mode"], "chain")
+
+    def test_issue_message_not_claiming_chain_when_mock(self):
+        """★ 签发接口在未真上链时不得说「完成可信存证」"""
+        cert = Certificate.objects.create(
+            batch=self.batch, report=self.report,
+            producer_name=self.producer_obj.name, product_name="柑橘",
+            quantity_kg=Decimal("1.00"), status=Certificate.Status.PENDING)
+        c = self.login(self.regulator)
+        r = c.post(f"/api/certificate/{cert.id}/issue/")
+        self.assertEqual(r.status_code, 200)
+        msg = r.data["message"]
+        data = r.data["data"]
+        # 测试环境链不可用 → 不应宣称「链上存证完成」
+        if not data.get("anchored"):
+            self.assertNotIn("完成链上存证", msg)
+            self.assertIn("本地存证", msg)
+        self.assertIn("anchor", data)
+        self.assertIn("anchored", data["anchor"])
+
+    def test_verify_message_distinguishes_local_and_chain(self):
+        """★ 验真措辞不得把「本地一致」说成「已验证可信」"""
+        from apps.traceability import services
+        services.anchor_certificate(self.cert)
+        res = services.verify_certificate(self.cert)
+        self.assertIn("本地摘要一致", res["message"])
+        self.assertIn("anchored", res)
+        self.assertIn("anchor_mode", res)
+        # 未真上链 → 不得为 True
+        if not res["anchored"]:
+            self.assertNotIn("链上核验", res["message"])
+
+    def test_public_verify_exposes_anchor_fields(self):
+        """公开验真接口应透出锚定状态，供前端避免误导"""
+        from apps.traceability import services
+        services.anchor_certificate(self.cert)
+        c = APIClient()      # 公开接口免登录
+        r = c.get(f"/api/public/verify/{self.cert.cert_no}/")
+        self.assertEqual(r.status_code, 200)
+        d = r.data["data"]
+        for k in ("anchored", "anchor_mode", "anchor_label", "anchor_detail"):
+            self.assertIn(k, d, f"公开验真应包含 {k}")
+
+
+class AtomicTransitionTest(BaseFixture):
+    """★ 第三轮（High）：状态转移必须原子，消除检查-写入竞态窗口。"""
+
+    def test_atomic_transition_succeeds_when_state_matches(self):
+        from apps.traceability import rules
+        cert = Certificate.objects.create(
+            batch=self.batch, report=self.report,
+            producer_name="X", product_name="柑橘",
+            quantity_kg=Decimal("1.00"), status=Certificate.Status.DRAFT)
+        ok = rules.atomic_cert_transition(cert, Certificate.Status.PENDING)
+        self.assertTrue(ok)
+        cert.refresh_from_db()
+        self.assertEqual(cert.status, Certificate.Status.PENDING)
+
+    def test_atomic_transition_fails_when_state_changed(self):
+        """★ 关键：库中状态已被并发修改时，条件更新必须失败（不覆盖）"""
+        from apps.traceability import rules
+        cert = Certificate.objects.create(
+            batch=self.batch, report=self.report,
+            producer_name="X", product_name="柑橘",
+            quantity_kg=Decimal("1.00"), status=Certificate.Status.PENDING)
+        stale = Certificate.objects.get(id=cert.id)      # 快照（status=pending）
+        # 模拟并发：另一请求先把它改成 suspended
+        Certificate.objects.filter(id=cert.id).update(
+            status=Certificate.Status.SUSPENDED)
+        # 用过期快照尝试 signed → 必须失败
+        ok = rules.atomic_cert_transition(stale, Certificate.Status.ISSUED)
+        self.assertFalse(ok, "状态已被并发修改时不得覆盖")
+        self.assertEqual(Certificate.objects.get(id=cert.id).status,
+                         Certificate.Status.SUSPENDED)
+
+    def test_issue_conflicts_when_suspended_concurrently(self):
+        """★ 签发遇到并发暂停 → 409，且不得把 suspended 覆盖成 issued"""
+        cert = Certificate.objects.create(
+            batch=self.batch, report=self.report,
+            producer_name=self.producer_obj.name, product_name="柑橘",
+            quantity_kg=Decimal("1.00"), status=Certificate.Status.ISSUED)
+        # 模拟并发：检查不合格把它暂停
+        Certificate.objects.filter(id=cert.id).update(
+            status=Certificate.Status.SUSPENDED)
+        c = self.login(self.regulator)
+        # 带过期内存态请求签发（get_object 会重新读库，读到 suspended → 状态机拦）
+        r = c.post(f"/api/certificate/{cert.id}/issue/")
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(Certificate.objects.get(id=cert.id).status,
+                         Certificate.Status.SUSPENDED)
+
+    def test_suspend_uses_atomic_update(self):
+        """检查暂停联动同样走原子更新"""
+        from apps.traceability import rules
+        cert = Certificate.objects.create(
+            batch=self.batch, report=self.report,
+            producer_name="X", product_name="柑橘",
+            quantity_kg=Decimal("1.00"), status=Certificate.Status.ISSUED)
+        ok = rules.atomic_cert_transition(
+            cert, Certificate.Status.SUSPENDED, {"suspend_reason": "测试"})
+        self.assertTrue(ok)
+        cert.refresh_from_db()
+        self.assertEqual(cert.status, Certificate.Status.SUSPENDED)
+        self.assertEqual(cert.suspend_reason, "测试")
+
+
+class ForcePasswordChangeTest(BaseFixture):
+    """★ 第三轮（Medium）：强制改密必须真正在服务端生效。"""
+
+    def _login_token(self, username, password="admin123"):
+        c = APIClient()
+        r = c.post("/api/auth/login/",
+                   {"username": username, "password": password}, format="json")
+        return r.data["data"]["access"]
+
+    def test_blocked_business_api_when_must_change(self):
+        """★ 待改密用户访问业务接口必须 403"""
+        self.producer.must_change_password = True
+        self.producer.save(update_fields=["must_change_password"])
+        token = self._login_token("t_prod")
+        c = APIClient()
+        c.credentials(HTTP_AUTHORIZATION="Bearer " + token)
+        r = c.get("/api/batch/")
+        self.assertEqual(r.status_code, 403)
+        self.assertTrue(r.data.get("must_change_password"))
+
+    def test_allowed_endpoints_still_accessible(self):
+        """待改密用户仍可访问改密/注销/profile"""
+        self.producer.must_change_password = True
+        self.producer.save(update_fields=["must_change_password"])
+        token = self._login_token("t_prod")
+        c = APIClient()
+        c.credentials(HTTP_AUTHORIZATION="Bearer " + token)
+        for path in ("/api/auth/profile/", "/api/auth/change-password/"):
+            r = c.get(path) if path.endswith("profile/") else c.post(
+                path, {"old_password": "x", "new_password": "y"}, format="json")
+            self.assertNotEqual(r.status_code, 403, f"{path} 应可访问")
+
+    def test_no_block_when_flag_false(self):
+        """未标记待改密的用户不受影响（回归：不能误伤正常用户）"""
+        token = self._login_token("t_prod")
+        c = APIClient()
+        c.credentials(HTTP_AUTHORIZATION="Bearer " + token)
+        r = c.get("/api/batch/")
+        self.assertEqual(r.status_code, 200)
+
+    def test_after_change_password_business_api_ok(self):
+        """改密后业务接口恢复可用"""
+        self.producer.must_change_password = True
+        self.producer.save(update_fields=["must_change_password"])
+        token = self._login_token("t_prod")
+        c = APIClient()
+        c.credentials(HTTP_AUTHORIZATION="Bearer " + token)
+        self.assertEqual(c.get("/api/batch/").status_code, 403)
+        r = c.post("/api/auth/change-password/", {
+            "old_password": "admin123", "new_password": "freshPass123"},
+            format="json")
+        self.assertEqual(r.status_code, 200)
+        # 用新 token 访问
+        token2 = self._login_token("t_prod", "freshPass123")
+        c2 = APIClient()
+        c2.credentials(HTTP_AUTHORIZATION="Bearer " + token2)
+        self.assertEqual(c2.get("/api/batch/").status_code, 200)
+
+    def test_change_password_revokes_old_refresh(self):
+        """★ 改密后旧 refresh 必须失效（不能留着旧会话）"""
+        c = APIClient()
+        r = c.post("/api/auth/login/",
+                   {"username": "t_prod", "password": "admin123"}, format="json")
+        old_refresh = r.data["data"]["refresh"]
+        access = r.data["data"]["access"]
+        c.credentials(HTTP_AUTHORIZATION="Bearer " + access)
+        r = c.post("/api/auth/change-password/", {
+            "old_password": "admin123", "new_password": "freshPass456"},
+            format="json")
+        self.assertEqual(r.status_code, 200)
+        # 旧 refresh 再换取 access → 应失败
+        r2 = APIClient().post("/api/auth/refresh/",
+                              {"refresh": old_refresh}, format="json")
+        self.assertEqual(r2.status_code, 401,
+                         "改密后旧 refresh 应被拉黑")
+
+
+class OcrPdfSubprocessTest(TestCase):
+    """★ 第三轮（Medium）：PDF 解析/渲染也必须可超时中断。"""
+
+    def test_render_runs_in_subprocess(self):
+        import inspect
+        from apps.traceability import ocr
+        src = inspect.getsource(ocr.render_pdf_to_images)
+        self.assertIn("_run_pdf_subprocess", src,
+                      "渲染必须走子进程（否则卡死 worker）")
+
+    def test_text_extract_runs_in_subprocess(self):
+        import inspect
+        from apps.traceability import ocr
+        src = inspect.getsource(ocr.extract_text_from_pdf)
+        self.assertIn("_run_pdf_subprocess", src)
+
+    def test_render_has_budget_param(self):
+        import inspect
+        from apps.traceability import ocr
+        sig = inspect.signature(ocr.render_pdf_to_images)
+        self.assertIn("budget", sig.parameters)
+        sig2 = inspect.signature(ocr.extract_text_from_pdf)
+        self.assertIn("budget", sig2.parameters)
+
+    def test_render_real_pdf(self):
+        """真实 PDF 渲染（子进程）应返回页图；无 pymupdf 则跳过"""
+        import io
+        from apps.traceability import ocr
+        try:
+            import pymupdf  # noqa: F401
+        except ImportError:
+            self.skipTest("本环境无 pymupdf")
+        try:
+            from pypdf import PdfWriter
+        except ImportError:
+            self.skipTest("本环境无 pypdf")
+        w = PdfWriter()
+        w.add_blank_page(width=200, height=200)
+        buf = io.BytesIO()
+        w.write(buf)
+        imgs = ocr.render_pdf_to_images(buf.getvalue(), budget=20)
+        self.assertGreaterEqual(len(imgs), 1)
+        self.assertTrue(imgs[0].startswith(b"\x89PNG"))
+
+    def test_broken_pdf_does_not_hang(self):
+        """畸形 PDF 不应抛异常/挂住"""
+        from apps.traceability import ocr
+        imgs = ocr.render_pdf_to_images(b"%PDF-1.4 broken", budget=5)
+        self.assertEqual(imgs, [])
+        t, m = ocr.extract_text_from_pdf(b"%PDF-1.4 broken", budget=5)
+        self.assertEqual((t, m), ("", ""))

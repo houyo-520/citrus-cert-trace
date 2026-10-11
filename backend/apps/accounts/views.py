@@ -147,12 +147,27 @@ class ChangePasswordView(APIView):
             user.must_change_password = False
             fields.append("must_change_password")
         user.save(update_fields=fields)
+
+        # ★ 第三轮审计修复：改密后**撤销该用户所有旧 refresh 会话**。
+        #   原实现只改口令，旧 refresh 仍能换新 access —— 对「待改密」场景尤其糟糕：
+        #   演示账号口令被轮换了，但攻击者若已持有旧 refresh，改密也踢不掉他。
+        #   做法：用 simplejwt 黑名单把该用户全部未过期 refresh 拉黑。
+        revoked = 0
         try:
-            from .models import OperationLog  # 若模型存在则留痕
-        except Exception:  # noqa: BLE001
+            from rest_framework_simplejwt.token_blacklist.models import (
+                OutstandingToken)
+            from rest_framework_simplejwt.tokens import RefreshToken as RT
+            for tok in OutstandingToken.objects.filter(user=user):
+                try:
+                    RT(tok.token).blacklist()
+                    revoked += 1
+                except Exception:  # noqa: BLE001 已过期/已拉黑都跳过
+                    continue
+        except Exception:  # noqa: BLE001 黑名单应用未启用时静默跳过
             pass
+
         return Response({"code": 200, "message": "密码已修改，请重新登录",
-                         "data": None})
+                         "data": {"revoked_sessions": revoked}})
 
 
 class ProfileView(APIView):

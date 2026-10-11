@@ -102,6 +102,8 @@ MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     # ★ CSP 响应头（仅当 DJANGO_CSP=1 时生效）—— 防 XSS 窃取 localStorage 里的 JWT
     "apps.accounts.middleware.ContentSecurityPolicyMiddleware",
+    # ★ 强制改密拦截：待改密用户只能访问改密/注销等白名单接口
+    "apps.accounts.middleware.ForcePasswordChangeMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",

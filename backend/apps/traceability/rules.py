@@ -73,6 +73,10 @@ def check_cert_transition(cert, to_status: str) -> str | None:
 
     ⚠️ 例外：`issued` 允许「幂等重签」（源状态=目标状态），
     这是批量签发/网络重试的正常场景，不算非法跃迁。
+
+    ⚠️ 并发提示：本函数是**基于内存对象的检查**，单独使用存在检查-写入
+    竞态窗口（第三轮审计 High）。真正的原子写入请配合
+    `atomic_cert_transition()` 使用（带原状态条件更新）。
     """
     cur = getattr(cert, "status", None)
     if cur == to_status:
@@ -81,6 +85,48 @@ def check_cert_transition(cert, to_status: str) -> str | None:
         return (f"不允许的状态流转：{cur} → {to_status}"
                 "（状态机见 apps/traceability/rules.py）")
     return None
+
+
+def atomic_cert_transition(cert, to_status: str, extra_fields: dict | None = None) -> bool:
+    """
+    ★ 并发安全的状态转移（第三轮审计 High 修复）。
+
+    问题：原实现是「先读取对象 → 检查状态 → 保存」，三步之间没有原子性。
+    并发场景下，签发请求可能依据**旧状态**通过校验，再覆盖另一请求刚写入的
+    `suspended` —— 出现「被暂停的证又被签发了」这类状态错乱。
+
+    做法：**带原状态条件的 UPDATE**（乐观并发控制）：
+        UPDATE certificate SET status=<to>[, ...] WHERE id=? AND status=<from>
+      只有当数据库里仍是「我读到的那个状态」时才更新成功。
+      - rowcount == 1 → 转移成功
+      - rowcount == 0 → 状态已被并发修改，本次放弃（调用方应提示重试）
+
+    ★ 为什么不用 select_for_update：
+      项目默认 SQLite，而 SQLite 不支持行级 `SELECT ... FOR UPDATE`（会被忽略）。
+      条件更新是**跨数据库都可靠**的方案（MySQL/SQLite 行为一致）。
+
+    返回 True 表示本次转移成功并在数据库生效（同时同步内存对象）。
+    """
+    from .models import Certificate
+
+    cur = getattr(cert, "status", None)
+    fields = {"status": to_status, "updated_at": _now()}
+    if extra_fields:
+        fields.update(extra_fields)
+
+    updated = (Certificate.objects
+               .filter(id=cert.id, status=cur)
+               .update(**fields))
+    if updated:
+        # 同步内存对象，避免调用方再读到旧值
+        for k, v in fields.items():
+            setattr(cert, k, v)
+    return bool(updated)
+
+
+def _now():
+    from django.utils import timezone
+    return timezone.now()
 
 
 def check_cert_issue(cert) -> str | None:
