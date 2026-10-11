@@ -30,6 +30,22 @@ def _load_dotenv(path: Path):
 
 _load_dotenv(BASE_DIR / ".env")
 
+
+def env_bool(name: str, default: bool = False) -> bool:
+    """
+    统一布尔环境变量解析（★ 续审修复：原实现散落着 `== "true"`，
+    与 `1/true/yes/on` 的兼容处理不一致 —— 例如设 `FISCO_ENABLE_CHAIN=1`
+    会被判为 False，导致**真实上链被意外关闭**，而运维以为开着）。
+
+    接受（不分大小写，忽略首尾空白）：1 / true / yes / on / y / t
+    其余一律视为 False；未设置时返回 default。
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on", "y", "t")
+
+
 SECRET_KEY = os.environ.get(
     "DJANGO_SECRET_KEY",
     "django-insecure-citrus-cert-trace-2026-change-me-in-production",
@@ -39,7 +55,7 @@ SECRET_KEY = os.environ.get(
 #   于是下面的「生产密钥断言」整块被跳过、ALLOWED_HOSTS 落到 *、
 #   错误页还会回显堆栈。安全配置不能靠「你记得设」，必须默认最严。
 #   本地开发请在 .env 里显式写 DJANGO_DEBUG=true。
-DEBUG = os.environ.get("DJANGO_DEBUG", "false").lower() == "true"
+DEBUG = env_bool("DJANGO_DEBUG", False)
 
 # ★ 生产安全断言：DEBUG=false 时若仍用默认/明显弱密钥，直接拒绝启动。
 #   防止「代码能跑、功能正常」但密钥是模板值的假上线 —— 攻击者拿到 SECRET_KEY
@@ -213,7 +229,7 @@ CORS_ALLOWED_ORIGINS = [
 #   因此改为**环境变量开关**：将来恢复 HTTPS 域名后，在 .env 里打开即可。
 #     DJANGO_HTTPS=1        → 启用 SSL 重定向 + HSTS + Secure Cookie
 # ---------------------------------------------------------------
-_HTTPS = os.environ.get("DJANGO_HTTPS", "false").lower() == "true"
+_HTTPS = env_bool("DJANGO_HTTPS", False)
 
 # 未启用 HTTPS 时，HSTS 等无意义（甚至有害），仅在 _HTTPS 时生效
 SECURE_SSL_REDIRECT = _HTTPS
@@ -245,7 +261,7 @@ X_FRAME_OPTIONS = "SAMEORIGIN"
 # ⚠️ 用环境变量开关，默认关闭：本地 `npm run dev`（Vite 需要 eval + 内联脚本，
 #    且前端在 5173 跨域调用）会被严格 CSP 打断。生产在 .env 里设
 #    `DJANGO_CSP=1` 打开。
-_CSP_ON = os.environ.get("DJANGO_CSP", "").strip().lower() in ("1", "true", "yes", "on")
+_CSP_ON = env_bool("DJANGO_CSP", False)
 
 if _CSP_ON:
     # 说明：
@@ -288,7 +304,7 @@ FISCO_BCOS = {
     "PRIVATE_KEY": os.environ.get("FISCO_PRIVATE_KEY", ""),
     "GAS_LIMIT": int(os.environ.get("FISCO_GAS_LIMIT", "300000")),
     # 是否启用真实上链（False 则一律走模拟存证，便于离线开发）
-    "ENABLE_CHAIN": os.environ.get("FISCO_ENABLE_CHAIN", "true").lower() == "true",
+    "ENABLE_CHAIN": env_bool("FISCO_ENABLE_CHAIN", True),
 }
 
 # ---------------------------------------------------------------

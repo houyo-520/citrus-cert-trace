@@ -52,6 +52,74 @@ CONTRACT_ABI = [
         "stateMutability": "nonpayable",
         "type": "function",
     },
+    # ★ v3.0 新增（原重大遗漏）：send_evidence 在「记录已存在」时会调用
+    #   updateEvidence，但 ABI 里没有该函数 → web3 会抛
+    #   「Could not find any function with matching name」并被外层 except 吞掉，
+    #   表现为「存证静默降级为 mock」，链上摘要永不更新。
+    {
+        "inputs": [
+            {"internalType": "string", "name": "bizType", "type": "string"},
+            {"internalType": "string", "name": "bizNo", "type": "string"},
+            {"internalType": "string", "name": "dataHash", "type": "string"},
+        ],
+        "name": "updateEvidence",
+        "outputs": [
+            {"internalType": "uint256", "name": "newVersion", "type": "uint256"},
+        ],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+    # ★ v3.0 权限管理（写入者白名单）
+    {
+        "inputs": [
+            {"internalType": "address", "name": "account", "type": "address"},
+            {"internalType": "bool", "name": "allowed", "type": "bool"},
+        ],
+        "name": "setWriter",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"internalType": "address", "name": "newOwner", "type": "address"},
+        ],
+        "name": "transferOwnership",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+    {
+        "inputs": [{"internalType": "address", "name": "", "type": "address"}],
+        "name": "writers",
+        "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [],
+        "name": "owner",
+        "outputs": [{"internalType": "address", "name": "", "type": "address"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    # ★ v3.0 读取（含版本号）
+    {
+        "inputs": [
+            {"internalType": "string", "name": "bizType", "type": "string"},
+            {"internalType": "string", "name": "bizNo", "type": "string"},
+        ],
+        "name": "getEvidenceWithVersion",
+        "outputs": [
+            {"internalType": "string", "name": "dataHash", "type": "string"},
+            {"internalType": "uint256", "name": "version", "type": "uint256"},
+            {"internalType": "bool", "name": "exists", "type": "bool"},
+            {"internalType": "bool", "name": "revoked", "type": "bool"},
+            {"internalType": "uint256", "name": "timestamp", "type": "uint256"},
+        ],
+        "stateMutability": "view",
+        "type": "function",
+    },
     {
         "inputs": [
             {"internalType": "string", "name": "bizType", "type": "string"},

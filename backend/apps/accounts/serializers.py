@@ -12,7 +12,9 @@ class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = ["id", "username", "nickname", "email", "phone",
-                  "role", "role_display", "org_name", "is_active", "permissions"]
+                  "role", "role_display", "org_name", "is_active", "permissions",
+                  # ★ 续审：把「需强制改密」下发给前端，登录后可提示/引导修改
+                  "must_change_password"]
         extra_kwargs = {"username": {"read_only": True}}
 
     # AbstractUser 没有 nickname 字段，这里提供兼容属性

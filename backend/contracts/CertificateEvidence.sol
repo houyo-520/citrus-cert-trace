@@ -124,11 +124,21 @@ contract CertificateEvidence {
 
     /**
      * @notice 转移 owner 权限。
+     * ★ 续审修复：转移时**撤销旧 owner 的 writers 权限** ——
+     *   原实现只给新 owner 授权，旧 owner 仍在白名单里，转移后依然能
+     *   写入/更新/撤销存证，等于「换了管理员但前任的钥匙没收回」。
+     *   若确实需要保留旧地址的写入权，请在转移后显式 setWriter(oldOwner, true)。
      */
     function transferOwnership(address newOwner) public onlyOwner {
         require(newOwner != address(0), "zero address");
-        writers[newOwner] = true;
+        address oldOwner = owner;
+        // 先收回旧 owner 的写入权（除非就是他自己，防自伤）
+        if (oldOwner != newOwner && oldOwner != address(0)) {
+            writers[oldOwner] = false;
+            emit WriterChanged(oldOwner, false);
+        }
         owner = newOwner;
+        writers[newOwner] = true;
         emit WriterChanged(newOwner, true);
     }
 

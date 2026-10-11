@@ -22,6 +22,8 @@
   python manage.py rehash_all --apply     # 真正执行重算 + 重新上链
   python manage.py rehash_all --dry-run   # 与默认同义（保留兼容）
 """
+import hashlib
+
 from django.core.management.base import BaseCommand
 
 from apps.traceability import services
@@ -44,8 +46,16 @@ class Command(BaseCommand):
         if options["dry_run"]:
             dry_run = True
 
-        salt = services._salt() or "(空盐)"
-        self.stdout.write(f"存证盐值：{salt}")
+        # ★ 续审修复：不再打印盐值原文 —— 命令可能在 CI / 部署日志 / 共享终端
+        #   被调用，原值会永久留在日志里（等于泄露加盐密钥，攻击者可离线穷举）。
+        #   改为只显示「是否已配置」+ 不可逆指纹，便于人工核对「服务器用的是不是同一把盐」。
+        salt = services._salt()
+        if salt:
+            fp = hashlib.sha256(salt.encode("utf-8")).hexdigest()[:16]
+            self.stdout.write(f"存证盐值：已配置（指纹 {fp}…，共 {len(salt)} 字符）")
+        else:
+            self.stdout.write(self.style.WARNING(
+                "存证盐值：未配置（空盐）—— 生产环境应设置 EVIDENCE_SALT"))
         if dry_run:
             self.stdout.write(self.style.WARNING(
                 "模式：dry-run（只统计，不改数据）。要真正执行请加 --apply"))

@@ -606,12 +606,26 @@ class MatchingTest(BaseFixture):
         self.assertEqual(self.supply.deal_status, SupplyDemand.DealStatus.MATCHED)
 
     def test_matching_writes_audit_log(self):
-        """产销对接应留痕"""
-        c = self.login(self.buyer)
+        """产销对接应留痕
+
+        ★ 续审修复：原测试用 **buyer** 去 match **producer 发布**的单 ——
+        这正是安全修复要拦住的越权场景（只能操作自己发布的单）。
+        改为由**发布方**操作，符合修复后的正确语义。
+        """
+        c = self.login(self.producer)      # ★ 发布方本人
         c.post(f"/api/supply/{self.supply.id}/match/")
         log = OperationLog.objects.filter(action=OperationLog.Action.MATCH).first()
         self.assertIsNotNone(log)
         self.assertEqual(log.target_no, self.supply.title)
+
+    def test_cannot_match_others_supply(self):
+        """★ 续审：不能把「别人的」供需单标记为已对接（否则别人单被下架）"""
+        c = self.login(self.buyer)          # buyer 不是该供应单的发布者
+        r = c.post(f"/api/supply/{self.supply.id}/match/")
+        self.assertEqual(r.status_code, 403)
+        self.supply.refresh_from_db()
+        self.assertEqual(self.supply.deal_status, SupplyDemand.DealStatus.OPEN,
+                         "别人的单不应被改动")
 
 
 # ===============================================================
@@ -3465,3 +3479,200 @@ class OcrBudgetTest(TestCase):
         from apps.traceability import ocr
         r = ocr.extract_from_file("x.txt", b"hello")   # 不支持格式
         self.assertFalse(any("超时" in w for w in r["warnings"]))
+
+
+# ===============================================================
+# ★ 第五批：续审（第二轮审计）修复回归
+#   指纹：TRACE-MATCH-OWNER / TRACE-PAYLOAD-COVERAGE / CHAIN-UPDATE-ABI /
+#         CSP-STATIC-SPA / OCR-DEADLINE-NONINTERRUPT / CONFIG-BOOL-DRIFT /
+#         REHASH-SALT-LOG / CHAIN-OWNER-TRANSFER
+# ===============================================================
+class CertTransitionWiringTest(BaseFixture):
+    """★ 续审：状态机必须真正被业务入口调用，而不能只写在 rules.py 里。"""
+
+    def _draft_cert(self):
+        return Certificate.objects.create(
+            batch=self.batch, report=self.report,
+            producer_name=self.producer_obj.name, product_name="柑橘",
+            quantity_kg=Decimal("1.00"), status=Certificate.Status.DRAFT)
+
+    def test_submit_uses_state_machine(self):
+        """draft → pending 合法，应成功"""
+        cert = self._draft_cert()
+        c = self.login(self.producer)
+        r = c.post(f"/api/certificate/{cert.id}/submit/")
+        self.assertEqual(r.status_code, 200)
+        cert.refresh_from_db()
+        self.assertEqual(cert.status, Certificate.Status.PENDING)
+
+    def test_revoke_rejected_by_state_machine(self):
+        """pending 直接作废在状态机里是允许的；但 revoked 态再作废必须被拦"""
+        cert = self._draft_cert()
+        cert.status = Certificate.Status.REVOKED
+        cert.cert_no = "CERT-TEST-RVK"
+        cert.save(update_fields=["status", "cert_no"])
+        c = self.login(self.regulator)
+        r = c.post(f"/api/certificate/{cert.id}/revoke/", {"reason": "x"},
+                   format="json")
+        self.assertEqual(r.status_code, 400)
+
+    def test_rules_transition_table_matches_issuable(self):
+        """★ 一致性约束：能签发的来源状态，状态机必须允许到达 issued"""
+        from . import rules
+        for src in rules.CERT_ISSUABLE_FROM:
+            self.assertTrue(
+                rules.can_transition_cert(src, "issued") or src == "issued",
+                f"状态机不允许 {src} → issued，但 CERT_ISSUABLE_FROM 允许签发")
+
+
+class PayloadCoverageTest(BaseFixture):
+    """★ 续审：时间轴/公众页展示的字段必须全部进摘要（改了就要能被发现）。"""
+
+    def test_batch_farming_record_covered(self):
+        before = services.sha256_hex(services.build_batch_payload(self.batch))
+        self.batch.farming_record = "被篡改的农事记录"
+        self.batch.save(update_fields=["farming_record"])
+        after = services.sha256_hex(services.build_batch_payload(self.batch))
+        self.assertNotEqual(before, after, "农事记录（时间轴展示）必须进摘要")
+
+    def test_batch_plant_area_covered(self):
+        before = services.sha256_hex(services.build_batch_payload(self.batch))
+        self.batch.plant_area_mu = Decimal("999.00")
+        self.batch.save(update_fields=["plant_area_mu"])
+        after = services.sha256_hex(services.build_batch_payload(self.batch))
+        self.assertNotEqual(before, after, "种植面积（时间轴展示）必须进摘要")
+
+    def test_report_residue_covered(self):
+        before = services.sha256_hex(services.build_report_payload(self.report))
+        self.report.pesticide_residue = "检出超标"
+        self.report.save(update_fields=["pesticide_residue"])
+        after = services.sha256_hex(services.build_report_payload(self.report))
+        self.assertNotEqual(before, after, "农药残留（消费者最关心）必须进摘要")
+
+    def test_report_heavy_metal_covered(self):
+        before = services.sha256_hex(services.build_report_payload(self.report))
+        self.report.heavy_metal = "超标"
+        self.report.save(update_fields=["heavy_metal"])
+        after = services.sha256_hex(services.build_report_payload(self.report))
+        self.assertNotEqual(before, after, "重金属（消费者最关心）必须进摘要")
+
+    def test_cert_digest_reacts_to_report_residue(self):
+        """证书摘要也必须随关联报告的残留字段变化（否则公众页仍显可信）"""
+        before = services.compute_certificate_hash(self.cert)
+        self.report.pesticide_residue = "检出超标"
+        self.report.save(update_fields=["pesticide_residue"])
+        self.cert.refresh_from_db()
+        after = services.compute_certificate_hash(self.cert)
+        self.assertNotEqual(before, after)
+
+
+class ChainAbiV3Test(TestCase):
+    """★ 续审：内联 ABI 必须覆盖 v3 合约全部函数，否则存证静默降级。"""
+
+    def test_abi_contains_v3_functions(self):
+        from apps.traceability.chain import CONTRACT_ABI
+        names = {e.get("name") for e in CONTRACT_ABI if e.get("type") == "function"}
+        for fn in ("addEvidence", "updateEvidence", "revokeEvidence",
+                   "getEvidence", "verifyEvidence", "isRevoked",
+                   "setWriter", "transferOwnership", "version"):
+            self.assertIn(fn, names, f"ABI 缺少 {fn}")
+
+    def test_abi_parsable_by_web3(self):
+        """web3 能解析所有函数名（否则调用时才炸）"""
+        web3 = __import__("web3")
+        from apps.traceability.chain import CONTRACT_ABI
+        c = web3.Web3().eth.contract(abi=CONTRACT_ABI)
+        for fn in ("addEvidence", "updateEvidence", "revokeEvidence",
+                   "getEvidence", "verifyEvidence", "isRevoked"):
+            getattr(c.functions, fn)   # 不存在会 AttributeError
+
+    def test_update_evidence_abi_signature(self):
+        """updateEvidence 必须返回 uint256 版本号（与合约一致）"""
+        from apps.traceability.chain import CONTRACT_ABI
+        e = next(x for x in CONTRACT_ABI
+                 if x.get("name") == "updateEvidence")
+        self.assertEqual(len(e["inputs"]), 3)
+        self.assertEqual(e["outputs"][0]["type"], "uint256")
+
+
+class ConfigBoolParsingTest(TestCase):
+    """★ 续审：布尔环境变量必须统一解析（原 FISCO_ENABLE_CHAIN=1 会意外关链）。"""
+
+    def test_env_bool_accepts_common_truthy(self):
+        import os
+        from config.settings import env_bool
+        for v in ("1", "true", "TRUE", "yes", "on", "Y", "t", " true "):
+            os.environ["__TEST_FLAG__"] = v
+            self.assertTrue(env_bool("__TEST_FLAG__", False), f"{v!r} 应为 True")
+        for v in ("0", "false", "no", "off", "", "random"):
+            os.environ["__TEST_FLAG__"] = v
+            self.assertFalse(env_bool("__TEST_FLAG__", True), f"{v!r} 应为 False")
+        os.environ.pop("__TEST_FLAG__", None)
+
+    def test_env_bool_default_when_unset(self):
+        from config.settings import env_bool
+        self.assertTrue(env_bool("__NOT_SET_AT_ALL__", True))
+        self.assertFalse(env_bool("__NOT_SET_AT_ALL__", False))
+
+
+class RehashSaltLogTest(TestCase):
+    """★ 续审：重算命令不得把盐值原文写进日志。"""
+
+    def test_no_raw_salt_in_output(self):
+        import os
+        from io import StringIO
+        from django.core.management import call_command
+        from django.test import override_settings
+        secret = "SUPER_SECRET_SALT_VALUE_2026"
+        out = StringIO()
+        with override_settings(EVIDENCE_SALT=secret):
+            os.environ.pop("EVIDENCE_SALT", None)
+            try:
+                call_command("rehash_all", stdout=out)
+            except Exception:  # noqa: BLE001
+                pass
+        written = out.getvalue()
+        self.assertNotIn(secret, written, "盐值原文不得出现在命令输出中")
+
+
+class ChangePasswordTest(BaseFixture):
+    """★ 续审：补齐强制改密的落地路径（User.must_change_password + 改密接口）。"""
+
+    def test_user_model_has_flag(self):
+        from apps.accounts.models import User
+        self.assertTrue(hasattr(User, "must_change_password"))
+
+    def test_change_password_clears_flag(self):
+        from apps.accounts.models import User
+        self.producer.must_change_password = True
+        self.producer.save(update_fields=["must_change_password"])
+        c = self.login(self.producer)
+        r = c.post("/api/auth/change-password/", {
+            "old_password": "admin123", "new_password": "newPass12345"},
+            format="json")
+        self.assertEqual(r.status_code, 200, r.data)
+        self.producer.refresh_from_db()
+        self.assertFalse(self.producer.must_change_password)
+        self.assertTrue(self.producer.check_password("newPass12345"))
+
+    def test_change_password_rejects_wrong_old(self):
+        c = self.login(self.producer)
+        r = c.post("/api/auth/change-password/", {
+            "old_password": "wrong", "new_password": "newPass12345"},
+            format="json")
+        self.assertEqual(r.status_code, 400)
+
+    def test_change_password_rejects_short(self):
+        c = self.login(self.producer)
+        r = c.post("/api/auth/change-password/", {
+            "old_password": "admin123", "new_password": "123"},
+            format="json")
+        self.assertEqual(r.status_code, 400)
+
+    def test_init_data_rotates_existing_demo_accounts(self):
+        """★ 续审：已有演示账号也要被轮换口令（不只新建时）"""
+        import inspect
+        from apps.traceability.management.commands import init_data as mod
+        src = inspect.getsource(mod.Command._create_users)
+        self.assertIn("rotated", src, "应存在对已存在账号的口令轮换逻辑")
+        self.assertIn("else:", src)

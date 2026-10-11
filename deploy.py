@@ -423,10 +423,18 @@ NGINX = """server {
     #   X-Content-Type-Options  防 MIME 嗅探攻击
     #   Referrer-Policy     控制请求跨站时是否携带来源信息
     #   X-XSS-Protection    浏览器 XSS 过滤兜底（现代浏览器多用 CSP，此为兼容垫）
+    #   Content-Security-Policy  ★ 续审修复：JWT 存于 localStorage，
+    #       真正需要 CSP 保护的是**浏览器里的 SPA 页面**（由 nginx 直接返回），
+    #       只给 Django 的 API 响应加 CSP 是保护不到前端的（原实现的疏漏）。
+    #       这里限定脚本仅同源、禁止 inline/eval，把外连限制在本站 —— 即使出现
+    #       XSS，注入脚本也执行不了、token 也外传不出去。
+    #       ⚠️ style 保留 'unsafe-inline'：Element Plus 运行时注入行内样式，禁掉会白屏。
+    #       ⚠️ 若前端新增了内联 <script>，需改用 nonce 或 hash（见 README 说明）。
     add_header X-Frame-Options "SAMEORIGIN" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;
     add_header X-XSS-Protection "1; mode=block" always;
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'self'; base-uri 'self'; form-action 'self'; object-src 'none'" always;
 
     # 前端静态站点（Vue3 SPA，hash 路由）
     root /home/ubuntu/citrus/frontend_dist;
@@ -447,6 +455,7 @@ NGINX = """server {
         add_header X-Content-Type-Options "nosniff" always;
         add_header Referrer-Policy "strict-origin-when-cross-origin" always;
         add_header X-XSS-Protection "1; mode=block" always;
+        add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'self'; base-uri 'self'; form-action 'self'; object-src 'none'" always;
         expires -1;
     }
 
@@ -491,6 +500,7 @@ NGINX = """server {
         add_header X-Content-Type-Options "nosniff" always;
         add_header Referrer-Policy "strict-origin-when-cross-origin" always;
         add_header X-XSS-Protection "1; mode=block" always;
+        add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'self'; base-uri 'self'; form-action 'self'; object-src 'none'" always;
     }
 
     # 静态资源长缓存：文件名含内容哈希，内容变则文件名变，可放心 immutable

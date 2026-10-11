@@ -560,6 +560,11 @@ class CertificateViewSet(RoleScopedQuerySetMixin, BaseViewSet):
         if err:
             return Response({"code": 400, "message": err},
                             status=status.HTTP_400_BAD_REQUEST)
+        # ★ 续审：状态转移也走状态机（draft → pending）
+        err = rules.check_cert_transition(obj, Certificate.Status.PENDING)
+        if err:
+            return Response({"code": 400, "message": err},
+                            status=status.HTTP_400_BAD_REQUEST)
         obj.status = Certificate.Status.PENDING
         obj.save(update_fields=["status", "updated_at"])
         audit.log_operation(request, OperationLog.Action.UPDATE,
@@ -579,6 +584,11 @@ class CertificateViewSet(RoleScopedQuerySetMixin, BaseViewSet):
             return Response({"code": 400, "message": "仅待审核状态可驳回"},
                             status=status.HTTP_400_BAD_REQUEST)
         reason = (request.data.get("reason") or "").strip()
+        # ★ 续审：走状态机（pending → draft）
+        err = rules.check_cert_transition(obj, Certificate.Status.DRAFT)
+        if err:
+            return Response({"code": 400, "message": err},
+                            status=status.HTTP_400_BAD_REQUEST)
         obj.status = Certificate.Status.DRAFT
         obj.remark = reason[:255] or obj.remark
         obj.save(update_fields=["status", "remark", "updated_at"])
@@ -630,6 +640,12 @@ class CertificateViewSet(RoleScopedQuerySetMixin, BaseViewSet):
                 return Response({"code": 500, "message": "编号分配失败，请稍后重试"},
                                 status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+        # ★ 续审：走状态机（draft/pending/issued → issued，issued 为幂等重签）
+        err = rules.check_cert_transition(obj, Certificate.Status.ISSUED)
+        if err:
+            return Response({"code": 400, "message": err},
+                            status=status.HTTP_400_BAD_REQUEST)
+
         # 补齐业务字段（签发日期/主体名称快照）
         update_fields = ["status", "cert_no", "updated_at"]
         obj.status = Certificate.Status.ISSUED
@@ -672,6 +688,11 @@ class CertificateViewSet(RoleScopedQuerySetMixin, BaseViewSet):
                 {"code": 400, "message": "仅已签发或已暂停的合格证可作废"
                                          "（草稿/待审核证尚未生效）"},
                 status=status.HTTP_400_BAD_REQUEST)
+        # ★ 续审：走状态机（issued/suspended → revoked）
+        err = rules.check_cert_transition(obj, Certificate.Status.REVOKED)
+        if err:
+            return Response({"code": 400, "message": err},
+                            status=status.HTTP_400_BAD_REQUEST)
         obj.status = Certificate.Status.REVOKED
         obj.save(update_fields=["status", "updated_at"])
         reason = request.data.get("reason", "")
@@ -1037,6 +1058,10 @@ class InspectionRecordViewSet(RoleScopedQuerySetMixin, BaseViewSet):
         cert = record.certificate
         if cert.status == Certificate.Status.REVOKED:
             return
+        # ★ 续审：走状态机（issued → suspended）。检查联动若遇非法转移（如草稿证），
+        #   静默跳过而不改状态，避免把未生效的证「暂停」出诡异语义。
+        if rules.check_cert_transition(cert, Certificate.Status.SUSPENDED):
+            return
         cert.status = Certificate.Status.SUSPENDED
         cert.suspend_reason = reason[:255]
         cert.save(update_fields=["status", "suspend_reason", "updated_at"])
@@ -1059,6 +1084,9 @@ class InspectionRecordViewSet(RoleScopedQuerySetMixin, BaseViewSet):
         """
         cert = record.certificate
         if cert.status != Certificate.Status.SUSPENDED:
+            return False
+        # ★ 续审：走状态机（suspended → revoked）
+        if rules.check_cert_transition(cert, Certificate.Status.REVOKED):
             return False
         cert.status = Certificate.Status.REVOKED
         cert.suspend_reason = (f"整改复查通过，原批次作废（检查#{record.id}）；"
@@ -1215,8 +1243,27 @@ class SupplyDemandViewSet(RoleScopedQuerySetMixin, BaseViewSet):
 
     @action(detail=True, methods=["post"])
     def match(self, request, pk=None):
-        """标记为已对接（保留原语义，同时落审计日志）"""
+        """
+        自己发布的供需单标记为「已对接」。
+
+        ★ 安全修复（续审 High）：原实现直接用 self.get_object()，
+        而读取范围**包含对方的公开单**（业务需要），导致任意可交易角色
+        都能把**别人的**单标记成 matched —— 对方的单会从「待对接」候选里
+        消失，等于被别人下架。
+
+        现在：仅**发布者本人**（或管理员/监管）可操作。
+        别人的单要推进状态，请走「发起对接 → 对方回应」的意向单流程，
+        这样才是双方确认、且留有痕迹的。
+        """
         obj = self.get_object()
+        user = request.user
+        if (user.role not in (Role.ADMIN, Role.REGULATOR)
+                and obj.publisher_id != user.id):
+            return Response(
+                {"code": 403,
+                 "message": "只能操作自己发布的供需单。"
+                            "如要推进对方的单，请发起对接意向，由对方确认。"},
+                status=status.HTTP_403_FORBIDDEN)
         obj.deal_status = SupplyDemand.DealStatus.MATCHED
         obj.save(update_fields=["deal_status", "updated_at"])
         audit.log_operation(request, OperationLog.Action.MATCH,

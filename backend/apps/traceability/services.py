@@ -99,11 +99,15 @@ def build_certificate_payload(cert: Certificate) -> str:
         batch.variety if batch else "",
         batch.origin if batch else "",
         batch.weight_kg if batch else "",
+        batch.plant_area_mu if batch else "",          # ★ 续审：时间轴会展示
+        batch.farming_record if batch else "",         # ★ 续审：农事记录（时间轴展示）
         # ---- 关联检测报告（★ 新增：结论/日期/机构 —— 决定能否流通的事实依据）----
         report.report_no if report else "",
         report.conclusion if report else "",
         report.test_org if report else "",
         _fmt(report.test_date) if report else "",
+        report.pesticide_residue if report else "",    # ★ 续审：消费者关心的安全指标
+        report.heavy_metal if report else "",          # ★ 续审：同上
         # ---- 格式版本 ----
         CERT_PAYLOAD_VERSION,
     ]
@@ -294,13 +298,21 @@ def build_batch_payload(batch) -> str:
     抽成独立函数是为了让「存证」与「核验」共用同一实现 —— 否则两处各写一份
     拼接逻辑，一改一漏就会出现「存的时候用 A 格式、验的时候用 B 格式」，
     导致验真永远失败。
+
+    ★ 续审修复（High）：时间轴/公众页会展示 `farming_record`（农事记录）与
+    `plant_area_mu`（种植面积），但原摘要未覆盖 —— 改了这两项展示值，
+    公开验真仍显示「可信」。现纳入摘要：凡对外展示的关键事实，必须防篡改。
     """
     fields = [
         batch.batch_no,
         batch.producer.name if batch.producer_id else "",
         batch.product_name,
+        batch.variety,
+        batch.origin,
         batch.harvest_date,
         batch.weight_kg,
+        batch.plant_area_mu,
+        batch.farming_record,
         BATCH_PAYLOAD_VERSION,
     ]
     return "|".join(_encode_field(f) for f in fields)
@@ -312,13 +324,19 @@ def build_report_payload(report) -> str:
 
     ★ 安全审计相关：报告的**结论（conclusion）**是决定农产品能否流通的事实依据，
     必须参与哈希 —— 否则「先按合格存证，事后偷偷改成不合格」不会被发现。
-    原实现已含 conclusion，这里保持并统一编码方式。
+
+    ★ 续审修复（High）：时间轴展示的 `pesticide_residue`（农药残留）与
+    `heavy_metal`（重金属）原未纳入摘要 —— 这两项是消费者最关心的安全指标，
+    被篡改却仍显「可信」后果严重。现纳入。
     """
     fields = [
         report.report_no,
         report.batch.batch_no if report.batch_id else "",
         report.conclusion,
         report.test_date,
+        report.test_org,
+        report.pesticide_residue,
+        report.heavy_metal,
         REPORT_PAYLOAD_VERSION,
     ]
     return "|".join(_encode_field(f) for f in fields)

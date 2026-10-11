@@ -210,3 +210,85 @@ gunicorn worker。
 - [ ] 确认服务器 `known_hosts` 已登记（或在部署环境设指纹变量）
 - [ ] 修改所有演示账号口令（若线上存在）
 - [ ] 因哈希原文格式升级（`v2`），线上需**重新存证**（`rehash_all`）后再对外验真
+
+---
+
+# 续审（第二轮审计）修复
+
+> 时间：2026-10-11　　在第一轮 11 项修复基础上，又处理 8 个新问题 + 2 项补充。
+> 测试：257 → **277**（新增 20 个回归用例），全部通过。
+
+## 清单
+
+| 指纹 | 问题 | 等级 | 状态 |
+| --- | --- | --- | --- |
+| TRACE-MATCH-OWNER | `match` 动作可改他人公开单状态 | 高/10 | ✅ |
+| TRACE-PAYLOAD-COVERAGE | 摘要未覆盖时间轴展示的农事记录/残留/重金属 | 高/9 | ✅ |
+| CHAIN-UPDATE-ABI | 内联 ABI 缺 `updateEvidence` → 存证静默降级 | 中高/10 | ✅ |
+| CSP-STATIC-SPA | CSP 只加在 API，SPA 静态页（nginx）没有 | 中/10 | ✅ |
+| OCR-DEADLINE-NONINTERRUPT | 总时限不能中断正在跑的 OCR | 中/9 | ✅ |
+| CONFIG-BOOL-DRIFT | 布尔环境变量判断不一致（`FISCO_ENABLE_CHAIN=1` 会关链）| 中/10 | ✅ |
+| REHASH-SALT-LOG | `rehash_all` 把盐值原文打进日志 | 中/9 | ✅ |
+| CHAIN-OWNER-TRANSFER | 合约转移所有权未撤销旧 owner 权限 | 中/9 | ✅ |
+| （补充）状态机未接入业务入口 | `can_transition_cert` 定义了但没被调用 | — | ✅ |
+| （补充）缺少强制改密机制 | User 无 `must_change_password` 字段 | — | ✅ |
+
+## 关键修复说明
+
+### TRACE-MATCH-OWNER（高）
+`SupplyDemandViewSet.match` 用 `self.get_object()`（公开读取范围），任意可交易角色
+可把**别人的**供需单标记为 matched —— 对方的单会从「待对接」候选消失，等于被下架。
+**修复**：仅发布者本人（或管理员/监管）可操作，否则 403 并提示走意向单流程。
+
+### TRACE-PAYLOAD-COVERAGE（高）
+时间轴/公众页展示的字段未进摘要，改了仍显「可信」。**补齐**：
+- 批次 payload：`variety` / `origin` / `plant_area_mu` / `farming_record`
+- 报告 payload：`test_org` / `pesticide_residue` / `heavy_metal`
+- 证书 payload 同步纳入上述关联字段（改任一 → 证书摘要必变）
+
+### CHAIN-UPDATE-ABI（中高，上轮自己引入）
+上轮把 `send_evidence` 改为「已存在走 `updateEvidence`」，但**没同步补 ABI**
+→ web3 找不到函数名、抛异常被吞 → **存证静默降级为 mock 且无任何报错**。
+**修复**：补齐 v3 ABI（`updateEvidence` / `setWriter` / `transferOwnership` /
+`writers` / `owner` / `getEvidenceWithVersion`），并加 web3 可解析性测试。
+
+### CSP-STATIC-SPA（中）
+CSP 加在 Django 响应上，但 SPA 的 `index.html` 是 **nginx 直接返回**，
+真正需要保护的前端页面反而没有 CSP。**修复**：`deploy.py` 的 nginx 配置中
+在 server 级 + `/index.html` + 附件 location（location 内 `add_header`
+会覆盖继承，故三处都要写）加 CSP 头。
+
+### OCR-DEADLINE-NONINTERRUPT（中）
+总时限只在页与页之间检查，`pytesseract.image_to_string` 是**阻塞调用无超时**。
+**修复**：
+- tesseract 命令行路线原生支持 `timeout=`，优先走它；
+- 无命令行时把 pytesseract 放到**子进程**执行，父进程按剩余预算 kill；
+- 每页把**剩余预算**传下去，单页超时即放弃该页（不重试，避免再卡一次）。
+
+### CONFIG-BOOL-DRIFT（中）
+`DJANGO_DEBUG` / `DJANGO_HTTPS` / `FISCO_ENABLE_CHAIN` 用 `== "true"`，
+与 `1/true/yes/on` 兼容处理不一致 —— 例 `FISCO_ENABLE_CHAIN=1` 被判 False，
+**真实上链被意外关闭而运维以为开着**。
+**修复**：抽出 `env_bool()` 统一解析，全量替换。
+
+### REHASH-SALT-LOG（中）
+`rehash_all` 打印 `存证盐值：<原文>`，在 CI/部署日志会永久留存（等于泄露加盐密钥）。
+**修复**：只显示「已配置」+ 盐值的**不可逆指纹**（sha256 前 16 位）+ 长度。
+
+### CHAIN-OWNER-TRANSFER（中）
+`transferOwnership` 只给新 owner 授权，**旧 owner 仍在白名单** —— 转移后仍能写。
+**修复**：转移时撤销旧 owner 的 writer 状态（如需保留请显式 `setWriter`）。
+
+### 补充：状态机接入业务入口
+上轮把状态机放进 `rules.py`，但业务视图仍各自硬编码判断（规则不是唯一来源）。
+**修复**：新增 `rules.check_cert_transition()`，接入 **6 个**状态写入点
+（submit / reject / issue / revoke / 检查暂停联动 / 复查作废）。
+⚠️ 过程中发现设计不一致：状态机表缺 `draft → issued`，而
+`CERT_ISSUABLE_FROM` 允许草稿直接签发 → 已补上并加「两表一致性」测试。
+
+### 补充：强制改密落地
+`User` 无 `must_change_password` 字段 → 上轮的 `hasattr` 分支永不生效。
+**修复**：
+- 模型加字段 + 迁移 `0005_user_must_change_password`
+- 新增 `POST /api/auth/change-password/`（校验旧密码、长度 ≥8、不得同旧）
+- `init_data` 对**已存在**的演示账号也轮换口令并置标记

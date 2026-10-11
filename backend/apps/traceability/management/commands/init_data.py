@@ -325,6 +325,7 @@ class Command(BaseCommand):
     def _create_users(self):
         demo_pw = getattr(self, "_demo_password", None) or self._resolve_demo_password()
         created_any = False
+        rotated = []
         for username, _pw, role, _, org in USERS:
             user, created = User.objects.get_or_create(
                 username=username,
@@ -334,15 +335,31 @@ class Command(BaseCommand):
             )
             if created:
                 user.set_password(demo_pw)
-                # ★ 标记强制首次修改口令（若 User 模型支持该字段）
+                # ★ 标记强制首次修改口令（User 模型已提供该字段）
                 if hasattr(user, "must_change_password"):
                     user.must_change_password = True
                 user.save()
                 created_any = True
                 self.stdout.write(f"  创建用户 {username} ({role})")
+            else:
+                # ★ 续审修复：**已有**演示账号也要轮换口令。
+                #   原实现只在 created 时设密码 → 老库里的账号口令永远是当初那个，
+                #   「不再硬编码」只对新库有效，线上旧账号仍留着重口令风险。
+                #   这里对**已存在的演示账号**统一重置为本次口令并标记强制改密。
+                user.set_password(demo_pw)
+                fields = ["password"]
+                if hasattr(user, "must_change_password"):
+                    user.must_change_password = True
+                    fields.append("must_change_password")
+                user.save(update_fields=fields)
+                rotated.append(username)
         if created_any:
             self.stdout.write(self.style.WARNING(
                 "  ⚠️ 演示账号已创建，请首次登录后立即修改口令！"))
+        if rotated:
+            self.stdout.write(self.style.WARNING(
+                "  ⚠️ 已重置以下**已存在**演示账号的口令为本次口令（并标记强制改密）："
+                + "、".join(rotated)))
 
     def _create_business_data(self):
         producer_user = User.objects.filter(username="producer").first()

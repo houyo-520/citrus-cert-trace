@@ -25,6 +25,13 @@ class User(AbstractUser):
     openid = models.CharField("微信openid", max_length=64, blank=True, default="",
                               db_index=True,
                               help_text="微信小程序登录标识，绑定后用于免密登录")
+    # ★ 续审修复：强制首次改密标记。
+    #   原 init_data 用 hasattr(user, "must_change_password") 判断，但模型**没有**
+    #   该字段 → 分支永不生效，「创建演示账号后强制改密」形同虚设。
+    #   现补上字段：init_data 创建演示账号时置 True，登录接口据此提示/拦截。
+    must_change_password = models.BooleanField(
+        "需强制修改密码", default=False,
+        help_text="为 True 时，登录后应提示（或强制）用户修改口令")
 
     class Meta:
         db_table = "sys_user"

@@ -24,18 +24,23 @@
 # ===============================================================
 # 允许的状态转移：{来源状态: {可去往的状态集合}}
 # 设计依据（与论文/答辩口径一致）：
-#   draft    → pending                 ：提交送审
+#   draft    → pending / issued        ：提交送审 / 管理员快捷直接签发
 #   pending  → issued / draft / revoked：签发 / 驳回退回草稿 / 直接作废
 #   issued   → suspended / revoked     ：监督检查不合格暂停 / 作废
 #   suspended→ revoked                 ：整改复查通过后原证作废（终态，不复原）
 #   revoked  → （无）                   ：终态
+#
+# ★ 续审修复：`draft → issued` 必须存在 —— `CERT_ISSUABLE_FROM` 明确允许
+#   「草稿直接签发」（管理员快捷通道，测试 `test_issue_assigns_cert_no_via_api`
+#   即按此路径走）。原状态机表漏了这一条，导致接入状态机后该路径被自己拦住。
+#   两张表必须一致：**能签发的来源状态 ⊆ 状态机能到达 issued 的来源状态**。
 #
 # ★ 关键点：suspended **不允许**回到 pending 或 issued。
 #   暂停后必须走「整改复查」流程：复查通过 → 原证转 revoked，
 #   生产方对新批次重新申领。若允许 suspended→pending，就会出现
 #   「停用中的证自己又变回已签发」，与设计冲突。
 CERT_TRANSITIONS = {
-    "draft": {"pending"},
+    "draft": {"pending", "issued"},
     "pending": {"issued", "draft", "revoked"},
     "issued": {"suspended", "revoked"},
     "suspended": {"revoked"},
@@ -53,6 +58,29 @@ CERT_ISSUABLE_FROM = {"draft", "pending", "issued"}
 def can_transition_cert(from_status: str, to_status: str) -> bool:
     """合格证状态转移是否合法（状态机唯一来源）。"""
     return to_status in CERT_TRANSITIONS.get(from_status, set())
+
+
+def check_cert_transition(cert, to_status: str) -> str | None:
+    """
+    校验一次状态转移是否被状态机允许（视图各入口共用）。
+
+    返回 None 表示允许；否则返回错误文案。
+
+    ★ 续审修复：此前 `can_transition_cert` 只在测试里被用到，业务视图
+    （submit / reject / revoke / 检查联动）仍各自硬编码判断 —— 规则虽集中
+    定义了，但**并未成为唯一来源**，改一处漏一处的问题依旧存在。
+    现在这些入口统一调用本函数，状态机真正生效。
+
+    ⚠️ 例外：`issued` 允许「幂等重签」（源状态=目标状态），
+    这是批量签发/网络重试的正常场景，不算非法跃迁。
+    """
+    cur = getattr(cert, "status", None)
+    if cur == to_status:
+        return None           # 幂等：同态转移一律放行
+    if not can_transition_cert(cur, to_status):
+        return (f"不允许的状态流转：{cur} → {to_status}"
+                "（状态机见 apps/traceability/rules.py）")
+    return None
 
 
 def check_cert_issue(cert) -> str | None:

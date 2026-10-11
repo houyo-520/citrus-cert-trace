@@ -113,6 +113,48 @@ class LoginView(APIView):
             pass
 
 
+class ChangePasswordView(APIView):
+    """
+    修改自己的密码。
+
+    ★ 续审修复：配合 `must_change_password` —— 演示账号首次登录后需要一个
+    可用的改密入口，否则「强制改密」没有落地路径。
+    入参：{"old_password": "...", "new_password": "..."}
+    成功后清除 must_change_password 标记。
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        user = request.user
+        old = (request.data.get("old_password") or "").strip()
+        new = (request.data.get("new_password") or "").strip()
+        if not old or not new:
+            return Response({"code": 400, "message": "请填写原密码与新密码"},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if not user.check_password(old):
+            return Response({"code": 400, "message": "原密码不正确"},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if len(new) < 8:
+            # 演示口令是随机 16 位；新口令要求至少 8 位，避免改成 123456
+            return Response({"code": 400, "message": "新密码长度至少 8 位"},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if new == old:
+            return Response({"code": 400, "message": "新密码不能与原密码相同"},
+                            status=status.HTTP_400_BAD_REQUEST)
+        user.set_password(new)
+        fields = ["password"]
+        if hasattr(user, "must_change_password"):
+            user.must_change_password = False
+            fields.append("must_change_password")
+        user.save(update_fields=fields)
+        try:
+            from .models import OperationLog  # 若模型存在则留痕
+        except Exception:  # noqa: BLE001
+            pass
+        return Response({"code": 200, "message": "密码已修改，请重新登录",
+                         "data": None})
+
+
 class ProfileView(APIView):
     permission_classes = [IsAuthenticated]
 
