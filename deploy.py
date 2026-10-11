@@ -28,6 +28,21 @@ Django SECRET_KEY、链上账户私钥直接写在源码里，一旦仓库公开
     export CITRUS_EVIDENCE_SALT='...'
     python deploy.py upload
 
+★ SSH 主机密钥校验（2026-10-11 安全加固）
+---------------------------------------------------------------
+本脚本**不再无条件信任**未知主机密钥（原 AutoAddPolicy 可被中间人利用
+窃取 .env 中的数据库口令 / JWT 密钥 / 存证私钥）。放行方式三选一：
+
+  ① 预登记到 known_hosts（推荐）
+       ssh-keyscan -p <SSH_PORT> <HOST> >> ~/.ssh/known_hosts
+     追加前请先用 `ssh-keygen -lf -` 核对指纹与服务器实际一致。
+
+  ② 指纹白名单
+       export CITRUS_SSH_HOST_FINGERPRINT=SHA256:xxxxxxxx
+
+  ③ 仅限你百分百确认网络可信的临时场景（有风险，勿长期使用）
+       export CITRUS_SSH_TRUST_NEW=1
+
   方式二：.deploy_env 文件（推荐日常开发，免每次手设）
     在 源代码/ 下建 .deploy_env，内容形如：
       CITRUS_SSH_PASSWORD=xxx
@@ -38,7 +53,7 @@ Django SECRET_KEY、链上账户私钥直接写在源码里，一旦仓库公开
 
 凭据实际值见 毕设源/凭据清单_请勿提交.md
 """
-import sys, os, posixpath, stat, json, time
+import sys, os, posixpath, stat, json, time, base64, hashlib
 import paramiko
 
 HOST = os.environ.get("CITRUS_SSH_HOST", "<your-server-ip>")
@@ -100,19 +115,97 @@ PWD = os.environ.get("CITRUS_SSH_PASSWORD", "")
 SECRET_KEY = os.environ.get("CITRUS_SECRET_KEY", "")
 
 
+def _host_key_policy(cli):
+    """
+    ★ 安全修复（审计 Medium：「部署脚本自动信任未知 SSH 主机密钥」）。
+
+    原实现一律 AutoAddPolicy()，会**无条件接受**任何服务器主机密钥 ——
+    一旦 DNS/路由被劫持，攻击者可冒充目标服务器，把部署脚本要上传的
+    .env（含数据库口令、JWT 密钥、存证私钥）连同代码全部收走。
+
+    现在的策略（按优先级）：
+      1. 若配置了 `CITRUS_SSH_HOST_FINGERPRINT`（形如 `SHA256:xxxx`），
+         用它做**指纹白名单**校验：不匹配即拒绝连接。
+      2. 否则尝试加载系统 known_hosts：
+         - 有对应条目 → 严格校验（RejectPolicy）
+         - 无对应条目 → 拒绝并提示如何登记（不再静默信任）
+
+    只允许两种显式放行方式，杜绝「默认信任」：
+      - 设置正确的指纹环境变量；
+      - 或把服务器公钥预先写入 ~/.ssh/known_hosts。
+
+    环境变量：
+      CITRUS_SSH_HOST_FINGERPRINT  服务器主机密钥指纹（SHA256:...）
+      CITRUS_SSH_TRUST_NEW=1       显式跳过校验（仅限你百分百确认的临时场景）
+    """
+    want_fp = os.environ.get("CITRUS_SSH_HOST_FINGERPRINT", "").strip()
+    trust_new = os.environ.get("CITRUS_SSH_TRUST_NEW", "") == "1"
+
+    if trust_new:
+        print("  ⚠️  CITRUS_SSH_TRUST_NEW=1：已跳过主机密钥校验（存在中间人风险，请勿长期使用）")
+        cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        return
+
+    if want_fp:
+        class _FingerprintPolicy(paramiko.MissingHostKeyPolicy):
+            """指纹白名单：仅接受与期望指纹一致的主机密钥。"""
+            def missing_host_key(self, client, hostname, key):
+                actual = "SHA256:" + base64.b64encode(
+                    hashlib.sha256(key.asbytes()).digest()).decode().rstrip("=")
+                if actual != want_fp:
+                    raise paramiko.SSHException(
+                        f"主机密钥指纹不匹配！\n"
+                        f"  期望: {want_fp}\n"
+                        f"  实际: {actual}\n"
+                        f"  可能遭遇中间人攻击，已中止连接。")
+                client.get_host_keys().add(hostname, key.get_name(), key)
+
+        cli.set_missing_host_key_policy(_FingerprintPolicy())
+        print(f"  主机密钥校验：按指纹白名单 {want_fp}")
+        return
+
+    # 未配置指纹 → 尝试用 known_hosts 严格校验
+    cli.load_system_host_keys()
+    cli.set_missing_host_key_policy(paramiko.RejectPolicy())
+    print("  主机密钥校验：known_hosts（未登记将拒绝连接）")
+
+
 def conn():
     # 优先密钥（ed25519）；密钥不存在时回退密码（向后兼容未加固的机器）
     if os.path.isfile(SSH_KEY):
         c = paramiko.SSHClient()
-        c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        c.connect(HOST, port=SSH_PORT, username=USER,
-                  key_filename=SSH_KEY, timeout=25)
+        _host_key_policy(c)
+        try:
+            c.connect(HOST, port=SSH_PORT, username=USER,
+                      key_filename=SSH_KEY, timeout=25)
+        except paramiko.SSHException as exc:
+            raise SystemExit(_host_key_hint(exc))
         return c
     pwd = _need("CITRUS_SSH_PASSWORD", "服务器 ubuntu 用户密码")
     c = paramiko.SSHClient()
-    c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    c.connect(HOST, port=SSH_PORT, username=USER, password=pwd, timeout=25)
+    _host_key_policy(c)
+    try:
+        c.connect(HOST, port=SSH_PORT, username=USER, password=pwd, timeout=25)
+    except paramiko.SSHException as exc:
+        raise SystemExit(_host_key_hint(exc))
     return c
+
+
+def _host_key_hint(exc) -> str:
+    """把「主机密钥被拒」转成可操作的中文指引。"""
+    return (
+        "✗ 无法验证服务器主机密钥，已中止连接（防中间人攻击）。\n\n"
+        f"  原始错误：{exc}\n\n"
+        "  两种放行方式（任选其一）：\n"
+        "  ① 预先把服务器公钥登记到 known_hosts（推荐）：\n"
+        f"       ssh-keyscan -p {SSH_PORT} {HOST} >> ~/.ssh/known_hosts\n"
+        "       ssh-keyscan -p " + str(SSH_PORT) + " " + HOST + " | ssh-keygen -lf -\n"
+        "     （核对打印出的指纹与服务器实际指纹一致后再执行追加）\n"
+        "  ② 设置指纹白名单环境变量：\n"
+        "       export CITRUS_SSH_HOST_FINGERPRINT=SHA256:xxxxx\n\n"
+        "  仅在你百分百确认网络可信的临时场景，才可用：\n"
+        "       export CITRUS_SSH_TRUST_NEW=1\n"
+    )
 
 
 def run(cli, cmd, timeout=900, quiet=False):

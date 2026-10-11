@@ -256,12 +256,20 @@ def _mock_tx_hash() -> str:
 
 def send_evidence(data_hash: str, biz_no: str = "", biz_type: str = "") -> dict:
     """
-    把存证哈希写入联盟链（调用 CertificateEvidence.addEvidence）。
+    把存证哈希写入联盟链。
+
+    ★ v3.0 合约语义（安全加固后）：
+      - `addEvidence` **已存在则 revert**（防止重复写入把 revoked 重置为 false）
+      - 合法「重存证」改用 `updateEvidence`（保留 revoked / revokedAt）
+
+    因此这里**先查链上是否已有该 bizType+bizNo**：
+      - 不存在 → addEvidence
+      - 已存在 → updateEvidence（追加式版本，不复活已作废记录）
 
     参数
       data_hash : 业务数据的 SHA-256 十六进制摘要（后端计算，如 cert_hash）
-      biz_no    : 业务编号（链上按此索引，同一编号重复存证会覆盖）
-      biz_type  : 业务类型（certificate / batch / report）
+      biz_no    : 业务编号（链上按此索引）
+      biz_type  : 业务类型（certificate / batch / report / inspection）
 
     返回
       {"ok": bool, "tx_hash": str, "block_height": int, "mode": "chain"|"mock", "message": str}
@@ -284,18 +292,33 @@ def send_evidence(data_hash: str, biz_no: str = "", biz_type: str = "") -> dict:
 
     try:
         contract = _get_contract(w3)
-        fn = contract.functions.addEvidence(biz_type or "certificate",
-                                            biz_no or "-", data_hash)
+        btype = biz_type or "certificate"
+        bno = biz_no or "-"
+
+        # ★ 先判断链上是否已存在该记录，决定走 add 还是 update
+        exists = False
+        try:
+            _hash, _ts, _op, _bn, exists, _rv, _ra, _rr = \
+                contract.functions.getEvidence(btype, bno).call()
+        except Exception:  # noqa: BLE001
+            # 查询失败时保守按「已存在」处理：updateEvidence 对不存在的记录会 revert，
+            # 会走下面的异常分支降级；而若误用 addEvidence 覆盖已撤销记录，
+            # 后果更严重（信任漏洞）。两害相权取轻。
+            exists = True
+
+        method = "updateEvidence" if exists else "addEvidence"
+        fn = getattr(contract.functions, method)(btype, bno, data_hash)
         result = _send(w3, fn, PRIVATE_KEY)
         ok = result["status"] == 1
-        logger.info("存证上链%s: %s block=%s",
-                    "成功" if ok else "失败", result["tx_hash"], result["block_height"])
+        logger.info("存证上链%s（%s）: %s block=%s",
+                    "成功" if ok else "失败", method,
+                    result["tx_hash"], result["block_height"])
         return {
             "ok": ok,
             "tx_hash": result["tx_hash"],
             "block_height": result["block_height"],
             "mode": "chain",
-            "message": "已上链存证" if ok else "交易执行失败（status != 1）",
+            "message": ("已上链存证" if ok else "交易执行失败（status != 1）"),
         }
     except Exception as exc:  # noqa: BLE001
         logger.exception("上链异常: %s", exc)

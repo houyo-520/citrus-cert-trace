@@ -19,12 +19,23 @@ pragma solidity >=0.6.10 <0.8.27;
  *  revokeEvidence()：对一条已存证的记录打「已撤销」标记（而非删链）。
  *  意义：把「作废」这个动作本身固化为链上事实，公众验真时能查到
  *        「该合格证已被撤销」，避免「本地已作废、链上却仍显合法」的信任悖论。
+ *
+ * v3.0 变更（2026-10-11 安全加固）：
+ *  1. ★ 写入者白名单（onlyWriter）：addEvidence / revokeEvidence 由 public
+ *     改为仅限 owner 及其授权地址调用。原实现任何地址都能写入，与本合约
+ *     「链上记录不可被任意改写」的承诺相悖。
+ *  2. ★ 防覆盖：addEvidence 对**已存在**的记录默认拒绝（require），
+ *     避免「重复写入把已撤销状态重置回未撤销」这一信任漏洞。
+ *     确需更新摘要（业务上合法的重存证）时走 updateEvidence()，
+ *     它保留 revoked 标记 —— 已作废的记录不会被「更新」变回有效。
+ *  3. ★ 修正文档与实现不一致：原 README 称「重复调用会 revert」，
+ *     但 v2.0 实现其实是静默覆盖。v3.0 起该说法才成立。
  */
 contract CertificateEvidence {
 
     struct Evidence {
         string  dataHash;      // 业务数据的 SHA-256 摘要（hex，无 0x 前缀）
-        string  bizType;       // 业务类型：certificate / batch / report
+        string  bizType;       // 业务类型：certificate / batch / report / inspection
         uint256 timestamp;     // 上链时间戳
         address operator;      // 操作人地址（存证发起方）
         uint256 blockNum;      // 所在区块高度
@@ -32,10 +43,15 @@ contract CertificateEvidence {
         bool    revoked;       // 是否已被撤销（作废）
         uint256 revokedAt;     // 撤销时间戳（0 表示未撤销）
         string  revokeReason;  // 撤销原因
+        uint256 version;       // ★ 追加式版本号（每次更新 +1，可回溯修改历史）
     }
 
     // bizType => bizNo => Evidence
     mapping(string => mapping(string => Evidence)) private records;
+
+    // ★ 写入者白名单：owner + 授权地址
+    address public owner;
+    mapping(address => bool) public writers;
 
     // 累计存证条数（便于看板展示）
     uint256 public totalEvidence;
@@ -49,6 +65,20 @@ contract CertificateEvidence {
         uint256 timestamp
     );
 
+    // ★ 摘要更新事件（追加式版本，保留作废状态）
+    event EvidenceUpdated(
+        string indexed bizType,
+        string indexed bizNo,
+        string oldHash,
+        string newHash,
+        uint256 version,
+        address operator,
+        uint256 timestamp
+    );
+
+    // ★ 写入者授权变更事件
+    event WriterChanged(address indexed account, bool allowed);
+
     // 每次撤销触发事件，便于链上按事件检索"谁在何时作废了什么"
     event EvidenceRevoked(
         string indexed bizType,
@@ -59,17 +89,65 @@ contract CertificateEvidence {
     );
 
     /**
-     * @notice 写入一条存证记录（同一 bizType+bizNo 重复调用会覆盖并更新时间）
-     * @param bizType  业务类型
-     * @param bizNo    业务编号
-     * @param dataHash 数据摘要
+     * @notice 部署时把部署者登记为 owner（唯一初始写入者）。
      */
-    function addEvidence(string memory bizType, string memory bizNo, string memory dataHash) public {
-        require(bytes(dataHash).length > 0, "dataHash cannot be empty");
+    constructor() public {
+        owner = msg.sender;
+        writers[msg.sender] = true;
+        emit WriterChanged(msg.sender, true);
+    }
 
-        if (!records[bizType][bizNo].exists) {
-            totalEvidence += 1;
-        }
+    /**
+     * @notice 仅白名单可写（owner 或已授权地址）。
+     */
+    modifier onlyWriter() {
+        require(writers[msg.sender], "not authorized to write evidence");
+        _;
+    }
+
+    /**
+     * @notice 仅 owner 可授权/取消授权写入地址。
+     */
+    modifier onlyOwner() {
+        require(msg.sender == owner, "only owner");
+        _;
+    }
+
+    /**
+     * @notice 授权/取消授权一个写入地址（业务侧存证账户）。
+     */
+    function setWriter(address account, bool allowed) public onlyOwner {
+        require(account != address(0), "zero address");
+        writers[account] = allowed;
+        emit WriterChanged(account, allowed);
+    }
+
+    /**
+     * @notice 转移 owner 权限。
+     */
+    function transferOwnership(address newOwner) public onlyOwner {
+        require(newOwner != address(0), "zero address");
+        writers[newOwner] = true;
+        owner = newOwner;
+        emit WriterChanged(newOwner, true);
+    }
+
+    /**
+     * @notice 新增一条存证记录。
+     * ★ 若该 bizType+bizNo **已存在**，直接 revert（不做静默覆盖）。
+     *   原因：v2.0 的覆盖语义会把 `revoked` 重置为 false ——
+     *   只要有人重复写入同一条记录，原本已作废的证就会「复活」，
+     *   等于链上不可篡改的承诺被一个重复调用架空。
+     *   需要更新摘要（合法重存证）请用 updateEvidence()。
+     */
+    function addEvidence(string memory bizType, string memory bizNo, string memory dataHash)
+        public
+        onlyWriter
+    {
+        require(bytes(dataHash).length > 0, "dataHash cannot be empty");
+        require(!records[bizType][bizNo].exists, "evidence already exists, use updateEvidence");
+
+        totalEvidence += 1;
         records[bizType][bizNo] = Evidence({
             dataHash:  dataHash,
             bizType:   bizType,
@@ -79,20 +157,50 @@ contract CertificateEvidence {
             exists:    true,
             revoked:   false,
             revokedAt: 0,
-            revokeReason: ""
+            revokeReason: "",
+            version:   1
         });
 
         emit EvidenceAdded(bizType, bizNo, dataHash, msg.sender, block.timestamp);
     }
 
     /**
+     * @notice 更新一条已存在记录的摘要（合法的「重存证」）。
+     * ★ 关键约束：**不允许**把已撤销的记录更新为有效 ——
+     *   revoked / revokedAt / revokeReason 三个字段原样保留。
+     *   这样「作废」仍是链上不可逆的事实，符合业务语义。
+     * @return newVersion 更新后的版本号
+     */
+    function updateEvidence(string memory bizType, string memory bizNo, string memory dataHash)
+        public
+        onlyWriter
+        returns (uint256 newVersion)
+    {
+        require(bytes(dataHash).length > 0, "dataHash cannot be empty");
+        Evidence storage e = records[bizType][bizNo];
+        require(e.exists, "evidence not found, use addEvidence");
+
+        string memory oldHash = e.dataHash;
+        e.dataHash = dataHash;
+        e.timestamp = block.timestamp;
+        e.operator = msg.sender;
+        e.blockNum = block.number;
+        e.version += 1;
+        // ★ revoked / revokedAt / revokeReason 保持不变（不复活）
+
+        emit EvidenceUpdated(bizType, bizNo, oldHash, dataHash, e.version,
+                             msg.sender, block.timestamp);
+        return e.version;
+    }
+
+    /**
      * @notice 撤销一条已存证记录（作废双向上链）。
      *         不删除原记录，而是把 revoked 置 true 并记录撤销原因与时间。
-     * @param bizType 业务类型
-     * @param bizNo   业务编号
-     * @param reason  撤销原因（如「检测不合格」「复查通过后原批次作废」）
      */
-    function revokeEvidence(string memory bizType, string memory bizNo, string memory reason) public {
+    function revokeEvidence(string memory bizType, string memory bizNo, string memory reason)
+        public
+        onlyWriter
+    {
         require(records[bizType][bizNo].exists, "evidence not found");
         require(!records[bizType][bizNo].revoked, "already revoked");
 
@@ -105,9 +213,6 @@ contract CertificateEvidence {
 
     /**
      * @notice 读取存证记录
-     * @return dataHash 数据摘要 / timestamp 上链时间 / operator 操作人 /
-     *         blockNum 区块高度 / exists 是否存在 /
-     *         revoked 是否已撤销 / revokedAt 撤销时间 / revokeReason 撤销原因
      */
     function getEvidence(string memory bizType, string memory bizNo)
         public
@@ -122,10 +227,20 @@ contract CertificateEvidence {
     }
 
     /**
+     * @notice 读取存证记录（含版本号）。
+     */
+    function getEvidenceWithVersion(string memory bizType, string memory bizNo)
+        public
+        view
+        returns (string memory dataHash, uint256 version, bool exists,
+                 bool revoked, uint256 timestamp)
+    {
+        Evidence memory e = records[bizType][bizNo];
+        return (e.dataHash, e.version, e.exists, e.revoked, e.timestamp);
+    }
+
+    /**
      * @notice 校验摘要是否与链上记录一致（验真核心接口）。
-     *         若该记录已被撤销，则无论摘要是否一致都返回 matched=false，
-     *         且 exists=true、revoked=true，供调用方区分「已作废」与「被篡改」。
-     * @return matched 是否一致（已撤销恒为 false）；exists 链上是否已有该存证
      */
     function verifyEvidence(string memory bizType, string memory bizNo, string memory dataHash)
         public
@@ -144,7 +259,6 @@ contract CertificateEvidence {
 
     /**
      * @notice 查询一条记录是否已被撤销（供验真页快速判断）
-     * @return found 链上是否有该记录；revoked 是否已撤销
      */
     function isRevoked(string memory bizType, string memory bizNo)
         public
@@ -157,6 +271,6 @@ contract CertificateEvidence {
 
     /// @notice 合约版本，便于运维确认部署版本
     function version() public pure returns (string memory) {
-        return "CertificateEvidence v2.0";
+        return "CertificateEvidence v3.0";
     }
 }

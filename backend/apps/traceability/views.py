@@ -25,7 +25,8 @@ from rest_framework.views import APIView
 
 from apps.accounts.models import LoginRecord, Role
 
-from . import audit, certno, chain, credit, matching, merkle, notify, ocr, services, timeline
+from . import (audit, certno, chain, credit, matching, merkle, notify, ocr,
+               rules, services, timeline)
 from .models import (Certificate, EvidenceRecord, InspectionRecord,
                      MatchIntent, Notification, OperationLog, Producer,
                      ProductBatch, PublicQueryRecord, SupplyDemand, TestReport)
@@ -476,16 +477,11 @@ class CertificateViewSet(RoleScopedQuerySetMixin, BaseViewSet):
                 continue
 
             label = obj.cert_no or f"草稿#{obj.id}"
-            if obj.status == Certificate.Status.REVOKED:
-                results.append({"id": cid, "label": label, "ok": False, "cert_no": "",
-                                "message": "已作废，不可签发"})
-                fail_count += 1
-                continue
-            # 与单张签发保持同一条业务规则：无检测报告不可签发
-            if not obj.report_id:
+            # ★ 与单张签发共用同一套校验（状态可签发 / 报告存在且合格 / 同批次 / 有主体）
+            err = rules.check_cert_issue(obj)
+            if err:
                 results.append({"id": cid, "label": label, "ok": False,
-                                "cert_no": obj.cert_no or "",
-                                "message": "缺少关联的检测报告，不可签发"})
+                                "cert_no": obj.cert_no or "", "message": err})
                 fail_count += 1
                 continue
 
@@ -546,11 +542,23 @@ class CertificateViewSet(RoleScopedQuerySetMixin, BaseViewSet):
         """提交审核：草稿 -> 待审核（仍不占号）。"""
         obj = self.get_object()
         if obj.status not in (Certificate.Status.DRAFT,
-                              Certificate.Status.SUSPENDED):
-            return Response({"code": 400, "message": "仅草稿或已暂停的合格证可提交审核"},
+                              Certificate.Status.PENDING):
+            # ★ 安全修复（审计 High）：原实现允许 SUSPENDED 送审，
+            #   会让「监督检查暂停的证」重新变成待审核、进而被再次签发。
+            #   暂停证必须走整改流程（复查通过 → 原证作废 → 新批次重新申领）。
+            if obj.status == Certificate.Status.SUSPENDED:
+                return Response(
+                    {"code": 400,
+                     "message": "该合格证处于「暂停使用」状态，不可重新送审。"
+                                "请按整改流程处理：监督检查复查通过后原证将转作废，"
+                                "届时对新批次重新申领。"},
+                    status=status.HTTP_400_BAD_REQUEST)
+            return Response({"code": 400, "message": "仅草稿或待审核的合格证可提交审核"},
                             status=status.HTTP_400_BAD_REQUEST)
-        if not obj.report_id:
-            return Response({"code": 400, "message": "请先关联合格的检测报告再提交"},
+        # 提交与签发共用同一套业务前置校验（规则集中在 rules.py）
+        err = rules.check_cert_issue(obj)
+        if err:
+            return Response({"code": 400, "message": err},
                             status=status.HTTP_400_BAD_REQUEST)
         obj.status = Certificate.Status.PENDING
         obj.save(update_fields=["status", "updated_at"])
@@ -592,14 +600,12 @@ class CertificateViewSet(RoleScopedQuerySetMixin, BaseViewSet):
         （见 certno.save_with_cert_no）。已签发过的证重复调用不会重新取号。
         """
         obj = self.get_object()
-        if obj.status == Certificate.Status.REVOKED:
-            return Response({"code": 400, "message": "已作废的合格证不可签发"},
-                            status=status.HTTP_400_BAD_REQUEST)
-        # ★ 签发前必须有关联的合格检测报告 —— 这是「承诺达标」的事实依据。
-        # 正常流程里 submit 已拦过一次，这里再拦一次是防御性校验：
-        # 若有人绕过 submit 直接改库造出 pending 状态，签发口仍能兜住。
-        if not obj.report_id:
-            return Response({"code": 400, "message": "缺少关联的检测报告，不可签发"},
+        # ★ 安全修复（审计 High）：签发前置校验统一走 rules.check_cert_issue ——
+        #   覆盖「状态可签发 / 有报告 / 报告结论合格 / 报告与本证同批次 / 批次有主体」，
+        #   单张与批量两处入口共用同一实现，避免只堵一个口子。
+        err = rules.check_cert_issue(obj)
+        if err:
+            return Response({"code": 400, "message": err},
                             status=status.HTTP_400_BAD_REQUEST)
 
         already = bool(obj.cert_no)
@@ -1162,7 +1168,23 @@ class SupplyDemandViewSet(RoleScopedQuerySetMixin, BaseViewSet):
         return [IsAuthenticated()]
 
     def get_queryset(self):
+        """
+        ★ 安全修复（审计 High）：读范围含「对方公开单」（业务需要），
+        但**写操作必须只作用于自己发布的单**。
+
+        原实现的漏洞：通用 PATCH/PUT/DELETE 直接复用这份「含对方公开单」的
+        查询范围，而 CanTrade 只校验角色不校验归属 —— 结果种植主体可以改/删
+        买家的求购单，收购商可以改/删别人的供应单。
+
+        处理：写动作（update/partial_update/destroy）把范围收紧到
+        `publisher=当前用户`。取不到对象即 404，等价于「无权操作」但
+        不泄露「该 id 存在」这一信息。
+        """
         qs = super().get_queryset()
+        if self.action in ("update", "partial_update", "destroy"):
+            user = self.request.user
+            if user.role not in (Role.ADMIN, Role.REGULATOR):
+                qs = qs.filter(publisher=user)
         kind = self.request.query_params.get("kind")
         deal_status = self.request.query_params.get("deal_status")
         keyword = self.request.query_params.get("keyword")
@@ -1312,13 +1334,29 @@ class MatchIntentViewSet(RoleScopedQuerySetMixin, viewsets.ModelViewSet):
         return Response({"code": 405, "message": "请使用「回应」更新意向状态"},
                         status=status.HTTP_405_METHOD_NOT_ALLOWED)
 
+    def partial_update(self, request, *args, **kwargs):
+        # ★ 安全修复：原实现只拦了 PUT（update），PATCH（partial_update）
+        #   仍会走序列化器直接改 status，等于绕过了 respond 的全部校验。
+        return Response({"code": 405, "message": "请使用「回应」更新意向状态"},
+                        status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
     @action(detail=True, methods=["post"])
     def respond(self, request, pk=None):
-        """供需单发布方回应意向：接受 / 拒绝 / 完成"""
+        """
+        回应意向单。
+
+        ★ 安全修复（审计 High）：原实现不核验回应人身份、也不限制状态流转，
+        导致「发起人可以替对方接受/拒绝自己的意向」「已拒绝的意向可被改回
+        pending」等问题。现统一走 rules.check_intent_respond：
+          - 只有供需单发布方可 accepted/rejected（pending 状态）
+          - accepted → done 由发起方或发布方确认
+          - rejected / done 为终态，不可再变
+        """
         obj = self.get_object()
         new_status = request.data.get("status")
-        if new_status not in dict(MatchIntent.Status.choices):
-            return Response({"code": 400, "message": "状态非法"},
+        err = rules.check_intent_respond(obj, new_status, request.user)
+        if err:
+            return Response({"code": 400, "message": err},
                             status=status.HTTP_400_BAD_REQUEST)
         obj.status = new_status
         obj.save(update_fields=["status", "updated_at"])
@@ -1611,6 +1649,9 @@ class PublicVerifyView(APIView):
             "current_hash": verify["current_hash"],
             "chain_verified": verify.get("chain_verified", False),
             "chain_detail": verify.get("chain_detail", ""),
+            # ★ 关联证据核验明细（安全修复）：公开页可展示「批次/报告是否也被改过」，
+            #   让「展示值」与「可信结论」不再脱节。
+            "related_evidence": verify.get("related", []),
             # ★ 链上作废标记：作废双向上链后，验真页据此显示「该证已在链上作废」
             "revoked": verify.get("revoked", False),
             # ★ 编号解析（让公众看到「区域/日期/序号」的构成）

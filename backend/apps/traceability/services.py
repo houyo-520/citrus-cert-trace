@@ -44,22 +44,70 @@ def _fmt(value):
     return str(value).strip()
 
 
+def _encode_field(value) -> str:
+    """
+    ★ 单字段编码（安全修复：审计 Medium「哈希原文用 | 拼接可致歧义碰撞」）。
+
+    原实现把各字段直接用 '|' 拼接，字段内容**未做转义**：
+      ("张三|李四", "柑橘")  与  ("张三", "李四|柑橘")
+    拼出来的原文完全相同 —— 字段边界被语义迁移，但摘要不变。
+    这违反「一物一摘要」的存证前提。
+
+    修法：改用「长度前缀」编码 —— 每个字段写成
+        <字符数>:<内容>
+    分隔符只作为可读性辅助，**判定边界靠长度**，因此字段内出现任何
+    字符（含 '|'、换行）都不会造成歧义。这是 netstring 的经典做法。
+    """
+    s = _fmt(value)
+    return f"{len(s)}:{s}"
+
+
+# ★ 存证原文格式版本。修改编码方式时必须递增，便于历史数据区分与迁移。
+CERT_PAYLOAD_VERSION = "v2"
+BATCH_PAYLOAD_VERSION = "v2"
+REPORT_PAYLOAD_VERSION = "v2"
+
+
 def build_certificate_payload(cert: Certificate) -> str:
     """
     构造合格证的规范化原文（参与哈希计算的字段集合）。
-    字段顺序固定，用 '|' 分隔，避免顺序歧义。
+
+    ★ 安全修复（审计 High/Medium）：
+      1. 关联数据纳入摘要 —— 原来只存「批次编号、报告编号」这类**引用值**，
+         批次产地/品种、报告结论/日期/机构被改了，证书摘要不变、验真照样绿。
+         现在把关联对象的**关键业务字段**一并编码进原文：这些字段一变，
+         证书摘要必然变，公众页展示值与「可信」结论不再脱节。
+      2. 拼接改为长度前缀编码，消除 '|' 歧义（见 _encode_field）。
+
+    字段顺序固定，保证同一份数据每次算出同一摘要。
+    末尾带上版本号，便于后续演进与历史数据识别。
     """
-    parts = [
+    batch = cert.batch if cert.batch_id else None
+    report = cert.report if cert.report_id else None
+
+    fields = [
+        # ---- 合格证自身 ----
         cert.cert_no,
         cert.producer_name,
         cert.product_name,
-        _fmt(cert.quantity_kg),
-        cert.batch.batch_no if cert.batch_id else "",
-        cert.report.report_no if cert.report_id else "",
+        cert.quantity_kg,
         _fmt(cert.issue_date),
         _fmt(cert.valid_until),
+        # ---- 关联批次（★ 新增：产地/品种等会被公众页展示的关键字段）----
+        batch.batch_no if batch else "",
+        batch.product_name if batch else "",
+        batch.variety if batch else "",
+        batch.origin if batch else "",
+        batch.weight_kg if batch else "",
+        # ---- 关联检测报告（★ 新增：结论/日期/机构 —— 决定能否流通的事实依据）----
+        report.report_no if report else "",
+        report.conclusion if report else "",
+        report.test_org if report else "",
+        _fmt(report.test_date) if report else "",
+        # ---- 格式版本 ----
+        CERT_PAYLOAD_VERSION,
     ]
-    return "|".join(parts)
+    return "|".join(_encode_field(f) for f in fields)
 
 
 def _salt() -> str:
@@ -238,11 +286,46 @@ def anchor_merkle_root(cert: Certificate) -> EvidenceRecord:
                         cert_no, root, payload, result)
 
 
+def build_batch_payload(batch) -> str:
+    """
+    生产批次的规范化原文。
+
+    ★ 与原实现等价（同样的字段、同样的顺序），但改用长度前缀编码消除 '|' 歧义。
+    抽成独立函数是为了让「存证」与「核验」共用同一实现 —— 否则两处各写一份
+    拼接逻辑，一改一漏就会出现「存的时候用 A 格式、验的时候用 B 格式」，
+    导致验真永远失败。
+    """
+    fields = [
+        batch.batch_no,
+        batch.producer.name if batch.producer_id else "",
+        batch.product_name,
+        batch.harvest_date,
+        batch.weight_kg,
+        BATCH_PAYLOAD_VERSION,
+    ]
+    return "|".join(_encode_field(f) for f in fields)
+
+
+def build_report_payload(report) -> str:
+    """
+    检测报告的规范化原文。
+
+    ★ 安全审计相关：报告的**结论（conclusion）**是决定农产品能否流通的事实依据，
+    必须参与哈希 —— 否则「先按合格存证，事后偷偷改成不合格」不会被发现。
+    原实现已含 conclusion，这里保持并统一编码方式。
+    """
+    fields = [
+        report.report_no,
+        report.batch.batch_no if report.batch_id else "",
+        report.conclusion,
+        report.test_date,
+        REPORT_PAYLOAD_VERSION,
+    ]
+    return "|".join(_encode_field(f) for f in fields)
+
+
 def anchor_batch(batch) -> EvidenceRecord:
-    payload = "|".join([
-        batch.batch_no, batch.producer.name if batch.producer_id else "",
-        batch.product_name, _fmt(batch.harvest_date), _fmt(batch.weight_kg),
-    ])
+    payload = build_batch_payload(batch)
     digest = sha256_hex(payload)
     result = _anchor(digest, payload, EvidenceRecord.BizType.BATCH,
                      batch.id, batch.batch_no)
@@ -261,10 +344,7 @@ def anchor_report(report) -> EvidenceRecord:
       - report_hash          = 当前内容哈希（可变，随内容更新）
       - EvidenceRecord 历史版本 = 各时点的锚定摘要（不可变，可回溯）
     """
-    payload = "|".join([
-        report.report_no, report.batch.batch_no if report.batch_id else "",
-        report.conclusion, _fmt(report.test_date),
-    ])
+    payload = build_report_payload(report)
     digest = sha256_hex(payload)
     report.report_hash = digest
     report.save(update_fields=["report_hash", "updated_at"])
@@ -381,6 +461,76 @@ def anchor_inspection(record) -> EvidenceRecord:
                         biz_no, digest, payload, result)
 
 
+def _verify_related_evidence(cert: Certificate) -> list:
+    """
+    核验合格证的关联证据（批次、检测报告）是否与各自存证摘要一致。
+
+    ★ 安全修复（审计 High）：原实现的验真只核对**证书自身摘要**，而证书摘要
+    里只含批次的 batch_no、报告的 report_no 这类「引用值」。结果是：
+      批次产地/品种、报告结论/日期/机构被改了 → 公众页展示值变了，
+      但证书摘要不变、验真仍显示「可信」—— 展示与结论脱节。
+
+    现在两重保障：
+      1. 这些字段已编码进证书摘要（改了就 current != stored）；
+      2. 本函数再对关联对象**各自的存证记录**做独立比对，用于**定位**是哪一项变了。
+
+    返回 [{kind, label, biz_no, trusted, checked, current_hash, stored_hash, message}, ...]
+
+    语义约定（重要）：
+      - checked=False 表示该关联对象**尚无存证记录**，无法独立核验。
+        ★ 这种情况**不算失败**（不参与 trusted 判定），只如实标注。
+        理由：防篡改的**主保障是「关联字段已编码进证书摘要」**——
+        字段被改，证书摘要必然变。独立核验只是「定位到具体哪一项变了」的辅助，
+        不应因为「对方还没存证」就把整张证判死。
+      - checked=True 且 trusted=False：该关联对象有存证但与当前内容不符 →
+        确定为篡改，会让整证判为不可信。
+    """
+    out = []
+
+    def _check(biz_type, obj, kind, label):
+        if obj is None:
+            return
+        rec = EvidenceRecord.objects.filter(
+            biz_type=biz_type, biz_id=obj.id, is_current=True).first()
+        if rec is None or not rec.data_hash:
+            out.append({
+                "kind": kind, "label": label, "biz_no": "",
+                "checked": False, "trusted": True,
+                "current_hash": "", "stored_hash": "",
+                "message": f"{label}未单独存证，已通过合格证摘要间接校验",
+            })
+            return
+        # 用关联对象当前的规范化原文重算，与存证摘要比对
+        current = sha256_hex(_payload_for(biz_type, obj))
+        ok = current == rec.data_hash
+        out.append({
+            "kind": kind, "label": label, "biz_no": rec.biz_no,
+            "checked": True, "trusted": ok,
+            "current_hash": current, "stored_hash": rec.data_hash,
+            "message": (f"{label}与存证摘要一致" if ok
+                        else f"{label}与存证摘要不一致，可能已被篡改"),
+        })
+
+    _check(EvidenceRecord.BizType.BATCH, cert.batch if cert.batch_id else None,
+           "batch", "生产批次")
+    _check(EvidenceRecord.BizType.REPORT, cert.report if cert.report_id else None,
+           "report", "检测报告")
+    return out
+
+
+def _payload_for(biz_type: str, obj) -> str:
+    """按 biz_type 选择对应的规范化原文构造函数（供关联证据核验复用）。"""
+    if biz_type == EvidenceRecord.BizType.BATCH:
+        return build_batch_payload(obj)
+    if biz_type == EvidenceRecord.BizType.REPORT:
+        return build_report_payload(obj)
+    if biz_type == EvidenceRecord.BizType.CERTIFICATE:
+        return build_certificate_payload(obj)
+    if biz_type == EvidenceRecord.BizType.INSPECTION:
+        return build_inspection_payload(obj)
+    return ""
+
+
 def verify_certificate(cert: Certificate, check_chain: bool = False) -> dict:
     """
     验真：重算当前合格证哈希，与存证记录中的摘要比对；可选做链上二次核验。
@@ -401,21 +551,41 @@ def verify_certificate(cert: Certificate, check_chain: bool = False) -> dict:
     stored = record.data_hash if record else ""
     local_trusted = bool(stored) and (current == stored)
 
+    # ★ 安全修复（审计 High）：关联证据单独核验。
+    #   证书摘要现在已把批次/报告的关键字段编码进去（见 build_certificate_payload），
+    #   所以「改了产地/结论」本身就会让上面的 current != stored。
+    #   这里再对**关联批次、报告各自的存证记录**做一次独立比对，做到：
+    #     - 能明确告诉公众「到底是证书本身变了，还是关联的批次/报告变了」
+    #     - 若关联对象尚未存证，如实标注（不假装可信）
+    related_issues = _verify_related_evidence(cert)
+
+    # ★ 关联证据异常 → 整证判为不可信（展示值与可信结论不能脱节）
+    #   只统计「已单独存证且比对失败」的项；未存证的关联对象不参与判定
+    #   （其正确性已由证书摘要间接保障）。
+    related_trusted = all(x["trusted"] for x in related_issues)
+
     if not record:
         message = "未找到存证记录，无法验真"
-    elif local_trusted:
+    elif local_trusted and related_trusted:
         message = "数据可信：当前数据与存证摘要一致"
-    else:
+    elif not local_trusted:
         message = "数据不可信：当前数据与存证摘要不一致，可能已被篡改"
+    else:
+        bad = [x["label"] for x in related_issues
+               if x["checked"] and not x["trusted"]]
+        message = ("数据不可信：关联证据（" + "、".join(bad)
+                   + "）与存证摘要不一致，可能已被篡改")
 
     result = {
-        "trusted": local_trusted,
+        "trusted": local_trusted and related_trusted,
         "current_hash": current,
         "stored_hash": stored,
         "message": message,
         "chain_verified": False,
         "chain_detail": "",
         "revoked": False,
+        # ★ 关联证据核验明细（公众页可展示「批次 / 报告是否也被改过」）
+        "related": related_issues,
     }
 
     # ---- 第二层：链上核验（调用合约 verifyEvidence / isRevoked）----

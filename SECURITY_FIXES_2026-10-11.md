@@ -1,0 +1,212 @@
+# 安全审计修复报告
+
+> 审计时间：2026-10-11　　修复范围：柑橘合格证追溯系统
+> 项目：`源代码/backend/`（Django 5.2 + DRF）、`源代码/deploy.py`、合约 `CertificateEvidence.sol`
+
+## 总览
+
+| # | 问题 | 审计等级 | 状态 |
+| --- | --- | --- | --- |
+| 1 | 供需单跨用户修改/删除 | 高 | ✅ 已修复 |
+| 2 | 意向单回应无核验、状态可任意流转 | 高 | ✅ 已修复 |
+| 3 | 签发只查报告存在、不查结论 | 高 | ✅ 已修复 |
+| 4 | 暂停证可重新送审/签发（状态绕过） | 高 | ✅ 已修复 |
+| 5 | 验真未覆盖全部关键关联数据 | 高 | ✅ 已修复 |
+| 6 | 哈希原文 `\|` 拼接可致歧义碰撞 | 中 | ✅ 已修复 |
+| 7 | 合约写入接口无权限控制、重复写清作废态 | 中高 | ✅ 已修复（v3.0） |
+| 8 | 演示账号口令写在代码/文档 | 中高 | ✅ 已修复 |
+| 9 | 部署脚本自动信任未知 SSH 主机密钥 | 中 | ✅ 已修复 |
+| 10 | 前端 JWT 存 localStorage | 建议评估 | ⚠️ 缓解（CSP + 时效收紧） |
+| 11 | OCR 同步处理可被拖垮 | 建议评估 | ✅ 已加固（总时限） |
+
+**回归测试**：229 → **257**（新增 28 个安全回归测试），全部通过。
+
+---
+
+## 高危问题
+
+### #1 供需单越权写（`views.py`）
+
+**漏洞**：`SupplyDemandViewSet.scope_queryset` 为支持「浏览对方公开单」，返回范围
+包含对方发布的单；而通用 `update/partial_update/destroy` **直接复用这份范围**，
+`CanTrade` 只校验角色不校验归属 → 种植主体可改/删买家求购单，反之亦然。
+
+**修复**：`get_queryset` 中按 action 收紧 —— 写动作只保留 `publisher=当前用户`。
+- 浏览/匹配/发起对接的授权**不变**（业务需要）。
+- 取不到对象返回 404，不泄露「该 id 存在」。
+- 管理员/监管不受限。
+
+**测试**：`SupplyDemandWriteScopeTest`（5 例，含「本人仍可改」「浏览不受影响」回归）
+
+### #2 意向单回应无鉴权（`views.py`）
+
+**漏洞**：`respond` 仅 `get_object()` 取范围内对象，未校验回应人身份：
+- 发起人 `initiator` 也在范围内 → **可替对方接受/拒绝自己的意向**；
+- 状态可任意跳转（已拒绝可改回 pending）。
+
+另发现 **`partial_update` 未拦**（原只拦了 `update`/PUT）→ PATCH 可绕过全部校验。
+
+**修复**：
+- 新增 `rules.check_intent_respond()`：状态机 + 身份校验
+  - `pending → accepted/rejected`：**仅供需单发布方**
+  - `accepted → done`：发起方或发布方确认
+  - `rejected` / `done` 为终态
+- 补 `partial_update` 拦截（405）。
+
+**测试**：`MatchIntentRespondAuthTest`（5 例）
+
+### #3 签发不校验报告结论（`views.py`）
+
+**漏洞**：单张 `issue` 与 `batch_issue` 均只判断 `report_id` 是否存在；
+**不合格报告也能签发**。且未校验报告是否属于同一批次。
+
+**修复**：抽出 `rules.check_cert_issue()`，**单张与批量共用**：
+1. 状态可签发（draft / pending / issued 幂等重签）
+2. 必须有关联报告
+3. **报告结论必须为「合格」**
+4. **报告与本证必须同批次**
+5. 批次必须有生产主体
+
+**测试**：`CertIssueReportConclusionTest`（5 例，含批量入口）
+
+### #4 暂停证状态绕过（`views.py`）
+
+**漏洞**：`submit` 显式允许 `SUSPENDED → PENDING`；`issue` 又未限制来源状态
+→ **被暂停的证可重新变为已签发**，与「整改后原证作废（终态）」的设计冲突。
+
+**修复**：状态机集中到 `rules.py`（唯一来源）：
+
+```
+draft     → pending
+pending   → issued / draft / revoked
+issued    → suspended / revoked
+suspended → revoked          ← 只能走整改→作废，不可回退
+revoked   → （终态）
+```
+
+`submit` 明确拒绝 suspended（并给出整改流程指引）；`issue` 只允许 `draft/pending/issued`。
+
+**测试**：`CertStateMachineTest` + `CertIssueReportConclusionTest`（暂停证送审/签发各一例）
+
+### #5 验真未覆盖关联数据（`services.py` / `views.py`）
+
+**漏洞**：证书摘要只含「批次编号、报告编号」这类**引用值**；批次产地/品种、
+报告结论/日期/机构被改，**证书摘要不变、验真仍显可信**，而公众页展示值已变。
+
+**修复**（双重保障）：
+1. **关联字段纳入摘要**：`build_certificate_payload` 现编码批次的
+   `batch_no/product_name/variety/origin/weight_kg` 与报告的
+   `report_no/conclusion/test_org/test_date` → 任一被改，摘要必变。
+2. **独立核验定位**：新增 `_verify_related_evidence()`，对批次/报告**各自的存证记录**
+   做独立比对，返回 `related[]` 明细，公开验真接口透出 `related_evidence` 字段。
+   - 已单独存证且不符 → 整证判不可信；
+   - **未单独存证 → `checked=false`，不参与判定**（正确性已由摘要间接保障，避免误伤）。
+
+**测试**：`VerifyRelatedEvidenceTest`（4 例）+ `test_batch_tamper_makes_cert_untrusted`
+
+---
+
+## 中高危问题
+
+### #6 哈希拼接歧义（`services.py`）
+
+**漏洞**：`"|".join([...])` 未转义字段 → `("张三|李四","柑橘")` 与
+`("张三","李四|柑橘")` 拼出**相同原文**，语义已变而摘要不变。
+
+**修复**：改为**长度前缀编码** `<字符数>:<内容>`（netstring），边界由长度判定，
+字段含任何字符（含 `|`、换行）都不歧义。批次/报告/合格证三处统一。
+末尾追加格式版本号（`CERT/BATCH/REPORT_PAYLOAD_VERSION = "v2"`）便于识别历史数据。
+
+**测试**：`test_payload_no_delimiter_ambiguity`
+
+### #7 合约写入权限与覆盖（`CertificateEvidence.sol` v3.0）
+
+**漏洞**：
+- `addEvidence` / `revokeEvidence` 均为 **public**，任何地址可写；
+- **重复 `addEvidence` 会覆盖**并把 `revoked` 重置为 `false`
+  → 已作废的证可被「重复写入复活」；
+- 根 README 称「重复调用会 revert」，与实现不符。
+
+**修复**：
+- 新增 `owner` + `writers` 白名单，`onlyWriter` 修饰器；
+  `setWriter()` / `transferOwnership()` 仅 owner 可调。
+- `addEvidence` **已存在则 revert**；
+- 新增 `updateEvidence()` 供合法重存证，**保留 revoked/revokedAt/revokeReason**，
+  版本号 +1；新增 `EvidenceUpdated` 事件。
+- 后端 `chain.send_evidence()` 改为**先查存在性**决定 add / update。
+- README 同步更正。合约版本 → `v3.0`。
+
+**部署注意**：需重新部署合约并更新 `FISCO_CONTRACT_ADDRESS`，随后跑 `rehash_all`。
+
+### #8 演示账号口令（`init_data.py` / README）
+
+**漏洞**：五类角色账号口令 `admin123` 硬编码在命令与两处 README；
+若生产误跑且未改密 → 直接可登录。
+
+**修复**：
+- **生产闸门**：`DEBUG=False` 时 `init_data` 默认 `CommandError` 拒绝，
+  需显式 `--force`（并警告）。
+- **口令不落源码**：优先读环境变量 `DEMO_PASSWORD`；未设置则
+  `secrets.token_urlsafe(12)` 生成随机口令并**只打印一次**；
+  若模型有 `must_change_password` 则置位强制首改。
+- 两处 README 删去明文口令，改为说明获取方式。
+
+**测试**：`InitDataSafetyTest`（2 例，含源码扫描 `admin123` 防回归）
+
+---
+
+## 中危问题
+
+### #9 部署脚本信任未知主机密钥（`deploy.py`）
+
+**漏洞**：`AutoAddPolicy()` 无条件接受任何主机密钥 → 中间人可冒充服务器，
+把 `.env`（含 DB 口令 / JWT 密钥 / 存证私钥）连同代码全部收走。
+
+**修复**：新增 `_host_key_policy()`，三种放行方式，**无默认信任**：
+1. `CITRUS_SSH_HOST_FINGERPRINT`（`SHA256:...`）—— 指纹白名单，不符即拒；
+2. `known_hosts` 严格校验（`RejectPolicy`）—— 未登记即拒；
+3. `CITRUS_SSH_TRUST_NEW=1` —— 显式临时放行（打印风险提示）。
+
+拒绝时输出中文指引（含 `ssh-keyscan` 命令）。
+
+**实测**：① 未知主机 → 拒绝；② 正确指纹 → 放行；③ 错误指纹 → 拒绝并报出实际指纹。
+
+---
+
+## 建议评估项
+
+### #10 前端 JWT 存 localStorage
+
+**现状**：token 存 localStorage，XSS 或依赖投毒时可被读取外传。
+
+**决策**：不改架构（改 HttpOnly Cookie 需重写整条认证链，风险大于收益）。
+采用**低成本高收益缓解**：
+- 新增 `ContentSecurityPolicyMiddleware`，支持 `DJANGO_CSP=1` 开启 CSP：
+  `script-src 'self'`（注入脚本不执行）、`connect-src 'self'`（难以外传 token）、
+  `object-src 'none'`、`base-uri 'self'`。
+- 默认关闭（本地 Vite 开发需 eval/内联，不受影响）。
+- JWT 时效此前已加固：access 2h、refresh 7d、轮换 + 黑名单。
+
+**生产启用**：`.env` 加 `DJANGO_CSP=1`（**上线前需实测前端无 inline script 依赖**）。
+
+### #11 OCR 同步处理拖垮 worker
+
+**现状**：已有单图/单页上限（40MP、3 页、dpi 200），但多页累加仍可能长时间占住
+gunicorn worker。
+
+**修复**：新增进程级**整单总时限** `OCR_TOTAL_BUDGET_SECONDS`（默认 90s）：
+- 每页识别前检查截止时间，超时**立即停止后续页**；
+- 已识别部分照常返回，并在 `warnings` 明确告知「超时未处理完，请手工补录」；
+- 超预算时**不进入**重 OCR 分支（保护 worker）。
+
+**测试**：`OcrBudgetTest`（3 例）
+
+---
+
+## 上线前检查清单
+
+- [ ] 重新部署合约（v3.0）并更新 `FISCO_CONTRACT_ADDRESS`，跑 `manage.py rehash_all`
+- [ ] 生产 `.env` 设 `DJANGO_CSP=1` 并实测前端正常
+- [ ] 确认服务器 `known_hosts` 已登记（或在部署环境设指纹变量）
+- [ ] 修改所有演示账号口令（若线上存在）
+- [ ] 因哈希原文格式升级（`v2`），线上需**重新存证**（`rehash_all`）后再对外验真

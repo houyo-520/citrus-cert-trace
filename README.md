@@ -415,24 +415,39 @@ FISCO_ENABLE_CHAIN=true
   保证无链环境也能正常开发演示（`.env` 里设 `FISCO_ENABLE_CHAIN=false` 可强制模拟）。
 - 部署细节见项目根目录 `FISCO_BCOS部署说明.md`。
 
-### 存证合约接口
+### 存证合约接口（v3.0）
 
 | 函数 | 说明 |
 | --- | --- |
-| `addEvidence(bizType, bizNo, dataHash)` | 写入存证（**同编号重复调用会 revert**，天然防重复存证） |
-| `getEvidence(bizType, bizNo)` | 读取存证（摘要/时间/操作人/区块高度） |
-| `verifyEvidence(bizType, bizNo, dataHash)` | 验真比对，返回 `(matched, exists)` |
-| `totalEvidence()` / `version()` | 存证总数 / 合约版本 |
+| `addEvidence(bizType, bizNo, dataHash)` | 新增存证。**已存在同编号则 revert**（不再静默覆盖）；仅白名单可调用 |
+| `updateEvidence(bizType, bizNo, dataHash)` | 更新摘要（合法重存证），**保留 revoked 标记**，版本号 +1 |
+| `revokeEvidence(bizType, bizNo, reason)` | 撤销（作废双向上链），不删记录只打标记 |
+| `getEvidence(...)` / `verifyEvidence(...)` / `isRevoked(...)` | 读取 / 验真 / 查撤销 |
+| `setWriter(addr, bool)` / `transferOwnership(addr)` | 写入者白名单管理（仅 owner） |
+| `totalEvidence()` / `version()` | 存证总数 / 合约版本（v3.0） |
+
+> ★ **v3.0 安全加固**：`addEvidence` / `revokeEvidence` 由 `public` 改为**仅白名单可调**，
+> 并禁止重复写入覆盖（原实现重复 addEvidence 会把 `revoked` 重置为 false，
+> 等于「已作废的证可被重复写入复活」）。业务侧重存证改走 `updateEvidence`。
 
 ## 七、默认账号
 
-| 账号 | 密码 | 角色 | 说明 |
-| --- | --- | --- | --- |
-| admin | admin123 | 系统管理员 | 全量可见 + 全部操作 |
-| regulator | admin123 | 监管人员 | 全量可见 + 审核/签发/作废 |
-| producer | admin123 | 种植主体 | 仅自己数据；可存证、发供需、发起对接 |
-| producer2 | admin123 | 种植主体 | 第二个主体账号，**用于演示数据隔离** |
-| buyer | admin123 | 收购商 | 仅已审核主体 + 已签发合格证；可发供需、发起对接 |
+⚠️ **演示账号口令不再硬编码在源码中**（2026-10-11 安全加固）。
+
+| 账号 | 角色 | 说明 |
+| --- | --- | --- |
+| admin | 系统管理员 | 全量可见 + 全部操作 |
+| regulator | 监管人员 | 全量可见 + 审核/签发/作废 |
+| producer | 种植主体 | 仅自己数据；可存证、发供需、发起对接 |
+| producer2 | 种植主体 | 第二个主体账号，**用于演示数据隔离** |
+| buyer | 收购商 | 仅已审核主体 + 已签发合格证；可发供需、发起对接 |
+
+口令来源（二选一）：
+- 设置环境变量 `DEMO_PASSWORD` 指定统一口令；
+- 或直接跑 `python manage.py init_data`，命令会**生成随机口令并打印一次**。
+
+> ★ 生产环境（`DEBUG=False`）下 `init_data` **默认拒绝执行**，需显式加 `--force`。
+> 演示账号创建后应**立即修改口令**。
 
 > 用 producer 与 producer2 分别登录，可直观看到"各自只看到自己的主体/批次/日志"；
 > 用 buyer 登录则看到"仅已审核通过的主体 + 仅已签发的合格证"。
@@ -533,6 +548,17 @@ python deploy.py all          # 或分步：upload / setup / migrate / service /
 
 > ⚠️ `deploy.py upload` 的 skip 集合必须包含 `db.sqlite3` 与 `.env`，
 > 否则本地演示库会覆盖服务器生产数据。
+
+> ★ **SSH 主机密钥校验**（2026-10-11 安全加固）：`deploy.py` 不再无条件信任未知主机密钥。
+> 未配置时走 `known_hosts` 严格校验，未登记即拒绝连接。三选一放行：
+> ```bash
+> # ① 登记到 known_hosts（推荐；先核对指纹再追加）
+> ssh-keyscan -p <端口> <主机> >> ~/.ssh/known_hosts
+> # ② 指纹白名单
+> export CITRUS_SSH_HOST_FINGERPRINT=SHA256:xxxx
+> # ③ 仅限可信网络的临时放行（有中间人风险）
+> export CITRUS_SSH_TRUST_NEW=1
+> ```
 
 手动部署方式：
 

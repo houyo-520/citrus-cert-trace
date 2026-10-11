@@ -7,11 +7,24 @@
 - 产生操作日志（审计演示）
 
 幂等：已有业务数据时不删库，只做增量补全（_top_up）。
+
+★ 安全加固（2026-10-11 审计 Medium-High）：
+  1. **生产环境默认拒绝执行**（DEBUG=False 且未显式确认时直接退出）。
+     演示账号是固定口令，若在生产误跑且未改密，等于留了后门。
+     确需在生产初始化演示数据，须显式加 `--force` 并自行承担风险。
+  2. 演示口令**不再硬编码在源码里**，改为：
+     - 优先读环境变量 `DEMO_PASSWORD`；
+     - 未设置时生成**随机口令**并打印到控制台（一次性），
+       同时标记 `must_change_password`，强制首次登录修改。
+  3. 随机口令只在「用户新建」时使用；已存在用户不动（幂等）。
 """
+import os
+import secrets
 from datetime import date, datetime, timedelta
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandError
 
 from apps.traceability import certno, services
 from apps.traceability.models import (Certificate, InspectionRecord, MatchIntent,
@@ -20,12 +33,13 @@ from apps.traceability.models import (Certificate, InspectionRecord, MatchIntent
 
 User = get_user_model()
 
+# ★ 演示账号清单：口令不再写死，见 _resolve_demo_password()
 USERS = [
-    ("admin", "admin123", "admin", "系统管理员", "平台运营中心"),
-    ("regulator", "admin123", "regulator", "监管人员", "县农业农村局"),
-    ("producer", "admin123", "producer", "种植主体", "橙心柑橘种植合作社"),
-    ("producer2", "admin123", "producer", "种植主体", "甜蜜蜜家庭农场"),
-    ("buyer", "admin123", "buyer", "收购商", "鲜果汇供应链"),
+    ("admin", None, "admin", "系统管理员", "平台运营中心"),
+    ("regulator", None, "regulator", "监管人员", "县农业农村局"),
+    ("producer", None, "producer", "种植主体", "橙心柑橘种植合作社"),
+    ("producer2", None, "producer", "种植主体", "甜蜜蜜家庭农场"),
+    ("buyer", None, "buyer", "收购商", "鲜果汇供应链"),
 ]
 
 # 行政区划代码（编号前 6 位）
@@ -38,7 +52,25 @@ REGION_CODES = {
 class Command(BaseCommand):
     help = "初始化演示数据"
 
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "--force", action="store_true",
+            help="在非 DEBUG 环境也允许执行（危险：会创建演示账号）",
+        )
+
     def handle(self, *args, **options):
+        # ★ 生产环境闸门：DEBUG=False 且未 --force 时拒绝执行
+        if not settings.DEBUG and not options.get("force"):
+            raise CommandError(
+                "当前为生产环境（DEBUG=False），init_data 会创建固定角色的演示账号，"
+                "存在被直接登录的风险，已拒绝执行。\n"
+                "  如确需执行，请显式加 --force，并务必随后修改所有演示账号口令。"
+            )
+        if not settings.DEBUG:
+            self.stdout.write(self.style.WARNING(
+                "⚠️  正在生产环境执行演示数据初始化（--force），请务必尽快修改演示账号口令！"))
+
+        self._demo_password = self._resolve_demo_password()
         self._create_users()
         if Certificate.objects.exists():
             # 已有业务数据：不清库，只做幂等补全（适配老数据升级到新功能）
@@ -47,8 +79,10 @@ class Command(BaseCommand):
         else:
             self._create_business_data()
         self.stdout.write(self.style.SUCCESS("演示数据初始化完成！"))
-        self.stdout.write("默认账号：admin / regulator / producer / producer2 / buyer，"
-                          "密码均为 admin123")
+        self.stdout.write("默认账号：admin / regulator / producer / producer2 / buyer")
+        self.stdout.write(self.style.WARNING(
+            "口令请见上面输出的演示口令（或环境变量 DEMO_PASSWORD）；"
+            "首次登录后请立即修改。"))
 
     def _top_up(self):
         """
@@ -272,8 +306,26 @@ class Command(BaseCommand):
         self.stdout.write("  已补充监督检查记录 3 条（合格1 / 已整改1 / 逾期1，"
                           "并联动暂停 1 张合格证）")
 
+    def _resolve_demo_password(self) -> str:
+        """
+        决定演示账号口令（安全加固）：
+          - 优先读环境变量 DEMO_PASSWORD（便于答辩/演示时统一指定）；
+          - 未设置则生成随机强口令，并**只打印这一次**。
+        ★ 不再把口令硬编码在源码里 —— 源码/文档中不再出现任何可用口令。
+        """
+        pw = os.environ.get("DEMO_PASSWORD", "").strip()
+        if pw:
+            self.stdout.write(f"  使用环境变量 DEMO_PASSWORD 指定的演示口令")
+            return pw
+        pw = secrets.token_urlsafe(12)
+        self.stdout.write(self.style.WARNING(
+            f"  ⚠️ 未设置 DEMO_PASSWORD，已生成随机演示口令（仅显示本次）：{pw}"))
+        return pw
+
     def _create_users(self):
-        for username, password, role, _, org in USERS:
+        demo_pw = getattr(self, "_demo_password", None) or self._resolve_demo_password()
+        created_any = False
+        for username, _pw, role, _, org in USERS:
             user, created = User.objects.get_or_create(
                 username=username,
                 defaults={"role": role, "org_name": org,
@@ -281,9 +333,16 @@ class Command(BaseCommand):
                           "is_superuser": role == "admin"},
             )
             if created:
-                user.set_password(password)
+                user.set_password(demo_pw)
+                # ★ 标记强制首次修改口令（若 User 模型支持该字段）
+                if hasattr(user, "must_change_password"):
+                    user.must_change_password = True
                 user.save()
+                created_any = True
                 self.stdout.write(f"  创建用户 {username} ({role})")
+        if created_any:
+            self.stdout.write(self.style.WARNING(
+                "  ⚠️ 演示账号已创建，请首次登录后立即修改口令！"))
 
     def _create_business_data(self):
         producer_user = User.objects.filter(username="producer").first()

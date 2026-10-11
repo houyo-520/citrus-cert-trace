@@ -24,6 +24,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 
 from django.conf import settings
 
@@ -42,6 +43,14 @@ MAX_PDF_PAGES = _limit("OCR_MAX_PDF_PAGES", 3)
 MAX_PDF_DPI = _limit("OCR_MAX_PDF_DPI", 200)
 MAX_PDF_RENDER_PIXELS = _limit("OCR_MAX_PDF_RENDER_PIXELS", 40_000_000)
 OCR_TIMEOUT = _limit("OCR_TIMEOUT_SECONDS", 60)
+
+# ★ 单次识别的**全局总时限**（2026-10-11 安全审计加固）。
+#   背景：原实现只对「单页 OCR」设超时，但一份 PDF 最多 3 页，若每页都接近上限，
+#   总耗时可达 3×上限 —— 同步接口长期占住 gunicorn worker，几个并发请求就能
+#   把 worker 池打满（表现为整站变慢/超时）。
+#   这里再加一道「整单截止时间」：超时后停止后续处理，已识别的部分照常返回，
+#   并在 warnings 里明确告知用户「因超时未处理完，请手工补录」。
+TOTAL_BUDGET_SECONDS = _limit("OCR_TOTAL_BUDGET_SECONDS", 90)
 
 # 检测报告常见字段的取值模式
 # 说明：中文报告里「合格」是「不合格」的子串，匹配顺序必须让「不合格」优先，
@@ -374,6 +383,11 @@ def extract_from_file(filename: str, data: bytes) -> dict:
     ext = os.path.splitext(filename or "")[1].lower()
     warnings = []
     text, method = "", ""
+    # ★ 整单截止时间（审计加固）：多页/多步累加超时保护。
+    deadline = time.monotonic() + TOTAL_BUDGET_SECONDS
+
+    def _over_budget() -> bool:
+        return time.monotonic() > deadline
 
     if not data:
         return {"method": "failed", "ok": False, "fields": {}, "filled": [],
@@ -383,7 +397,7 @@ def extract_from_file(filename: str, data: bytes) -> dict:
     if ext == ".pdf":
         # 第一层：文本层
         text, method = extract_text_from_pdf(data)
-        if not method:
+        if not method and not _over_budget():
             # 第二层：扫描件 → 渲染成图再 OCR
             images = render_pdf_to_images(data)
             if not images:
@@ -391,14 +405,28 @@ def extract_from_file(filename: str, data: bytes) -> dict:
                         "confidence": "low",
                         "warnings": ["PDF 无法解析（可能已加密或损坏），请手工录入"],
                         "text_excerpt": ""}
-            chunks = [ocr_image(img) for img in images]
+            # ★ 逐页识别，每页前检查总时限；超时立即停止后续页
+            chunks = []
+            for idx, img in enumerate(images):
+                if _over_budget():
+                    warnings.append(
+                        f"识别超时（已处理 {idx}/{len(images)} 页），"
+                        "请手工补录剩余内容")
+                    break
+                chunks.append(ocr_image(img))
             text = "\n".join(chunks).strip()
             method = "ocr-pdf" if text else ""
             warnings.append("该 PDF 无文本层（扫描件），已用 OCR 识别，建议逐项核对")
+        elif not method and _over_budget():
+            # 文本层尝试就已超时：不进入重 OCR，直接如实告知
+            warnings.append("识别超时，未能完成扫描件 OCR，请手工录入")
     elif ext in (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"):
-        text, method = extract_text_from_image(data)
-        if method:
-            warnings.append("图片识别结果可能存在误差，请核对后再保存")
+        if _over_budget():
+            warnings.append("识别超时，未能完成图片 OCR，请手工录入")
+        else:
+            text, method = extract_text_from_image(data)
+            if method:
+                warnings.append("图片识别结果可能存在误差，请核对后再保存")
     else:
         return {"method": "failed", "ok": False, "fields": {}, "filled": [],
                 "confidence": "low",

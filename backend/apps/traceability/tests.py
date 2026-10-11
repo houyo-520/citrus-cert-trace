@@ -115,11 +115,68 @@ class HashConsistencyTest(BaseFixture):
         self.assertEqual(record.biz_no, self.cert.cert_no)
 
     def test_payload_field_order_stable(self):
-        """规范化原文的字段顺序必须固定（顺序变了哈希就变）"""
+        """规范化原文的字段顺序必须固定（顺序变了哈希就变）
+
+        ★ 编码升级（安全审计）：字段改用「长度前缀」编码 `<len>:<内容>`，
+        所以断言时要把前缀剥掉再看字段值。
+        """
         payload = services.build_certificate_payload(self.cert)
         parts = payload.split("|")
-        self.assertEqual(parts[0], self.cert.cert_no)
-        self.assertEqual(parts[2], self.cert.product_name)
+
+        def value_of(seg):
+            """把 '13:CERT-TEST-001' 还原为 'CERT-TEST-001'。"""
+            _, _, content = seg.partition(":")
+            return content
+
+        self.assertEqual(value_of(parts[0]), self.cert.cert_no)
+        self.assertEqual(value_of(parts[2]), self.cert.product_name)
+        # 末尾必须是格式版本号，便于历史数据识别与迁移
+        self.assertEqual(value_of(parts[-1]), services.CERT_PAYLOAD_VERSION)
+
+    def test_payload_no_delimiter_ambiguity(self):
+        """★ 安全回归（审计 Medium）：字段含 '|' 不得造成边界歧义。
+
+        反例：原实现直接 '|'.join(['张三|李四', '柑橘']) 与
+              '|'.join(['张三', '李四|柑橘']) 会得到**完全相同**的原文，
+              但语义已变。改用长度前缀后，两者必须算出不同原文/不同哈希。
+        """
+        from apps.traceability.models import Certificate
+
+        c1 = Certificate.objects.create(
+            batch=self.batch, report=self.report,
+            cert_no="C-A|B", producer_name="X", product_name="Y",
+            quantity_kg=Decimal("1.00"),
+            status=Certificate.Status.DRAFT)
+        c2 = Certificate.objects.create(
+            batch=self.batch, report=self.report,
+            cert_no="C-A", producer_name="B|X", product_name="Y",
+            quantity_kg=Decimal("1.00"),
+            status=Certificate.Status.DRAFT)
+        # 字段内容被「挪」到相邻字段，但拼接后语义不同 —— 摘要必须不同
+        self.assertNotEqual(services.build_certificate_payload(c1),
+                            services.build_certificate_payload(c2))
+        self.assertNotEqual(services.compute_certificate_hash(c1),
+                            services.compute_certificate_hash(c2))
+
+    def test_payload_includes_related_batch_and_report(self):
+        """★ 安全回归（审计 High）：关联批次/报告的关键字段必须进证书摘要。
+
+        否则「改了批次产地 / 报告结论」不会让证书摘要变化，公众页展示值与
+        「可信」结论脱节。
+        """
+        before = services.compute_certificate_hash(self.cert)
+        # 改批次产地（公众页会展示）
+        self.batch.origin = "新疆和田"
+        self.batch.save(update_fields=["origin"])
+        after_origin = services.compute_certificate_hash(self.cert)
+        self.assertNotEqual(before, after_origin, "批次产地变化必须影响证书摘要")
+
+        # 改报告结论（决定能否流通）
+        self.report.conclusion = "unqualified"
+        self.report.save(update_fields=["conclusion"])
+        after_concl = services.compute_certificate_hash(self.cert)
+        self.assertNotEqual(after_origin, after_concl,
+                            "报告结论变化必须影响证书摘要")
 
 
 # ===============================================================
@@ -1360,15 +1417,26 @@ class BatchIssueTest(BaseFixture):
     """
 
     def _make_pending(self, n, with_report=True, prefix="BATCH-P"):
-        """造 n 张待审核的合格证（可控制是否有检测报告）"""
+        """造 n 张待审核的合格证（可控制是否有检测报告）
+
+        ★ 安全修复（审计 High）后：签发要求「报告与合格证属于同一批次」，
+        所以这里必须为**每个新批次**配一份属于它自己的合格报告，
+        不能再图省事直接复用 self.report（那会构成跨批次引用，被 rules 拦下）。
+        """
         out = []
         for i in range(n):
             b = ProductBatch.objects.create(
                 batch_no=f"{prefix}-{i}", producer=self.producer_obj,
                 product_name="柑橘", variety="砂糖橘", origin="新疆阿克苏",
                 weight_kg=Decimal("1000.00"))
+            rep = None
+            if with_report:
+                rep = TestReport.objects.create(
+                    report_no=f"{prefix}-R-{i}", batch=b, test_org="阿克苏检测中心",
+                    test_date=date(2026, 9, 5),
+                    conclusion=TestReport.Conclusion.QUALIFIED)
             out.append(Certificate.objects.create(
-                batch=b, report=self.report if with_report else None,
+                batch=b, report=rep,
                 product_name="柑橘", quantity_kg=Decimal("1000.00"),
                 status=Certificate.Status.PENDING))
         return out
@@ -3083,3 +3151,317 @@ class TodayLocalRobustnessTest(BaseFixture):
             self.skipTest("本环境无 tzdata，跳过")
         self.assertEqual(certno.today_local(),
                          datetime.now(ZoneInfo(s.TIME_ZONE)).date())
+
+
+# ===============================================================
+# ★ 第四批安全加固回归（2026-10-11 安全审计修复）
+#
+# 对应审计结论：
+#   高：供需单越权写 / 意向单回应无鉴权 / 签发不校验结论 /
+#       暂停证状态绕过 / 验真未覆盖关联数据
+#   中高：合约写入权限与覆盖 / 演示账号固定口令 / 部署脚本主机密钥
+#   中：哈希拼接歧义
+# ===============================================================
+class SupplyDemandWriteScopeTest(BaseFixture):
+    """审计 High：供需单写操作必须只作用于自己发布的单。"""
+
+    def setUp(self):
+        # 买家发一条求购单；种植主体发一条供应单
+        self.demand = SupplyDemand.objects.create(
+            kind=SupplyDemand.Kind.DEMAND, title="求购砂糖橘",
+            product_name="柑橘", quantity_kg=Decimal("1000.00"),
+            publisher=self.buyer)
+        self.supply = SupplyDemand.objects.create(
+            kind=SupplyDemand.Kind.SUPPLY, title="供应砂糖橘",
+            product_name="柑橘", quantity_kg=Decimal("1000.00"),
+            publisher=self.producer)
+
+    def test_producer_cannot_modify_buyer_demand(self):
+        """★ 种植主体不能改买家的求购单（原漏洞：可见即可改）"""
+        c = self.login(self.producer)
+        r = c.patch(f"/api/supply/{self.demand.id}/",
+                    {"title": "被恶意改标题"}, format="json")
+        self.assertIn(r.status_code, (403, 404),
+                      "种植主体不应能修改他人的求购单")
+        self.demand.refresh_from_db()
+        self.assertEqual(self.demand.title, "求购砂糖橘", "原标题不得被改")
+
+    def test_producer_cannot_delete_buyer_demand(self):
+        """★ 种植主体不能删买家的求购单"""
+        c = self.login(self.producer)
+        r = c.delete(f"/api/supply/{self.demand.id}/")
+        self.assertIn(r.status_code, (403, 404))
+        self.assertTrue(SupplyDemand.objects.filter(id=self.demand.id).exists())
+
+    def test_buyer_cannot_modify_others_supply(self):
+        """★ 收购商不能改他人的供应单"""
+        c = self.login(self.buyer)
+        r = c.patch(f"/api/supply/{self.supply.id}/",
+                    {"title": "被恶意改标题"}, format="json")
+        self.assertIn(r.status_code, (403, 404))
+        self.supply.refresh_from_db()
+        self.assertEqual(self.supply.title, "供应砂糖橘")
+
+    def test_owner_can_still_modify_own(self):
+        """回归：本人仍然可以改自己的单（修复不能误伤正常功能）"""
+        c = self.login(self.producer)
+        r = c.patch(f"/api/supply/{self.supply.id}/",
+                    {"title": "自己的单正常改"}, format="json")
+        self.assertEqual(r.status_code, 200)
+        self.supply.refresh_from_db()
+        self.assertEqual(self.supply.title, "自己的单正常改")
+
+    def test_public_browse_still_works(self):
+        """回归：浏览对方公开单的能力不能被削弱"""
+        c = self.login(self.producer)
+        r = c.get("/api/supply/?kind=demand")
+        self.assertEqual(r.status_code, 200)
+        ids = [x["id"] for x in r.data.get("results", r.data)]
+        self.assertIn(self.demand.id, ids, "种植主体仍应看得到买家求购单")
+
+
+class MatchIntentRespondAuthTest(BaseFixture):
+    """审计 High：意向单回应必须校验回应人身份 + 限制状态流转。"""
+
+    def setUp(self):
+        self.supply = SupplyDemand.objects.create(
+            kind=SupplyDemand.Kind.SUPPLY, title="供应砂糖橘",
+            product_name="柑橘", quantity_kg=Decimal("1000.00"),
+            publisher=self.producer)
+        self.intent = MatchIntent.objects.create(
+            supply=self.supply, initiator=self.buyer,
+            quantity_kg=Decimal("100.00"), price=Decimal("5.00"),
+            status=MatchIntent.Status.PENDING)
+
+    def test_initiator_cannot_accept_own_intent(self):
+        """★ 发起人不能替对方接受自己的意向（原漏洞）"""
+        c = self.login(self.buyer)
+        r = c.post(f"/api/intent/{self.intent.id}/respond/",
+                   {"status": "accepted"}, format="json")
+        self.assertEqual(r.status_code, 400)
+        self.intent.refresh_from_db()
+        self.assertEqual(self.intent.status, MatchIntent.Status.PENDING)
+
+    def test_publisher_can_accept(self):
+        """发布方可以接受（正常路径）"""
+        c = self.login(self.producer)
+        r = c.post(f"/api/intent/{self.intent.id}/respond/",
+                   {"status": "accepted"}, format="json")
+        self.assertEqual(r.status_code, 200)
+        self.intent.refresh_from_db()
+        self.assertEqual(self.intent.status, MatchIntent.Status.ACCEPTED)
+
+    def test_cannot_revive_rejected_intent(self):
+        """★ 已拒绝是终态，不能改回 pending（原漏洞：任意状态可跳）"""
+        self.intent.status = MatchIntent.Status.REJECTED
+        self.intent.save(update_fields=["status"])
+        c = self.login(self.producer)
+        r = c.post(f"/api/intent/{self.intent.id}/respond/",
+                   {"status": "pending"}, format="json")
+        self.assertEqual(r.status_code, 400)
+        self.intent.refresh_from_db()
+        self.assertEqual(self.intent.status, MatchIntent.Status.REJECTED)
+
+    def test_cannot_jump_pending_to_done(self):
+        """★ 不能跳过 accepted 直接 pending -> done"""
+        c = self.login(self.producer)
+        r = c.post(f"/api/intent/{self.intent.id}/respond/",
+                   {"status": "done"}, format="json")
+        self.assertEqual(r.status_code, 400)
+
+    def test_patch_is_blocked(self):
+        """★ PATCH 也必须被拦（原实现只拦了 PUT）"""
+        c = self.login(self.producer)
+        r = c.patch(f"/api/intent/{self.intent.id}/",
+                    {"status": "accepted"}, format="json")
+        self.assertEqual(r.status_code, 405)
+        self.intent.refresh_from_db()
+        self.assertEqual(self.intent.status, MatchIntent.Status.PENDING)
+
+
+class CertIssueReportConclusionTest(BaseFixture):
+    """审计 High：签发必须校验报告结论合格 + 报告同批次 + 暂停证不可签发。"""
+
+    def _cert(self, report, status=Certificate.Status.PENDING):
+        return Certificate.objects.create(
+            batch=self.batch, report=report, producer_name=self.producer_obj.name,
+            product_name="柑橘", quantity_kg=Decimal("1.00"), status=status)
+
+    def test_cannot_issue_with_unqualified_report(self):
+        """★ 不合格报告不得用于签发（原漏洞：只查 report_id 存在）"""
+        bad = TestReport.objects.create(
+            report_no="R-BAD-001", batch=self.batch, test_org="X",
+            test_date=date(2026, 9, 5),
+            conclusion=TestReport.Conclusion.UNQUALIFIED)
+        cert = self._cert(bad)
+        c = self.login(self.regulator)
+        r = c.post(f"/api/certificate/{cert.id}/issue/")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("不合格", r.data["message"])
+        cert.refresh_from_db()
+        self.assertFalse(cert.cert_no, "被拒的签发不得分配编号")
+
+    def test_cannot_issue_with_cross_batch_report(self):
+        """★ 报告必须与合格证同批次（防止张冠李戴）"""
+        other_batch = ProductBatch.objects.create(
+            batch_no="B-OTHER", producer=self.producer_obj,
+            product_name="柑橘", weight_kg=Decimal("1.00"))
+        other_report = TestReport.objects.create(
+            report_no="R-OTHER", batch=other_batch,
+            conclusion=TestReport.Conclusion.QUALIFIED)
+        cert = self._cert(other_report)
+        c = self.login(self.regulator)
+        r = c.post(f"/api/certificate/{cert.id}/issue/")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("批次", r.data["message"])
+
+    def test_batch_issue_also_checks_conclusion(self):
+        """★ 批量签发与单张签发走同一套校验（原漏洞：只堵了一个口）"""
+        bad = TestReport.objects.create(
+            report_no="R-BAD-002", batch=self.batch,
+            conclusion=TestReport.Conclusion.UNQUALIFIED)
+        cert = self._cert(bad)
+        c = self.login(self.regulator)
+        r = c.post("/api/certificate/batch-issue/", {"ids": [cert.id]},
+                   format="json")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.data["data"]["success_count"], 0)
+        self.assertEqual(r.data["data"]["fail_count"], 1)
+
+    def test_suspended_cannot_resubmit(self):
+        """★ 暂停证不能重新送审（原漏洞：suspended 可回 pending）"""
+        cert = self._cert(self.report, status=Certificate.Status.SUSPENDED)
+        c = self.login(self.producer)
+        r = c.post(f"/api/certificate/{cert.id}/submit/")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("暂停", r.data["message"])
+        cert.refresh_from_db()
+        self.assertEqual(cert.status, Certificate.Status.SUSPENDED)
+
+    def test_suspended_cannot_issue(self):
+        """★ 暂停证不能直接签发（防状态绕过）"""
+        cert = self._cert(self.report, status=Certificate.Status.SUSPENDED)
+        c = self.login(self.regulator)
+        r = c.post(f"/api/certificate/{cert.id}/issue/")
+        self.assertEqual(r.status_code, 400)
+        cert.refresh_from_db()
+        self.assertEqual(cert.status, Certificate.Status.SUSPENDED)
+
+
+class CertStateMachineTest(BaseFixture):
+    """状态机集中定义后的合法性校验（rules.py 唯一来源）。"""
+
+    def test_transition_table(self):
+        from . import rules
+        # 合法
+        self.assertTrue(rules.can_transition_cert("draft", "pending"))
+        self.assertTrue(rules.can_transition_cert("pending", "issued"))
+        self.assertTrue(rules.can_transition_cert("issued", "suspended"))
+        self.assertTrue(rules.can_transition_cert("issued", "revoked"))
+        self.assertTrue(rules.can_transition_cert("suspended", "revoked"))
+        # 非法
+        self.assertFalse(rules.can_transition_cert("suspended", "pending"))
+        self.assertFalse(rules.can_transition_cert("suspended", "issued"))
+        self.assertFalse(rules.can_transition_cert("revoked", "issued"))
+        self.assertFalse(rules.can_transition_cert("revoked", "draft"))
+
+    def test_issuable_from_excludes_suspended_revoked(self):
+        from . import rules
+        self.assertIn("draft", rules.CERT_ISSUABLE_FROM)
+        self.assertIn("pending", rules.CERT_ISSUABLE_FROM)
+        self.assertNotIn("suspended", rules.CERT_ISSUABLE_FROM)
+        self.assertNotIn("revoked", rules.CERT_ISSUABLE_FROM)
+
+
+class VerifyRelatedEvidenceTest(BaseFixture):
+    """审计 High：验真必须覆盖关联批次/报告（展示值与可信结论不能脱节）。"""
+
+    def test_related_list_present(self):
+        services.anchor_certificate(self.cert)
+        result = services.verify_certificate(self.cert)
+        kinds = {x["kind"] for x in result["related"]}
+        self.assertIn("batch", kinds)
+        self.assertIn("report", kinds)
+
+    def test_batch_tamper_makes_cert_untrusted(self):
+        """★ 改批次产地 → 证书摘要变化 → 判定不可信"""
+        services.anchor_certificate(self.cert)
+        self.assertTrue(services.verify_certificate(self.cert)["trusted"])
+        ProductBatch.objects.filter(id=self.batch.id).update(origin="被篡改的产地")
+        self.cert.refresh_from_db()
+        result = services.verify_certificate(self.cert)
+        self.assertFalse(result["trusted"], "批次被改后必须判不可信")
+
+    def test_related_batch_check_marks_checked_when_anchored(self):
+        """批次单独存证后，关联核验应标记为 checked 且 trusted"""
+        services.anchor_batch(self.batch)
+        services.anchor_certificate(self.cert)
+        result = services.verify_certificate(self.cert)
+        batch_item = next(x for x in result["related"] if x["kind"] == "batch")
+        self.assertTrue(batch_item["checked"])
+        self.assertTrue(batch_item["trusted"])
+
+    def test_related_batch_untampered_but_not_anchored(self):
+        """批次未单独存证时 checked=False，且不参与可信判定（不误伤）"""
+        services.anchor_certificate(self.cert)
+        result = services.verify_certificate(self.cert)
+        batch_item = next(x for x in result["related"] if x["kind"] == "batch")
+        self.assertFalse(batch_item["checked"])
+        self.assertTrue(batch_item["trusted"],
+                        "未单独存证不应导致不可信（已由证书摘要间接保障）")
+
+
+class InitDataSafetyTest(TestCase):
+    """审计 Medium-High：演示数据命令在生产环境必须拒绝执行。"""
+
+    def test_refuses_when_not_debug(self):
+        from django.test import override_settings
+        from io import StringIO
+        from django.core.management import call_command
+        from django.core.management.base import CommandError
+        with override_settings(DEBUG=False):
+            with self.assertRaises(CommandError) as ctx:
+                call_command("init_data", stdout=StringIO())
+            self.assertIn("生产环境", str(ctx.exception))
+
+    def test_no_hardcoded_password_in_source(self):
+        """★ 源码里不得再出现硬编码演示口令 admin123"""
+        import inspect
+        from .management.commands import init_data as mod
+        src = inspect.getsource(mod)
+        self.assertNotIn('"admin123"', src,
+                         "演示口令不得硬编码（应走 DEMO_PASSWORD 或随机生成）")
+
+
+class OcrBudgetTest(TestCase):
+    """审计『值得处理』：OCR 同步入口必须有整单总时限，避免占满 worker。"""
+
+    def test_total_budget_configurable(self):
+        from django.test import override_settings
+        from apps.traceability import ocr
+        self.assertGreater(ocr.TOTAL_BUDGET_SECONDS, 0)
+        self.assertGreaterEqual(ocr.TOTAL_BUDGET_SECONDS, ocr.OCR_TIMEOUT,
+                                "整单预算不应小于单页超时，否则单页都跑不完")
+
+    def test_over_budget_short_circuits(self):
+        """★ 已经超预算时不再进入耗时识别，直接如实告知（不假成功）"""
+        from unittest import mock
+        from apps.traceability import ocr
+        # 把预算设为 0 → 立即超时
+        with mock.patch.object(ocr, "TOTAL_BUDGET_SECONDS", 0):
+            with mock.patch.object(ocr, "extract_text_from_pdf",
+                                   return_value=("", "")) as m1, \
+                 mock.patch.object(ocr, "render_pdf_to_images",
+                                   return_value=[b"fake"]) as m2:
+                r = ocr.extract_from_file("x.pdf", b"%PDF-1.4 fake")
+        # 文本层试过一次；因为超预算，不应再渲染/OCR
+        self.assertTrue(m1.called)
+        self.assertFalse(m2.called, "超预算后不应继续渲染（保护 worker）")
+        self.assertTrue(any("超时" in w for w in r["warnings"]))
+        self.assertFalse(r["ok"])
+
+    def test_no_time_warning_when_fast(self):
+        """回归：正常快速路径不应出现任何超时提示"""
+        from apps.traceability import ocr
+        r = ocr.extract_from_file("x.txt", b"hello")   # 不支持格式
+        self.assertFalse(any("超时" in w for w in r["warnings"]))

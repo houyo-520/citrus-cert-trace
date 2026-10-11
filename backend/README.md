@@ -41,12 +41,16 @@ API 文档/根路径：http://localhost:8000/api/
 
 ## 默认账号
 
-| 账号 | 密码 | 角色 |
-| --- | --- | --- |
-| admin | admin123 | 系统管理员 |
-| regulator | admin123 | 监管人员 |
-| producer | admin123 | 种植主体 |
-| buyer | admin123 | 收购商 |
+⚠️ **口令不再硬编码**（2026-10-11 安全加固）：跑 `python manage.py init_data` 时，
+口令取自环境变量 `DEMO_PASSWORD`，未设置则**随机生成并打印一次**。
+生产环境（`DEBUG=False`）默认拒绝执行，需显式 `--force`。
+
+| 账号 | 角色 |
+| --- | --- |
+| admin | 系统管理员 |
+| regulator | 监管人员 |
+| producer / producer2 | 种植主体（producer2 用于演示数据隔离） |
+| buyer | 收购商 |
 
 ## 核心 API
 

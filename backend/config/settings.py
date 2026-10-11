@@ -84,6 +84,8 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
+    # ★ CSP 响应头（仅当 DJANGO_CSP=1 时生效）—— 防 XSS 窃取 localStorage 里的 JWT
+    "apps.accounts.middleware.ContentSecurityPolicyMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -229,6 +231,40 @@ CSRF_COOKIE_HTTPONLY = False   # 前端需读 CSRF cookie（DRF session 场景�
 SECURE_CONTENT_TYPE_NOSNIFF = True
 SECURE_REFERRER_POLICY = "strict-origin-when-cross-origin"
 X_FRAME_OPTIONS = "SAMEORIGIN"
+
+# ---------------------------------------------------------------
+# ★ CSP（内容安全策略）—— 2026-10-11 安全加固
+#
+# 背景（审计「值得处理」项）：JWT 存于 localStorage，一旦出现 XSS
+# （无论是自身代码还是被投毒的第三方依赖），token 即可被脚本读取外传。
+# 彻底方案是改 HttpOnly Cookie（牵动整条认证链，风险大）；在保持现有
+# 架构不变的前提下，CSP 是**成本最低、收益最直接**的缓解措施：
+#   - 限制脚本只能来自本站（禁 inline script 与 eval）→ 注入的 <script> 不执行
+#   - 限制外连目标（connect-src / img-src）→ 即使被 XSS 也难以把 token 外传
+#
+# ⚠️ 用环境变量开关，默认关闭：本地 `npm run dev`（Vite 需要 eval + 内联脚本，
+#    且前端在 5173 跨域调用）会被严格 CSP 打断。生产在 .env 里设
+#    `DJANGO_CSP=1` 打开。
+_CSP_ON = os.environ.get("DJANGO_CSP", "").strip().lower() in ("1", "true", "yes", "on")
+
+if _CSP_ON:
+    # 说明：
+    #   'unsafe-inline' 仅保留给 style（Element Plus 运行时注入行内样式，禁掉会白屏）
+    #   connect-src 放开 self + 联盟链 RPC（生产后端同机走 127.0.0.1，前端不直连，此处保守自限）
+    SECURE_CSP = (
+        "default-src 'self'; "
+        "script-src 'self'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: blob:; "
+        "font-src 'self' data:; "
+        "connect-src 'self'; "
+        "frame-ancestors 'self'; "
+        "base-uri 'self'; "
+        "form-action 'self'; "
+        "object-src 'none'"
+    )
+else:
+    SECURE_CSP = ""
 
 # 前端验真页地址（二维码指向）
 FRONTEND_VERIFY_BASE = os.environ.get(
