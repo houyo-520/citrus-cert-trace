@@ -90,7 +90,15 @@ def _anchor_of(biz_type: str, biz_id: int, cache=None):
         "tx_hash": rec.tx_hash,
         "block_height": rec.block_height,
         "chain_status": rec.chain_status,
-        "anchored": bool(rec.tx_hash and rec.tx_hash.startswith("0x")),
+        # ★ 第四轮审计修复（TIMELINE-ANCHOR-FAKE，高）：
+        #   原判据 `tx_hash.startswith("0x")` 挡不住降级存证 —— mock 的
+        #   tx_hash 本身就是 0x+64hex（chain.py 的 _mock_tx_hash）。
+        #   后果：同一份数据两处结论互相打脸 ——
+        #     签发接口说「本地存证（未上链）」，验真页时间轴却显示
+        #     「已上链 · 区块 #0 · 0x…」，timeline_summary.anchored_nodes 也虚高。
+        #   真正的判据是 chain_status（只有真链上成功才是 "success"），
+        #   与 services.describe_anchor 保持一致（唯一事实来源）。
+        "anchored": (rec.chain_status == "success"),
     }
 
 

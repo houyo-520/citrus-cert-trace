@@ -634,6 +634,22 @@ def verify_certificate(cert: Certificate, check_chain: bool = False) -> dict:
     # ★ 锚定状态（是否真上链）—— 与「本地一致」是两个不同的事实，必须分开表达
     anchor = describe_anchor(record)
 
+    # ★★ 第四轮审计修复（LOCAL-REVOKED-NOT-PRIORITY，高，优先级最高）：
+    #   本地「已作废」必须**优先且终局**地判定为「不可信/不可流通」，
+    #   不能只依赖链上查询结果。
+    #
+    #   原实现的漏洞链：
+    #     1. `build_certificate_payload` 字段里**没有 status** —— 作废不改变摘要，
+    #        所以 local_trusted 永远为 True；
+    #     2. `anchor_revoke` 写的是独立 bizType=REVOKE 记录，**不碰 CERTIFICATE 记录**；
+    #     3. `revoked` 只在 `chain_info.get("revoked")` 为真时才置位。
+    #   ⇒ 只要链上查询失败/降级（节点抖动、RPC 超时、ENABLE_CHAIN=False、
+    #     原存证是 mock），一张**本地已作废**的证就会回落成
+    #     `revoked=False, trusted=True` → 公众页顶部绿色「验真通过 · 数据可信」。
+    #
+    #   修法：本地状态优先，链上只作**附加证据**（只能补充、不能翻案）。
+    local_revoked = (getattr(cert, "status", None) == Certificate.Status.REVOKED)
+
     result = {
         "trusted": local_trusted and related_trusted,
         "current_hash": current,
@@ -641,7 +657,7 @@ def verify_certificate(cert: Certificate, check_chain: bool = False) -> dict:
         "message": message,
         "chain_verified": False,
         "chain_detail": "",
-        "revoked": False,
+        "revoked": local_revoked,
         # ★ 明确的锚定状态：anchored=True 才代表「链上已完成存证」
         "anchored": anchor["anchored"],
         "anchor_mode": anchor["mode"],
@@ -650,6 +666,13 @@ def verify_certificate(cert: Certificate, check_chain: bool = False) -> dict:
         # ★ 关联证据核验明细（公众页可展示「批次 / 报告是否也被改过」）
         "related": related_issues,
     }
+
+    if local_revoked:
+        # 本地终局判定：直接置不可信，并给出明确文案。
+        # 下方链上分支只允许在这个基础上**追加**信息，不得把 trusted 翻回 True。
+        result["trusted"] = False
+        result["message"] = "该合格证已作废（撤销），不可再用于流通"
+        result["revoke_source"] = "local"
 
     # ---- 第二层：链上核验（调用合约 verifyEvidence / isRevoked）----
     # ★ 原 M5：只看 tx_hash 是否 0x 开头挡不住降级存证 —— mock 的 tx_hash
@@ -672,14 +695,17 @@ def verify_certificate(cert: Certificate, check_chain: bool = False) -> dict:
                 result["trusted"] = False
                 result["chain_detail"] = chain_info["message"]
                 result["message"] = "该合格证已在链上作废（撤销），不可再用于流通"
+                if not local_revoked:
+                    result["revoke_source"] = "chain"
             else:
                 result["chain_verified"] = chain_info["matched"]
                 result["chain_detail"] = chain_info["message"]
                 if chain_info["exists"] and not chain_info["matched"]:
                     result["trusted"] = False
                     result["message"] = "数据不可信：存证记录与链上数据不一致"
-                elif result["trusted"]:
+                elif result["trusted"] and not local_revoked:
                     # ★ 链上核验通过且本地一致 → 这时才配得上「可信」的完整表述
+                    #   （★ 加 `not local_revoked` 守卫：本地已作废时不得被链上"翻案"）
                     result["message"] = ("数据可信：本地摘要一致，且已通过链上核验")
         else:
             result["chain_detail"] = f"链上查询失败：{chain_info.get('message', '未知原因')}"
@@ -688,5 +714,12 @@ def verify_certificate(cert: Certificate, check_chain: bool = False) -> dict:
         result["chain_detail"] = (
             f"未做链上核验：{anchor['detail']}。"
             "当前结论仅代表「本地摘要一致」，不含链上不可篡改保证")
+
+    # ★ 最终防线（第四轮）：本地作废是终局判定，任何分支都不得翻回 True
+    if local_revoked:
+        result["trusted"] = False
+        result["revoked"] = True
+        if result.get("revoke_source") not in ("local", "chain"):
+            result["revoke_source"] = "local"
 
     return result

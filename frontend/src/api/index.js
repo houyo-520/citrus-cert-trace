@@ -131,3 +131,6 @@ export const publicVerify = (certNo) => request.get(`/public/verify/${certNo}/`)
 
 // ---- 看板 ----
 export const getDashboard = () => request.get('/dashboard/')
+
+// ---- 修改密码（★ 第四轮：配合服务端强制改密）----
+export const changePassword = (data) => request.post('/auth/change-password/', data)

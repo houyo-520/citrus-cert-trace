@@ -124,6 +124,17 @@ request.interceptors.response.use(
       // ★ 统一走 forceLogout（内部有 loggingOut 闸门）：
       //   并发 4 个 401 同时失败时只提示/跳转一次。
       forceLogout()
+    } else if (status === 403 && error.response?.data?.must_change_password) {
+      // ★ 第四轮审计修复（FORCED-PASSWORD-CHANGE-NO-CLIENT-FLOW，中高）：
+      //   服务端 ForcePasswordChangeMiddleware 会对「待改密」账号的业务接口
+      //   返回 403 + must_change_password=true。这里识别该标记并把用户**引导**到
+      //   改密页 —— 否则账号会陷入死锁：每个页面都报错、又没有任何自救入口。
+      //   打本地标记，刷新后仍能识别（路由守卫也会用到）。
+      localStorage.setItem('must_change_password', '1')
+      if (!window.location.hash.startsWith('#/change-password')) {
+        ElMessage.warning('请先修改初始密码后再使用系统功能')
+        window.location.hash = '#/change-password?forced=1'
+      }
     } else {
       ElMessage.error(error.response?.data?.message || error.message || '网络错误')
     }

@@ -56,6 +56,9 @@ class ContentSecurityPolicyMiddleware:
 """
 import re
 
+from django.conf import settings
+from django.http import JsonResponse
+
 # 待改密用户仍可访问的路径前缀（正则）
 _PWD_ALLOW_PATTERNS = [
     r"^/api/auth/login/?$",
@@ -65,7 +68,11 @@ _PWD_ALLOW_PATTERNS = [
     r"^/api/auth/change-password/?$",
     r"^/api/auth/config/?$",
     r"^/api/public/",          # 公众验真等免登录接口
-    r"^/static/", r"^/media/", r"^/admin/",
+    r"^/static/", r"^/media/",
+    # ★ 第四轮审计（ADMIN-WHITELIST-BYPASS，低）：**不再放行 /admin/**。
+    #   项目已关闭 Django admin 路由（config/urls.py 注释掉 path("admin/")），
+    #   放行它当前没有暴露面，但若将来重开 admin，待改密用户就能绕过本中间件
+    #   直达后台。窄化白名单，只保留业务必需项。
 ]
 _PWD_ALLOW_RE = re.compile("|".join(_PWD_ALLOW_PATTERNS))
 
@@ -78,16 +85,24 @@ class ForcePasswordChangeMiddleware:
 
     def __call__(self, request):
         if self._should_block(request):
-            from rest_framework import status as drf_status
-            from rest_framework.response import Response
-            resp = Response(
+            # ★ 第四轮审计修复（FORCE-PWD-MIDDLEWARE-RESPONSE，高，已实机复现）：
+            #   原先这里返回 DRF 的 `rest_framework.response.Response` ——
+            #   但中间件短路发生在 **DRF 视图的 finalize_response 之前**，
+            #   Response 没被设置 accepted_renderer、也没 render()。
+            #   后果（实测）：403 状态行与响应头已 flush，随后 WSGI 抛
+            #     ContentNotRenderedError: The response content must be rendered
+            #     before it can be iterated over.
+            #   → 服务端每次记一条未处理异常，客户端 body 为空，
+            #     连「请先改密」的提示都到不了前端。
+            #   修法：改用 Django 原生 JsonResponse（自己完成序列化与渲染）。
+            return JsonResponse(
                 {"code": 403,
-                 "message": "您的账号处于「首次登录须修改密码」状态，请先调用 "
-                            "/api/auth/change-password/ 修改密码后再使用其他功能。",
+                 "message": "您的账号处于「首次登录须修改密码」状态，"
+                            "请先修改密码后再使用其他功能。",
                  "must_change_password": True},
-                status=drf_status.HTTP_403_FORBIDDEN)
-            resp["X-Must-Change-Password"] = "1"
-            return resp
+                status=403,
+                json_dumps_params={"ensure_ascii": False},
+                headers={"X-Must-Change-Password": "1"})
         return self.get_response(request)
 
     def _should_block(self, request) -> bool:

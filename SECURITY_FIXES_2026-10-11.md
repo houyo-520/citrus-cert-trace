@@ -369,3 +369,81 @@ UPDATE certificate SET status=<to>,... WHERE id=? AND status=<from>
    吞成 `bad-output`，表现为**渲染静默返回 0 页**（功能等于不存在）。
    教训：宽 except 会吞掉「自己忘 import」这类低级错误，调试时要打印真实异常。
 2. 子进程回传大体积结果**不要走 stdout**（管道容量/缓冲），改用临时文件。
+
+---
+
+# 第四轮审计修复
+
+> 时间：2026-10-11　　8 条（3 高 / 2 中高 / 2 中 / 1 低），其中 #1 已实机复现。
+> 测试：296 → **310**，全部通过。
+
+| 指纹 | 问题 | 等级 | 状态 |
+| --- | --- | --- | --- |
+| FORCE-PWD-MIDDLEWARE-RESPONSE | 中间件返回未渲染的 DRF Response | 高/10 | ✅ |
+| LOCAL-REVOKED-NOT-PRIORITY | 本地已作废仍可能显示可信 | 高/10 | ✅ |
+| TIMELINE-ANCHOR-FAKE | 时间轴用假哈希判「已上链」 | 高/10 | ✅ |
+| FRONTEND-VERDICT-IGNORES-ANCHOR | 前端结论条忽略 anchored | 中高/10 | ✅ |
+| FORCED-PASSWORD-CHANGE-NO-CLIENT-FLOW | 前端无改密入口（死锁）| 中高/10 | ✅ |
+| BUYER-CAN-READ-UNAPPROVED-REPORT | 买家可读未审核主体报告 | 中/9 | ✅ |
+| CERT-TRANSITION-PARTIAL-ATOMIC | 意向单回应状态不同步 | 中/9 | ✅ |
+| ADMIN-WHITELIST-BYPASS | 白名单放行 /admin/ | 低/8 | ✅ |
+
+## 关键修复
+
+### ① 中间件返回可渲染响应（高，实机复现）
+**复现结果**：状态码 403 但 `Content-Type: text/html`，WSGI 抛
+`ContentNotRenderedError`，客户端 body 为空 —— 提示语一个字都到不了前端。
+
+**根因**：中间件短路发生在 DRF 视图 `finalize_response` **之前**，`Response`
+没设 `accepted_renderer`、也没 `render()`。
+
+**修复**：改用 `django.http.JsonResponse`（自身完成序列化与渲染）+
+`json_dumps_params={"ensure_ascii": False}`（中文不转义）。
+
+**测试**：新增 3 条 —— 含**真实 Django Client 断言 content 可读且为 JSON**
+（原测试只用 DRF APIClient 查 status_code，漏掉了这个 bug）。
+
+### ② 本地作废优先（高）
+**问题**：`build_certificate_payload` 不含 `status`（作废不改摘要）+
+`anchor_revoke` 写独立 bizType 记录 → `local_trusted` 恒 True；
+`revoked` 又只在链上查询成功且返回 revoked 时才置位。
+⇒ 链抖动/降级时，**本地已作废的证会显示绿色「验真通过」**。
+
+**修复**：本地状态优先且**终局** ——
+- 计算 `local_revoked`，置 `trusted=False`、`revoked=True`、`revoke_source="local"`；
+- 链上分支只作**附加证据**，`elif result["trusted"] and not local_revoked` 守卫，
+  不允许把结论翻回 True；
+- **函数末尾再加一道最终防线**（任何分支后强制 `trusted=False`）。
+
+### ③ 时间轴锚定判据（高）
+`timeline._anchor_of` 原用 `tx_hash.startswith("0x")` —— mock 的假哈希
+本身就是 `0x`+64hex，于是同一份数据两处结论互相打脸（签发说「未上链」、
+时间轴说「已上链」）。改为 `chain_status == "success"`，与
+`services.describe_anchor` 统一（并加「两处结论必须一致」的测试）。
+
+### ④ 前端结论条接入 anchored（中高）
+- 绿色（数据可信）需 **`trusted && anchored && chain_verified`** 同时成立；
+- 新增三态：`partial`（本地一致未上链，橙色）/ `local`（已上链未核验，蓝色）；
+- 第二层判据由 `!tx_hash` 换成 `!anchored`，标签展示 `anchor_label`。
+
+### ⑤ 前端改密流程（中高）
+原前端零引用 → 账号被置待改密即**死锁**（所有页面 403 且无法自救）。新增：
+- `views/ChangePassword.vue`（独立路由，不进 MainLayout）+ `api/changePassword`；
+- `request.js` 拦截 **403 + must_change_password** → 打标记并跳转改密页；
+- **路由守卫**：带标记时任何业务路由都重定向到改密页；
+- `Login.vue` 登录后检测标记直接引导；
+- 改密成功后清空本地凭证（后端已拉黑旧 refresh）并要求重新登录。
+
+### ⑥ 买家报告范围（中）
+补 `batch__producer__audit_status=APPROVED` —— 与「买家只能看已审核主体」
+的既有规则对齐（`Producer` 默认 PENDING，原来未审核主体的报告也可见）。
+
+### ⑦ 意向单回应原子化（中）
+`respond` 的两步写（意向状态 + 供需单 deal_status）包进 `transaction.atomic()`
+并用**带原状态条件的 UPDATE** 抢锁；冲突返回 409（防「意向=已拒绝、
+供需单=已对接」的不同步）。其余 4 处（submit/reject/revoke/复查作废）
+并发后果仅重复审计日志，按报告建议**不加**。
+
+### ⑧ 白名单收紧（低）
+移除 `/admin/` 放行 —— 项目已关闭 admin 路由，当前无暴露面，但避免将来
+重开后台时被待改密用户绕过。

@@ -66,8 +66,18 @@ const onSubmit = async () => {
   loading.value = true
   try {
     await userStore.login(form)
-    ElMessage.success('登录成功')
-    router.push('/dashboard')
+    // ★ 第四轮审计修复（强制改密客户端流程）：登录响应里带 must_change_password，
+    //   若为 true 则直接引导去改密页，避免先进业务页吃一堆 403 才反应过来。
+    const mustChange = userStore.user?.must_change_password
+    if (mustChange) {
+      localStorage.setItem('must_change_password', '1')
+      ElMessage.warning('您的账号需先修改初始密码')
+      router.replace({ name: 'ChangePassword', query: { forced: '1' } })
+    } else {
+      localStorage.removeItem('must_change_password')
+      ElMessage.success('登录成功')
+      router.push('/dashboard')
+    }
   } catch (e) {
     // 拦截器已提示
   } finally {

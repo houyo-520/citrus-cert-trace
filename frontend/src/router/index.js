@@ -15,6 +15,17 @@ const routes = [
     meta: { title: '合格证验真', public: true }
   },
   {
+    // ★ 第四轮审计修复（FORCED-PASSWORD-CHANGE-NO-CLIENT-FLOW，中高）：
+    //   后端 ForcePasswordChangeMiddleware 会把待改密账号除白名单外的所有
+    //   业务接口 403 掉。若前端没有改密入口，账号一旦被置 must_change_password=1
+    //   就是死锁：每个页面都报错，且无处自救。
+    //   这条独立路由（不进 MainLayout，避免侧边栏请求触发 403）提供自救入口。
+    path: '/change-password',
+    name: 'ChangePassword',
+    component: () => import('@/views/ChangePassword.vue'),
+    meta: { title: '修改密码' }     // 注意：不加 public —— 仍需登录态
+  },
+  {
     path: '/',
     component: () => import('@/layout/MainLayout.vue'),
     redirect: '/dashboard',
@@ -114,6 +125,17 @@ router.beforeEach((to, from, next) => {
   }
   if (!token) {
     return next('/login')
+  }
+  // ★ 第四轮审计修复（强制改密客户端流程）：
+  //   待改密账号只能停在改密页 —— 否则进任何业务页都会收到 403，
+  //   用户看到一堆报错却不知道要干什么（体验上是「系统坏了」）。
+  const mustChange = localStorage.getItem('must_change_password') === '1'
+  if (mustChange && to.name !== 'ChangePassword') {
+    return next({ name: 'ChangePassword', query: { forced: '1' } })
+  }
+  if (!mustChange && to.name === 'ChangePassword' && to.query.forced === '1') {
+    // 改完密后不要再被 forced 参数拉回改密页
+    return next('/dashboard')
   }
   // 角色级路由守卫：菜单已隐藏，这里防手输 URL 绕过
   const need = to.meta.roles

@@ -3818,7 +3818,12 @@ class ForcePasswordChangeTest(BaseFixture):
         return r.data["data"]["access"]
 
     def test_blocked_business_api_when_must_change(self):
-        """★ 待改密用户访问业务接口必须 403"""
+        """★ 待改密用户访问业务接口必须 403
+
+        ★ 第四轮审计修复：中间件改用 Django JsonResponse（原 DRF Response
+        在中间件层未渲染，会抛 ContentNotRenderedError → body 为空），
+        所以这里断言的是 **JSON body**，不再用 DRF 的 r.data。
+        """
         self.producer.must_change_password = True
         self.producer.save(update_fields=["must_change_password"])
         token = self._login_token("t_prod")
@@ -3826,7 +3831,45 @@ class ForcePasswordChangeTest(BaseFixture):
         c.credentials(HTTP_AUTHORIZATION="Bearer " + token)
         r = c.get("/api/batch/")
         self.assertEqual(r.status_code, 403)
-        self.assertTrue(r.data.get("must_change_password"))
+        import json
+        body = json.loads(r.content.decode("utf-8"))
+        self.assertTrue(body.get("must_change_password"))
+        self.assertEqual(r["X-Must-Change-Password"], "1")
+
+    def test_middleware_returns_renderable_json(self):
+        """★ 第四轮（FORCE-PWD-MIDDLEWARE-RESPONSE，高）：必须能真正渲染出 body。
+
+        原实现返回 DRF Response，在中间件短路时未经 finalize_response 渲染 →
+        WSGI 抛 `ContentNotRenderedError: The response content must be rendered
+        before it can be iterated over.`，客户端拿到空 body。
+
+        这条用**真实 Django Client（走完整中间件链）**断言 content 可读且为 JSON。
+        """
+        import json
+        from django.test import Client as DjClient
+        self.producer.must_change_password = True
+        self.producer.save(update_fields=["must_change_password"])
+        token = self._login_token("t_prod")
+        c = DjClient()   # ★ 原生 Client，不走 DRF 测试封装
+        r = c.get("/api/batch/", HTTP_AUTHORIZATION="Bearer " + token)
+        self.assertEqual(r.status_code, 403)
+        # ★ 核心断言：内容可迭代（不抛 ContentNotRenderedError）且是 JSON
+        raw = b"".join(r.streaming_content) if r.streaming else r.content
+        data = json.loads(raw.decode("utf-8"))
+        self.assertEqual(data["code"], 403)
+        self.assertIn("修改密码", data["message"])
+        self.assertEqual(r["Content-Type"], "application/json")
+
+    def test_middleware_message_is_readable_chinese(self):
+        """★ body 里的中文提示不得变成 \\uXXXX 转义（ensure_ascii=False）"""
+        from django.test import Client as DjClient
+        self.producer.must_change_password = True
+        self.producer.save(update_fields=["must_change_password"])
+        token = self._login_token("t_prod")
+        r = DjClient().get("/api/batch/", HTTP_AUTHORIZATION="Bearer " + token)
+        body = r.content.decode("utf-8")
+        self.assertIn("修改密码", body)
+        self.assertNotIn("\\u", body)
 
     def test_allowed_endpoints_still_accessible(self):
         """待改密用户仍可访问改密/注销/profile"""
@@ -3936,3 +3979,181 @@ class OcrPdfSubprocessTest(TestCase):
         self.assertEqual(imgs, [])
         t, m = ocr.extract_text_from_pdf(b"%PDF-1.4 broken", budget=5)
         self.assertEqual((t, m), ("", ""))
+
+
+# ===============================================================
+# ★ 第七批：第四轮审计修复回归
+# ===============================================================
+class LocalRevokedPriorityTest(BaseFixture):
+    """★ 第四轮（LOCAL-REVOKED-NOT-PRIORITY，高）：本地作废必须优先且终局。"""
+
+    def _revoked_cert(self):
+        return Certificate.objects.create(
+            batch=self.batch, report=self.report, cert_no="CERT-REV-LOCAL",
+            producer_name=self.producer_obj.name, product_name="柑橘",
+            quantity_kg=Decimal("1.00"), status=Certificate.Status.REVOKED)
+
+    def test_local_revoked_is_untrusted_without_chain(self):
+        """★ 链不可用（拿不到 revoked）时，本地已作废仍必须判不可信"""
+        cert = self._revoked_cert()
+        services.anchor_certificate(cert)      # 存证（测试环境是 mock）
+        r = services.verify_certificate(cert, check_chain=False)
+        self.assertFalse(r["trusted"], "本地已作废必须 trusted=False")
+        self.assertTrue(r["revoked"])
+        self.assertIn("作废", r["message"])
+        self.assertEqual(r.get("revoke_source"), "local")
+
+    def test_local_revoked_not_overridden_by_local_match(self):
+        """★ 关键：作废不改变摘要 → local_trusted=True，但结论仍须不可信"""
+        cert = self._revoked_cert()
+        # 模拟「摘要完全一致」（作废本来就不进 payload，所以必然一致）
+        services.anchor_certificate(cert)
+        r = services.verify_certificate(cert, check_chain=True)
+        self.assertFalse(r["trusted"])
+
+    def test_revoked_survives_simulated_chain_success(self):
+        """★ 即便链上核验"通过"，本地作废也不得被翻回可信"""
+        from unittest import mock
+        cert = self._revoked_cert()
+        services.anchor_certificate(cert)
+        rec = services.EvidenceRecord.objects.filter(
+            biz_type="certificate", biz_id=cert.id, is_current=True).first()
+        rec.chain_status = "success"
+        rec.tx_hash = "0x" + "a" * 64
+        rec.save(update_fields=["chain_status", "tx_hash"])
+        fake = {"ok": True, "revoked": False, "matched": True, "exists": True,
+                "message": "链上摘要一致"}
+        with mock.patch.object(services.chain, "verify_on_chain", return_value=fake):
+            r = services.verify_certificate(cert, check_chain=True)
+        self.assertFalse(r["trusted"], "本地作废不得被链上结果翻案")
+        self.assertTrue(r["revoked"])
+
+    def test_issued_cert_still_trusted(self):
+        """回归：正常已签发的证不受影响"""
+        services.anchor_certificate(self.cert)
+        r = services.verify_certificate(self.cert)
+        self.assertTrue(r["trusted"])
+        self.assertFalse(r["revoked"])
+
+
+class TimelineAnchorJudgementTest(BaseFixture):
+    """★ 第四轮（TIMELINE-ANCHOR-FAKE，高）：时间轴「已上链」判据必须是 chain_status。"""
+
+    def test_mock_tx_hash_not_counted_as_anchored(self):
+        """★ mock 的假哈希以 0x 开头，但不得算作已上链"""
+        services.anchor_certificate(self.cert)
+        rec = services.EvidenceRecord.objects.filter(
+            biz_type="certificate", biz_id=self.cert.id, is_current=True).first()
+        # mock 的 tx_hash 形如 0x+64hex（旧判据会被骗）
+        self.assertTrue(rec.tx_hash.startswith("0x"))
+        from apps.traceability import timeline
+        a = timeline._anchor_of("certificate", self.cert.id)
+        self.assertIsNotNone(a)
+        if rec.chain_status != "success":
+            self.assertFalse(a["anchored"],
+                             "chain_status != success 时不得标记为已上链")
+
+    def test_success_status_counts_as_anchored(self):
+        services.anchor_certificate(self.cert)
+        rec = services.EvidenceRecord.objects.filter(
+            biz_type="certificate", biz_id=self.cert.id, is_current=True).first()
+        rec.chain_status = "success"
+        rec.tx_hash = "0x" + "b" * 64
+        rec.save(update_fields=["chain_status", "tx_hash"])
+        from apps.traceability import timeline
+        a = timeline._anchor_of("certificate", self.cert.id)
+        self.assertTrue(a["anchored"])
+
+    def test_timeline_matches_describe_anchor(self):
+        """★ 同一份数据两处结论必须一致（时间轴 vs describe_anchor）"""
+        services.anchor_certificate(self.cert)
+        rec = services.EvidenceRecord.objects.filter(
+            biz_type="certificate", biz_id=self.cert.id, is_current=True).first()
+        from apps.traceability import timeline
+        a = timeline._anchor_of("certificate", self.cert.id)
+        d = services.describe_anchor(rec)
+        self.assertEqual(a["anchored"], d["anchored"],
+                         "时间轴与 describe_anchor 的锚定判定必须一致")
+
+
+class BuyerReportScopeTest(BaseFixture):
+    """★ 第四轮（BUYER-CAN-READ-UNAPPROVED-REPORT，中）：买家不得读未审核主体的报告。"""
+
+    def test_buyer_cannot_see_unapproved_producer_report(self):
+        """★ 主体未审核通过时，其报告对买家不可见"""
+        # self.batch 属于 producer_obj（APPROVED）；另造一个 PENDING 主体
+        pending = Producer.objects.create(
+            name="待审核合作社", contact="王五", phone="13700000000",
+            region="新疆", audit_status=Producer.AuditStatus.PENDING,
+            owner=self.other_producer)
+        pb = ProductBatch.objects.create(
+            batch_no="B-PENDING", producer=pending, product_name="柑橘",
+            weight_kg=Decimal("100.00"))
+        rpt = TestReport.objects.create(
+            report_no="R-PENDING", batch=pb,
+            conclusion=TestReport.Conclusion.QUALIFIED)
+        c = self.login(self.buyer)
+        r = c.get("/api/report/")
+        self.assertEqual(r.status_code, 200)
+        ids = [x["id"] for x in r.data.get("results", r.data)]
+        self.assertNotIn(rpt.id, ids, "未审核主体的报告不得对买家可见")
+
+    def test_buyer_can_see_approved_producer_report(self):
+        """回归：已审核主体的合格报告，买家仍可见"""
+        self.report.conclusion = TestReport.Conclusion.QUALIFIED
+        self.report.save(update_fields=["conclusion"])
+        c = self.login(self.buyer)
+        r = c.get("/api/report/")
+        ids = [x["id"] for x in r.data.get("results", r.data)]
+        self.assertIn(self.report.id, ids)
+
+
+class IntentRespondAtomicTest(BaseFixture):
+    """★ 第四轮（CERT-TRANSITION-PARTIAL-ATOMIC，中）：回应意向须原子且状态同步。"""
+
+    def setUp(self):
+        from apps.traceability.models import MatchIntent
+        self.supply = SupplyDemand.objects.create(
+            kind=SupplyDemand.Kind.SUPPLY, title="供应砂糖橘",
+            product_name="柑橘", quantity_kg=Decimal("1000.00"),
+            publisher=self.producer)
+        self.intent = MatchIntent.objects.create(
+            supply=self.supply, initiator=self.buyer,
+            quantity_kg=Decimal("100.00"), price=Decimal("5.00"),
+            status=MatchIntent.Status.PENDING)
+
+    def test_accept_syncs_supply_status(self):
+        """接受后：意向=accepted 且 供需单=matched（两者必须同步）"""
+        c = self.login(self.producer)
+        r = c.post(f"/api/intent/{self.intent.id}/respond/",
+                   {"status": "accepted"}, format="json")
+        self.assertEqual(r.status_code, 200)
+        self.intent.refresh_from_db()
+        self.supply.refresh_from_db()
+        self.assertEqual(self.intent.status, "accepted")
+        self.assertEqual(self.supply.deal_status, "matched")
+
+    def test_stale_respond_returns_409(self):
+        """★ 状态已被并发改掉时，回应必须 409（不覆盖）"""
+        from apps.traceability.models import MatchIntent
+        # 模拟并发：另一请求已把意向改成 rejected
+        MatchIntent.objects.filter(id=self.intent.id).update(status="rejected")
+        c = self.login(self.producer)
+        r = c.post(f"/api/intent/{self.intent.id}/respond/",
+                   {"status": "accepted"}, format="json")
+        # 状态机在 check 阶段就会拦（rejected 是终态）→ 400；
+        # 若走到原子更新则 409。两者都表示「没被错误覆盖」。
+        self.assertIn(r.status_code, (400, 409))
+        self.intent.refresh_from_db()
+        self.assertEqual(self.intent.status, "rejected")
+
+
+class MiddlewareWhitelistTest(TestCase):
+    """★ 第四轮（ADMIN-WHITELIST-BYPASS，低）：白名单不得放行 /admin/。"""
+
+    def test_admin_not_whitelisted(self):
+        from apps.accounts import middleware as mw
+        self.assertIsNone(mw._PWD_ALLOW_RE.match("/admin/"))
+        self.assertIsNone(mw._PWD_ALLOW_RE.match("/admin/login/"))
+        # 改密相关仍应放行
+        self.assertIsNotNone(mw._PWD_ALLOW_RE.match("/api/auth/change-password/"))

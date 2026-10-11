@@ -57,6 +57,8 @@ export const useUserStore = defineStore('user', {
       localStorage.removeItem('token')
       localStorage.removeItem('refresh')
       localStorage.removeItem('user')
+      // ★ 第四轮：登出时一并清掉强制改密标记，避免换账号登录被上一次的标记带偏
+      localStorage.removeItem('must_change_password')
     }
   }
 })

@@ -27,16 +27,22 @@
       </div>
 
       <!-- ===== 验真结论：放最顶部，一眼可见 ===== -->
-      <div class="verdict" :class="result.revoked ? 'revoked' : (result.trusted ? 'ok' : 'bad')">
+      <!--
+        ★ 第四轮审计修复（FRONTEND-VERDICT-IGNORES-ANCHOR，中高）：
+          原判据只看 result.trusted —— 但后端在「链降级/未上链」时也会返回
+          trusted=true（代表「本地摘要一致」），于是页面顶部绿色大条写
+          「验真通过 · 数据可信」，下面第二层却是红色「不通过」，自相矛盾。
+          现在绿色（数据可信）需要 **trusted && anchored** 同时成立；
+          只 trusted 未 anchored 时显示为「中性/待核验」状态。
+      -->
+      <div class="verdict" :class="verdictClass">
         <div class="verdict-icon">
           <el-icon :size="34">
-            <component :is="result.trusted ? 'CircleCheckFilled' : 'CircleCloseFilled'" />
+            <component :is="verdictIcon" />
           </el-icon>
         </div>
         <div class="verdict-text">
-          <div class="verdict-title">
-            {{ result.revoked ? '该合格证已作废 · 不可流通' : (result.trusted ? '验真通过 · 数据可信' : '验真失败 · 数据不可信') }}
-          </div>
+          <div class="verdict-title">{{ verdictTitle }}</div>
           <div class="verdict-sub">{{ result.verify_message }}</div>
         </div>
       </div>
@@ -113,18 +119,26 @@
         </div>
 
         <div class="check-item"
-             :class="!result.tx_hash ? 'skip' : (result.chain_verified ? 'ok' : 'bad')">
+             :class="!result.anchored ? 'skip' : (result.chain_verified ? 'ok' : 'bad')">
           <div class="check-head">
             <el-icon><Link /></el-icon>
             <span>第二层 · 联盟链上核验</span>
-            <el-tag v-if="!result.tx_hash" type="info" size="small" effect="dark">未上链</el-tag>
+            <!--
+              ★ 第四轮审计修复：原判据 `!result.tx_hash` 判「未上链」不成立 ——
+                mock 存证的假哈希本身就是 0x+64hex，会被当成"已上链"，
+                于是这一格显示成红色「不通过」而不是中性「未上链」。
+                正确的判据是后端下发的 result.anchored（= chain_status == success）。
+            -->
+            <el-tag v-if="!result.anchored" type="info" size="small" effect="dark">
+              {{ result.anchor_label || '未上链' }}
+            </el-tag>
             <el-tag v-else :type="result.chain_verified ? 'success' : 'danger'"
                     size="small" effect="dark">
               {{ result.chain_verified ? '通过' : '不通过' }}
             </el-tag>
           </div>
           <div class="check-body">
-            {{ result.chain_detail || '该合格证尚未上链存证' }}
+            {{ result.chain_detail || result.anchor_detail || '该合格证尚未上链存证' }}
           </div>
         </div>
       </div>
@@ -242,6 +256,36 @@ const onMq = (e) => { isMobile.value = e.matches }
 const timeline = computed(() => result.value?.timeline || [])
 const timelineSummary = computed(() => result.value?.timeline_summary || {})
 
+// ★ 第四轮修复（FRONTEND-VERDICT-IGNORES-ANCHOR）：
+//   结论条必须综合 trusted 与 anchored —— 「本地摘要一致」不等于「链上已验证」。
+//   三态优先级：已作废 > 可信（本地一致且已上链且链上核验通过）> 部分可信 > 不可信
+const verdictState = computed(() => {
+  const r = result.value
+  if (!r) return 'unknown'
+  if (r.revoked) return 'revoked'
+  if (r.trusted && r.anchored && r.chain_verified) return 'ok'
+  // 本地一致但未上链（mock/降级/链关闭）→ 中性提示，不给绿色
+  if (r.trusted && !r.anchored) return 'partial'
+  if (r.trusted) return 'local'          // 已上链但本次未做链上核验
+  return 'bad'
+})
+const verdictClass = computed(() => verdictState.value)
+const verdictIcon = computed(() => (
+  ['ok', 'local', 'partial'].includes(verdictState.value)
+    ? 'CircleCheckFilled' : 'CircleCloseFilled'
+))
+const verdictTitle = computed(() => {
+  const r = result.value || {}
+  switch (verdictState.value) {
+    case 'revoked': return '该合格证已作废 · 不可流通'
+    case 'ok': return '验真通过 · 数据可信（已通过链上核验）'
+    case 'local': return '本地摘要一致 · 链上已存证'
+    case 'partial': return '本地摘要一致 · 尚未上链核验'
+    case 'bad': return '验真失败 · 数据不可信'
+    default: return ''
+  }
+})
+
 const statusTagType = (s) => ({
   issued: 'success', draft: 'info', pending: 'warning',
   suspended: 'danger', revoked: 'danger'
@@ -323,6 +367,10 @@ onUnmounted(() => { mq?.removeEventListener('change', onMq) })
 .verdict.ok { background: linear-gradient(135deg, #3f9d5c, #2d7d46); }
 .verdict.bad { background: linear-gradient(135deg, #e05b5b, #c33c3c); }
 .verdict.revoked { background: linear-gradient(135deg, #8c7a3c, #6b5c28); }
+/* ★ 第四轮新增：本地一致但未上链核验 / 已上链但本次未核验 —— 不给绿色误导 */
+.verdict.partial { background: linear-gradient(135deg, #c98a2e, #a06f1f); }
+.verdict.local { background: linear-gradient(135deg, #4a7fa5, #35617f); }
+.verdict.unknown { background: linear-gradient(135deg, #7a7a7a, #5c5c5c); }
 .verdict-icon { flex: 0 0 auto; display: flex; }
 .verdict-title { font-size: 19px; font-weight: 700; letter-spacing: 0.5px; }
 .verdict-sub { font-size: 13px; opacity: 0.92; margin-top: 4px; }

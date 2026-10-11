@@ -13,6 +13,7 @@ from decimal import Decimal, InvalidOperation
 
 import qrcode
 from django.conf import settings
+from django.db import transaction
 from django.db.models import Avg, Count, Q, Sum
 from django.http import HttpResponse
 from django.utils import timezone
@@ -195,8 +196,19 @@ class TestReportViewSet(RoleScopedQuerySetMixin, BaseViewSet):
         if user.role == Role.PRODUCER:
             return qs.filter(batch__producer__owner=user)
         if user.role == Role.BUYER:
-            # 收购商只看结论为合格的报告
-            return qs.filter(conclusion=TestReport.Conclusion.QUALIFIED)
+            # 收购商只看「结论合格 + 主体已审核通过」的报告
+            #
+            # ★ 第四轮审计修复（BUYER-CAN-READ-UNAPPROVED-REPORT，中）：
+            #   原实现只筛 conclusion=QUALIFIED，**没筛主体审核状态** ——
+            #   Producer 默认 audit_status=PENDING，即「还没通过审核的主体」
+            #   其报告也对收购商可见（含检测机构、农残/重金属、OCR 原文等）。
+            #   这既泄露了未审核主体的经营信息，也与「买家只能看已审核主体
+            #   的产品」这条既有规则不一致（见 ProducerViewSet / CertificateViewSet）。
+            #   现与附件访问规则对齐：必须主体已审核通过。
+            return qs.filter(
+                conclusion=TestReport.Conclusion.QUALIFIED,
+                batch__producer__audit_status=Producer.AuditStatus.APPROVED,
+            )
         return qs.none()
 
     def get_permissions(self):
@@ -1437,14 +1449,35 @@ class MatchIntentViewSet(RoleScopedQuerySetMixin, viewsets.ModelViewSet):
         if err:
             return Response({"code": 400, "message": err},
                             status=status.HTTP_400_BAD_REQUEST)
-        obj.status = new_status
-        obj.save(update_fields=["status", "updated_at"])
 
-        # 接受时同步把供需单置为已对接
-        if new_status == MatchIntent.Status.ACCEPTED:
-            sd = obj.supply
-            sd.deal_status = SupplyDemand.DealStatus.MATCHED
-            sd.save(update_fields=["deal_status", "updated_at"])
+        # ★ 第四轮审计修复（CERT-TRANSITION-PARTIAL-ATOMIC，中）：
+        #   「意向单状态」与「供需单 deal_status」是**一对必须同步的事实**，
+        #   原实现是「读 → 判 → 存」两步写，并发下会不同步：
+        #   例如两个请求同时接受同一意向，可能一个把意向置 accepted、
+        #   另一个把供需单置 matched 后又被 rejected 覆盖 →
+        #   出现「意向=已拒绝，供需单=已对接」这种自相矛盾的数据。
+        #
+        #   修法：整块放进一个事务，并用**带原状态条件的 UPDATE** 抢锁
+        #   （与 rules.atomic_cert_transition 同一思路，SQLite 下同样可靠）。
+        with transaction.atomic():
+            old_status = obj.status
+            updated = (MatchIntent.objects
+                       .filter(id=obj.id, status=old_status)
+                       .update(status=new_status, updated_at=timezone.now()))
+            if not updated:
+                # 状态已被并发请求改掉 → 放弃本次回应（不覆盖别人的结果）
+                return Response(
+                    {"code": 409, "message": "该意向状态已被其他操作变更，请刷新后重试"},
+                    status=status.HTTP_409_CONFLICT)
+            obj.status = new_status
+
+            # 接受时同步把供需单置为已对接（同事务，保证一致性）
+            if new_status == MatchIntent.Status.ACCEPTED:
+                sd = obj.supply
+                SupplyDemand.objects.filter(id=sd.id).update(
+                    deal_status=SupplyDemand.DealStatus.MATCHED,
+                    updated_at=timezone.now())
+                sd.deal_status = SupplyDemand.DealStatus.MATCHED
 
         audit.log_operation(request, OperationLog.Action.MATCH,
                             target_type="产销意向单", target_id=obj.id,
